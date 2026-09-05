@@ -20,7 +20,7 @@ from duplicate_cleaner.paths import (
     validate_not_excluded,
     validate_scan_root_candidate,
 )
-from duplicate_cleaner.report.schema import Report
+from duplicate_cleaner.report.schema import Manifest, ManifestEntry, Report
 
 log = logging.getLogger(__name__)
 
@@ -221,21 +221,29 @@ def apply_report(
     run_dir = runs_dir / ts
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "manifest.json"
+    # v0.2 sub-phase 5a: every entry now carries the trailing cloud fields
+    # with their v0.1.1-equivalent defaults (``source_id="local"``, cloud
+    # ids / etag null).  ``ManifestEntry.model_dump()`` guarantees the JSON
+    # shape stays in sync with the pydantic model used by future sub-phases.
+    # ``Manifest`` also stamps ``manifest_version="0.2.0"`` at the top level.
     entries: list[dict[str, Any]] = [
-        {
-            "original_path": str(p),
-            "size": s,
-            "mtime": mt,
-            "hash": h,
-            "trashed_at_path": None,
-        }
+        ManifestEntry(
+            original_path=str(p),
+            size=s,
+            mtime=mt,
+            hash=h,
+            trashed_at_path=None,
+        ).model_dump()
         for p, s, mt, h in verified
     ]
 
     def _flush_manifest() -> None:
-        _write_manifest(
-            manifest_path, {"created_at": ts, "entries": entries}
+        manifest = Manifest(
+            created_at=ts,
+            roots=[str(r) for r in report.roots],
+            entries=[ManifestEntry.model_validate(e) for e in entries],
         )
+        _write_manifest(manifest_path, manifest.model_dump())
 
     # Write BEFORE moving anything, so recovery is always possible.
     _flush_manifest()

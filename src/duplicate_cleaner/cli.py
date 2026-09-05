@@ -19,11 +19,16 @@ from duplicate_cleaner.auth import (
     ACCOUNTS_PATH,
     BUNDLED_GDRIVE_CLIENT_ID,
     BUNDLED_GDRIVE_CLIENT_SECRET,
+    BUNDLED_ONEDRIVE_CLIENT_ID,
+    BUNDLED_ONEDRIVE_CLIENT_SECRET,
     GDRIVE_AUTH_URL,
     GDRIVE_DEFAULT_SCOPES,
     GDRIVE_FULL_SCOPES,
     GDRIVE_REVOKE_URL,
     GDRIVE_TOKEN_URL,
+    ONEDRIVE_AUTH_URL,
+    ONEDRIVE_DEFAULT_SCOPES,
+    ONEDRIVE_TOKEN_URL,
     AccountEntry,
     AccountsRegistry,
     DuplicateAccountError,
@@ -306,7 +311,10 @@ def scan(
     """Walk, hash, group, score, and write a report."""
     # B3: refuse non-local source ids until sub-phase 5 wires cloud sources
     # into the scan pipeline.  Accepting them silently produced reports
-    # missing entire sources — surface the gap loudly instead.
+    # missing entire sources — surface the gap loudly instead.  Sub-phase 4
+    # (OneDrive) registers accounts and exercises the source in tests but
+    # still routes end-users through the same "not until sub-phase 5"
+    # message so cross-source behaviour lands in one place.
     requested_sources = [s.strip() for s in sources.split(",") if s.strip()]
     for s in requested_sources:
         if s != "local":
@@ -707,6 +715,21 @@ def _resolve_client_credentials(
             )
             raise typer.Exit(1)
         return client_id, BUNDLED_GDRIVE_CLIENT_SECRET
+    if type_ == "onedrive":
+        client_id = BUNDLED_ONEDRIVE_CLIENT_ID
+        # B1 mirror: refuse the placeholder Microsoft client id so users get
+        # an actionable message instead of Entra's raw ``invalid_client``
+        # response.  Microsoft public clients ship WITHOUT a secret (PKCE
+        # only) so the returned secret is intentionally the empty string.
+        if client_id.endswith("_TO_REPLACE"):
+            console.print(
+                "[red]This build's bundled Microsoft OAuth client is not "
+                "registered yet.[/red] Use [cyan]--client-secret path/to/msal.json"
+                "[/cyan] with your own Entra App Registration id until the "
+                "release build ships."
+            )
+            raise typer.Exit(1)
+        return client_id, BUNDLED_ONEDRIVE_CLIENT_SECRET
     raise typer.BadParameter(f"Unknown auth type: {type_}")
 
 
@@ -729,7 +752,7 @@ def auth_add(
         str,
         typer.Argument(
             metavar="TYPE",
-            help="Cloud provider type — currently 'gdrive'.",
+            help="Cloud provider type — 'gdrive' or 'onedrive'.",
         ),
     ],
     label: Annotated[
@@ -772,8 +795,11 @@ def auth_add(
     ] = False,
 ) -> None:
     """Register a cloud account by running the OAuth localhost flow."""
-    if type_ != "gdrive":
-        console.print(f"[red]Unsupported auth type[/red]: {type_}. Only 'gdrive' in sub-phase 2.")
+    if type_ not in {"gdrive", "onedrive"}:
+        console.print(
+            f"[red]Unsupported auth type[/red]: {type_}. "
+            "Supported: 'gdrive', 'onedrive'."
+        )
         raise typer.Exit(2)
     registry = AccountsRegistry()
     tokens = TokenStore()
@@ -806,21 +832,39 @@ def auth_add(
         console.print(f"[red]Failed to load client secret[/red]: {e}")
         raise typer.Exit(2) from e
 
-    scopes = list(GDRIVE_FULL_SCOPES if full else GDRIVE_DEFAULT_SCOPES)
+    if type_ == "gdrive":
+        auth_url_base = GDRIVE_AUTH_URL
+        token_url = GDRIVE_TOKEN_URL
+        scopes = list(GDRIVE_FULL_SCOPES if full else GDRIVE_DEFAULT_SCOPES)
+        extra_auth_params: dict[str, str] = {
+            "access_type": "offline",
+            "prompt": "consent",
+            "include_granted_scopes": "true",
+        }
+    else:  # onedrive
+        if full:
+            console.print(
+                "[yellow]Warning[/yellow]: --full is a Google-only flag; "
+                "OneDrive always uses Files.ReadWrite + offline_access."
+            )
+        auth_url_base = ONEDRIVE_AUTH_URL
+        token_url = ONEDRIVE_TOKEN_URL
+        scopes = list(ONEDRIVE_DEFAULT_SCOPES)
+        # Entra requires ``prompt=select_account`` for the multi-account
+        # flow so the user can pick between signed-in identities.  We do
+        # not send ``access_type`` (Google-only).
+        extra_auth_params = {"prompt": "select_account"}
+
     console.print(f"Starting OAuth flow for [cyan]{account_id}[/cyan]…")
     try:
         token_data = run_localhost_flow(
-            auth_url_base=GDRIVE_AUTH_URL,
+            auth_url_base=auth_url_base,
             client_id=client_id,
             client_secret=secret or None,
             scopes=scopes,
-            token_url=GDRIVE_TOKEN_URL,
+            token_url=token_url,
             port_hint=port_hint,
-            extra_auth_params={
-                "access_type": "offline",
-                "prompt": "consent",
-                "include_granted_scopes": "true",
-            },
+            extra_auth_params=extra_auth_params,
         )
     except OAuthFlowError as e:
         console.print(f"[red]OAuth flow failed[/red]: {e}")
@@ -892,25 +936,56 @@ def auth_test(
         console.print(f"[red]No token for[/red] {account_id}. Run `dc auth add`.")
         raise typer.Exit(1)
     kind = str(data.get("type", ""))
-    if kind != "gdrive":
+    if kind == "gdrive":
+        try:
+            creds = _google_credentials_from_token(data)
+            # Lazy import so unit tests + no-deps environments can import cli.py.
+            from duplicate_cleaner.sources.gdrive import GoogleDriveSource
+
+            src = GoogleDriveSource(account_id=account_id, credentials=creds)
+            # A trivial 1-item listing exercises token refresh + API round-trip.
+            it = src.list_files()
+            first = next(iter(it), None)
+            console.print(
+                f"[green]OK[/green]: {account_id} — "
+                + (f"first file: {first.path}" if first is not None else "empty drive")
+            )
+        except Exception as e:
+            console.print(f"[red]{account_id} check failed[/red]: {e}")
+            raise typer.Exit(1) from e
+    elif kind == "onedrive":
+        try:
+            # Bearer token is used as-is here — an expired access_token
+            # will surface as a SourceAuthError from the source layer,
+            # prompting the user to re-run ``dc auth add --force``.
+            from duplicate_cleaner.sources.onedrive import OneDriveSource
+
+            access_token = str(data.get("access_token") or "")
+            if not access_token:
+                console.print(
+                    f"[red]{account_id}: no access_token in stored blob[/red]"
+                )
+                raise typer.Exit(1)
+            src_od = OneDriveSource(
+                account_id=account_id,
+                token_provider=lambda: access_token,
+            )
+            it_od = src_od.list_files()
+            first_od = next(iter(it_od), None)
+            console.print(
+                f"[green]OK[/green]: {account_id} — "
+                + (
+                    f"first file: {first_od.path}"
+                    if first_od is not None
+                    else "empty drive"
+                )
+            )
+        except Exception as e:
+            console.print(f"[red]{account_id} check failed[/red]: {e}")
+            raise typer.Exit(1) from e
+    else:
         console.print(f"[yellow]auth test not implemented for type[/yellow]: {kind}")
         raise typer.Exit(0)
-    try:
-        creds = _google_credentials_from_token(data)
-        # Lazy import so unit tests + no-deps environments can import cli.py.
-        from duplicate_cleaner.sources.gdrive import GoogleDriveSource
-
-        src = GoogleDriveSource(account_id=account_id, credentials=creds)
-        # A trivial 1-item listing exercises token refresh + API round-trip.
-        it = src.list_files()
-        first = next(iter(it), None)
-        console.print(
-            f"[green]OK[/green]: {account_id} — "
-            + (f"first file: {first.path}" if first is not None else "empty drive")
-        )
-    except Exception as e:
-        console.print(f"[red]{account_id} check failed[/red]: {e}")
-        raise typer.Exit(1) from e
 
 
 @auth_app.command("remove")
@@ -935,6 +1010,18 @@ def auth_remove(
                     "[yellow]Warning[/yellow]: provider revoke call failed — "
                     "local token will still be removed."
                 )
+        elif kind == "onedrive":
+            # Microsoft does not expose a token-revocation endpoint the
+            # way Google does; ``/logout`` invalidates the browser
+            # session only.  The user-actionable step is to visit
+            # https://account.live.com/consent/Manage and remove the app
+            # — we surface that link and delete the local token below.
+            console.print(
+                "[cyan]Note[/cyan]: Microsoft does not provide a "
+                "programmatic revoke.  To fully revoke access visit "
+                "https://account.live.com/consent/Manage and remove "
+                "DuplicateCleaner from the app list."
+            )
     tokens.delete(account_id)
     removed = registry.remove(account_id)
     console.print(

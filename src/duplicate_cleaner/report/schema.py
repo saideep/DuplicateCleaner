@@ -29,6 +29,18 @@ class ReportMember(BaseModel):
     is_informational: bool = False
     is_archive_member: bool = False
     is_bundle: bool = False
+    # v0.2 additions — all defaulted so v0.1.1 reports load cleanly with
+    # ``source_id="local"`` and cloud fields cleared.  See design doc
+    # ``docs/design/v0.2-subphase5-cloud-path-validation.md`` §3.1.  Nothing
+    # in ``apply/`` or ``paths.py`` may treat these fields as authoritative
+    # for local paths — the dispatch key is ``source_id``, and only the
+    # source-dispatched cloud branch (added in sub-milestone 5b onward) may
+    # consult ``cloud_file_id`` / ``etag``.
+    source_id: str = "local"
+    cloud_file_id: str | None = None
+    etag: str | None = None
+    owner: str | None = None
+    is_shared: bool = False
 
 
 class ReportGroup(BaseModel):
@@ -63,7 +75,12 @@ class SingletonEntry(BaseModel):
 
 
 class Report(BaseModel):
-    version: str = "0.1.1"
+    # v0.2 sub-phase 5a: bumped from ``"0.1.1"`` → ``"0.2.0"``.  The loader
+    # (``apply/mover.py::load_report``) accepts any older value and treats
+    # missing / ``0.1.*`` markers as v0.1.1, applying default field values
+    # silently — a v0.1.1 report.json in a checked-out runs directory keeps
+    # working under v0.2.  See design doc §3.
+    version: str = "0.2.0"
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     roots: list[Path]
     total_files_scanned: int
@@ -75,3 +92,52 @@ class Report(BaseModel):
     # ``discover`` mode: no keeper is proposed on any group. ``dc apply``
     # refuses to run a discover-mode report so nothing accidentally deletes.
     discover: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Manifest schema (v0.2 sub-phase 5a) — Pydantic model backing the on-disk
+# ``manifest.json`` written by ``apply/mover.py`` and read by ``apply/undo.py``.
+#
+# The v0.1.1 manifest was a raw ``dict[str, Any]``.  Sub-phase 5a extracts a
+# typed model so cloud-side fields (``source_id``, ``cloud_file_id``,
+# ``cloud_trash_id``, ``etag``) are declared in exactly one place and
+# guaranteed to round-trip.  Undo (``restore_from_manifest``) continues to
+# read the JSON via ``json.loads`` + ``dict.get`` so a v0.1.1 manifest with
+# no ``manifest_version`` and no ``source_id`` on entries still restores
+# byte-identically — the missing fields are treated as their defaults.
+# ---------------------------------------------------------------------------
+
+
+class ManifestEntry(BaseModel):
+    """One row in an apply-run manifest.
+
+    v0.1.1 rows carry only ``original_path``, ``size``, ``mtime``, ``hash``,
+    ``trashed_at_path``.  v0.2 rows add the trailing cloud fields; the
+    defaults keep old JSON loadable via ``ManifestEntry.model_validate(row)``
+    without a forced re-scan.
+    """
+
+    original_path: str
+    size: int
+    mtime: float
+    hash: str
+    trashed_at_path: str | None = None
+    # v0.2 additions — see design doc §3.2.
+    source_id: str = "local"
+    cloud_file_id: str | None = None
+    cloud_trash_id: str | None = None
+    etag: str | None = None
+
+
+class Manifest(BaseModel):
+    """Top-level envelope for ``manifest.json`` on disk.
+
+    ``manifest_version`` is optional on read (missing → treat as v0.1.1 →
+    every entry defaults to ``source_id="local"``).  Writers stamp it
+    explicitly so downstream tooling can key off the marker.
+    """
+
+    manifest_version: str = "0.2.0"
+    created_at: str
+    roots: list[str] = Field(default_factory=list)
+    entries: list[ManifestEntry] = Field(default_factory=list)

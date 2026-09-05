@@ -123,7 +123,9 @@ The flow mirrors Google Drive: local callback server, browser opens to `login.mi
          | prints "Authorized as user@outlook.com"               |
 ```
 
-DuplicateCleaner supports **OneDrive Personal only** in v0.2. If you sign in with a Microsoft 365 Business tenant the flow aborts with a clear message. This is deliberate — OneDrive Business exposes only `quickXorHash`, which the scanner cannot align with local BLAKE3 without extra work. Business support is not on the v0.2 roadmap.
+DuplicateCleaner supports **OneDrive Personal only** in v0.2. The OAuth flow uses Microsoft's `/consumers/` authority which rejects Business / Work tenants at the token endpoint — Business tenants cannot complete the flow. This is deliberate: OneDrive Business exposes only `quickXorHash`, which the scanner cannot align with local BLAKE3 without extra work. Business support is not on the v0.2 roadmap.
+
+Business items missing `file.hashes.sha256Hash` (which is Personal-only) are skipped during enumeration with a debug log line. If you find yourself with a Business account that somehow completed the flow, `dc scan` will find zero indexable files and warn accordingly.
 
 ### Multi-account OneDrive
 
@@ -140,8 +142,13 @@ DuplicateCleaner requests exactly:
 
 - `Files.ReadWrite`
 - `offline_access`
+- `User.Read`
 
-`Files.ReadWrite` covers reading files and moving items to the recycle bin. `offline_access` is what makes the refresh token issue. Neither grants hard-delete beyond recycle-bin.
+`Files.ReadWrite` covers reading files and moving items to the recycle bin. `offline_access` is what makes the refresh token issue. `User.Read` is used at `dc auth add` time only, to fetch your account's email and object id via `GET /me` for account labelling and shared-vs-owned classification. None of these grants hard-delete beyond recycle bin.
+
+### Restore quirk on OneDrive Personal
+
+Microsoft Graph documents `POST /me/drive/items/{id}/restore` as OneDrive Business only. OneDrive Personal historically returns HTTP 501 or an error body with `code: "notSupported"` for the same call. When `dc undo` encounters this on a OneDrive Personal manifest entry, the entry is reported as failed with a message pointing at your Recycle Bin at `https://onedrive.live.com/?id=recyclebin`. Successful entries in the same manifest still complete. This is a provider limitation — no changes on our side can bypass it.
 
 ## iCloud (coming in v0.6)
 
@@ -172,6 +179,8 @@ dc auth remove gdrive:work
 
 `dc auth remove` deletes the token file, best-effort revokes at the provider's revocation endpoint, and removes the entry from `accounts.toml`. If the revocation call fails (offline, provider rate limit, etc.), the local file is still deleted and a warning is logged. To fully cut access, sign in to the provider's account page and remove the app from your connected apps list.
 
+Note: Microsoft does not expose a programmatic token-revocation endpoint the way Google does. For OneDrive accounts, `dc auth remove` deletes the local token file and prints a link to `https://account.live.com/consent/Manage` where you can revoke the app for good. For Google accounts, the revoke call hits `oauth2.googleapis.com/revoke` and only falls back to the account-page instructions if that call fails.
+
 ## Token storage
 
 ### Files on disk
@@ -198,6 +207,20 @@ The tokens directory is created with mode `0700` (owner-only). Each token file i
   "refresh_token": "1//0g...",
   "expires_at": 1793145600.0,
   "scopes": ["https://www.googleapis.com/auth/drive.file"]
+}
+```
+
+OneDrive follows the same shape with `"type": "onedrive"` and the Microsoft scopes:
+
+```json
+{
+  "account_id": "onedrive:main",
+  "type": "onedrive",
+  "user_email": "me@outlook.com",
+  "access_token": "EwB...",
+  "refresh_token": "M.C1_BAY...",
+  "expires_at": 1793145600.0,
+  "scopes": ["Files.ReadWrite", "offline_access", "User.Read"]
 }
 ```
 

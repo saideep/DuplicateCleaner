@@ -31,12 +31,12 @@ Next up in v0.3 (in development):
 
 In development for v0.2:
 
-- Cloud sources. Google Drive and OneDrive Personal accounts are scanned alongside local trees. Duplicates that span local and cloud propose the cloud copy for deletion (local wins any cross-source tie).
+- Cloud sources. Google Drive and OneDrive Personal accounts are scanned alongside local trees. Duplicates that span local and cloud propose the cloud copy for deletion (local wins any cross-source tie). Sub-phases 1–4 have shipped (LocalFileSystemSource refactor, shared OAuth, GoogleDriveSource read + trash + restore, OneDriveSource read + trash + restore); sub-phase 5 wires cross-source scoring, reports, and apply.
 - OAuth 2.0 authentication with bundled clients. `dc auth add gdrive` and `dc auth add onedrive` handle the browser-based login flow end to end with zero setup. `--client-secret path.json` lets you bring your own OAuth client.
 - Multi-account support with user-chosen labels. `gdrive:personal`, `gdrive:family`, `gdrive:work`, `onedrive:main` — each account is a separate source ID you can include in a scan.
 - Cloud deletions go to the provider's trash (Google Drive trash, OneDrive recycle bin), never hard-delete. OAuth scopes are trash-only — the tool literally cannot hard-delete a cloud file.
-- Shared cloud files are informational-only. If the provider reports the file was authored by someone else, the scanner never proposes it for deletion.
-- Undo works across sources. A single manifest can carry mixed local + cloud entries; `dc undo` restores each entry via the right API.
+- Shared cloud files are informational-only. If the provider reports the file was authored by someone else, the scanner never proposes it for deletion. On OneDrive this is inferred from `remoteItem` (shared-with-you drive items) plus `createdBy.user.id`.
+- Undo works across sources. A single manifest can carry mixed local + cloud entries; `dc undo` restores each entry via the right API. OneDrive Personal restore falls back to a clear "restore manually via the web recycle bin" message when Graph returns `notSupported`.
 - New `--sources` flag on `dc scan` selects which backends to enumerate. Existing local-only invocations behave identically.
 
 Later milestones:

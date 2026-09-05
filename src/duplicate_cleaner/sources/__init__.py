@@ -14,11 +14,13 @@ from duplicate_cleaner.sources.base import (
 )
 from duplicate_cleaner.sources.gdrive import GoogleDriveSource
 from duplicate_cleaner.sources.local import LocalFileSystemSource
+from duplicate_cleaner.sources.onedrive import OneDriveSource
 
 __all__ = [
     "ForeignHash",
     "GoogleDriveSource",
     "LocalFileSystemSource",
+    "OneDriveSource",
     "Source",
     "SourceAuthError",
     "SourceError",

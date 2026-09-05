@@ -78,6 +78,99 @@ Category counts: 1 safety (PLAUSIBLE), 2 simplification (CONFIRMED). Zero DATA-L
 
 **Fourth audit (Code Review pass 4, fork+scaffold, 2026-09-05)** — verified H1–H9 all correctly fixed under the new AUDIT_SCAFFOLD contract. No DATA-LOSS. No invariants weakened. 5 findings, all deferrable: 2 `simplification` (H7's `singleton-by-partial:...` marker leaks path — same class as v0.1.2-deferred `singleton-by-size` marker; undo.py's `_src_is_in_trash` duplicates `paths.is_inside_any_trash`), 2 `test-coverage` (no test proves nested-skip attributes to outer-archive path in `skipped_outer_archives`; no end-to-end test that H7 partial-unique singleton reaches `Report.singletons`), 1 `simplification` (H4 nested-archive double-hashes bytes; single-pass optimisation possible). **Verdict: Ready with post-release notes.** v0.1.1 clears ship.
 
+### v0.2 — cloud sources (sub-milestone 5a: schema surgery)
+
+Sub-milestone 5a Dev delivered (2026-09-05): schema fields added to `ReportMember` + `ManifestEntry`, backward-compat loader (v0.1.1 reports load with `source_id="local"` default), 9 new tests (215 → 224 total). Zero behavior change on local reports. Sub-milestone 5b next: mover dispatches on source_id.
+
+Shipped:
+- `ReportMember` gains five trailing defaulted fields per design doc §3.1: `source_id="local"`, `cloud_file_id: str | None = None`, `etag: str | None = None`, `owner: str | None = None`, `is_shared: bool = False`. A v0.1.1 report.json (no `version` key, no `source_id` on members) loads cleanly and every member defaults to `source_id="local"` — no forced re-scan.
+- `Report.version` default bumped from `"0.1.1"` to `"0.2.0"`. Older markers are still accepted on read (Pydantic field is a plain `str`).
+- New `ManifestEntry` and `Manifest` Pydantic models in `report/schema.py` per design doc §3.2. `ManifestEntry` fields: `original_path`, `size`, `mtime`, `hash`, `trashed_at_path`, plus v0.2 additions `source_id="local"`, `cloud_file_id=None`, `cloud_trash_id=None`, `etag=None`. `Manifest` envelope: `manifest_version="0.2.0"`, `created_at`, `roots: list[str] = []`, `entries: list[ManifestEntry]`.
+- `apply/mover.py::apply_report` now constructs each manifest row via `ManifestEntry(...).model_dump()` and each flushed envelope via `Manifest(...).model_dump()`. Every v0.2 write stamps `source_id="local"` + null cloud fields + `manifest_version="0.2.0"` explicitly (no missing-vs-null ambiguity).
+- `tests/test_schema_backward_compat.py` — 9 tests: v0.1.1 report loads with default `source_id`; v0.1.1 report `apply_report --dry-run` still works; v0.2 report round-trips; v0.2 report always serializes `source_id` explicitly; v0.1.1 manifest row loads with default `source_id`; v0.1.1 manifest envelope loads with default `manifest_version`; v0.2 manifest round-trips; v0.2 manifest local entry serializes `source_id` explicitly; mover writes v0.2 shape on disk end-to-end.
+
+Deferred to sub-milestone 5b (mover dispatch):
+- `_validate_report_paths` cloud vs local branching per design §4.2.
+- `validate_cloud_entry` helper in `sources/base.py`.
+- `AccountsRegistry.load()` integration into apply-time authorization set.
+
+Invariants preserved:
+- All 215 pre-existing tests still pass unchanged.
+- `test_no_forbidden_calls.py` still passes.
+- Ruff clean on every touched file.
+- `mypy --strict` on `src/duplicate_cleaner/report/schema.py` clean; the pre-existing `unused-ignore` warnings across `src/` (documented in sub-milestone 2 notes for the stub-installed env) are unchanged.
+- On-disk manifest gains `manifest_version` + `source_id` + null cloud fields; every v0.1.1 manifest still round-trips through `restore_from_manifest` (undo reads via `dict.get()` with the same defaults).
+
+Notes for review:
+- The mover's `_flush_manifest` now populates `manifest.roots` from `report.roots`. `apply/undo.py::restore_from_manifest` already validates that array with `validate_scan_root_candidate` when present, so pytest tmp_path values under `/tmp/pytest-dc` continue to pass (≥3 resolved segments, not in `EXCLUDED_ROOTS`).
+- Cloud-side dispatch, drift check, and undo integration are NOT included — every read/write path in this sub-milestone still runs the v0.1.1 local rails. The pass-5/pass-6 `Path("gdrive:x://foo")` landmine remains latent (nothing feeds cloud entries through the mover yet) and will be closed by sub-milestone 5b.
+
+### v0.2 — cloud sources (sub-milestone 4: OneDriveSource read + trash + restore)
+
+**Sub-milestone 4 Dev delivered** (2026-09-05): 25 new tests for OneDrive + 3 new tests in `test_cli_auth.py` = 28 new tests. Ruff clean on all new/modified files (auth/clients.py, auth/__init__.py, sources/onedrive.py, sources/__init__.py, cli.py, tests/test_sources_onedrive.py, tests/test_cli_auth.py). All 252 tests passing (215 baseline + 9 existing schema-backcompat + 25 onedrive + 3 cli-auth-onedrive). `test_no_forbidden_calls.py` still green — no destructive filesystem calls added; OneDrive trash flows through Microsoft Graph's Recycle Bin API. `shutil.move` still confined to `apply/undo.py`.
+
+Shipped:
+- `sources/onedrive.py` — new file. `OneDriveSource` mirrors `GoogleDriveSource` shape. Wire choice per design: raw `httpx` + `msal`, no `msgraph-sdk`.
+  - Enumerate via `GET /me/drive/root/delta` (paginated via `@odata.nextLink`). First call returns every non-deleted item. `deleted != null` filtered, folders (`folder` field) filtered, items missing `file.hashes.sha256Hash` skipped with debug log (OneDrive Business `quickXorHash`-only items — out of scope for v0.2).
+  - Foreign hash format: `sha256:<hex-lower>` (lower-cased for consistency with BLAKE3's hexdigest).
+  - `remoteItem` present ⇒ `is_shared=True` (shared-with-you drive item — authoritative signal per Graph docs). Falls back to `createdBy.user.id != account_user_id` when supplied; B2 mirror ensures missing `createdBy.user.id` defaults to `owner_is_me=False` (not True) so the informational-only invariant is preserved.
+  - Path scheme: `Path(f"onedrive:<account_id>://<parent_path>/<name>")`. Colon-boundary in Graph's `parentReference.path` (e.g. `/drive/root:/Documents/Sub`) is stripped so the display path shows `Documents/Sub/file.pdf`. Forward-compatible with sub-phase 5 Alt-C: no `Path.resolve()` semantics required in sub-phase 4 code.
+  - `move_to_trash`: `DELETE /me/drive/items/{id}` (204 No Content on success). Returns `TrashedLocation(source_id, cloud_file_id=id, cloud_trash_id=id)` — OneDrive Personal keeps the same id after moving to the Recycle Bin.
+  - `restore_from_trash`: `POST /me/drive/items/{id}/restore`. When Graph returns HTTP 501 OR any status carrying `error.code == "notSupported"` (documented Personal-only quirk), `SourceError` fires with an actionable message pointing at `https://onedrive.live.com/?id=recyclebin`.
+  - Retry via tenacity on 429/5xx — same `_graph_call` wrapper shape as `_drive_call` in gdrive.py.
+  - `_raise_mapped` translates Graph errors: 401 → `SourceAuthError`, 403 → `SourcePermissionError`, 404 → `SourceNotFoundError`, 429/5xx (post-retry) → `SourceRateLimitError`.
+  - Read-only-scan tripwire: `is_read_only_scan=True` default. `move_to_trash` raises `PermissionError` before any HTTP call — parity with GoogleDriveSource.
+  - `httpx` and `msal` imported lazily so the module can be `py_compile`'d and unit-tested with mocks even without the runtime deps installed. `client_factory` constructor param lets tests inject a MagicMock directly.
+- `auth/clients.py` — adds `BUNDLED_ONEDRIVE_CLIENT_ID = "BUNDLED_ONEDRIVE_CLIENT_ID_TO_REPLACE"` sentinel (same pattern as gdrive), `BUNDLED_ONEDRIVE_CLIENT_SECRET = ""` (Microsoft public clients don't need a secret with PKCE), `ONEDRIVE_AUTH_URL` / `ONEDRIVE_TOKEN_URL` (`/consumers/` authority — rejects Business tenants at token endpoint), `ONEDRIVE_LOGOUT_URL` (unused for revoke since Microsoft has no programmatic revoke endpoint), `ONEDRIVE_DEFAULT_SCOPES = ("Files.ReadWrite", "offline_access", "User.Read")`, and `GRAPH_ROOT` constant.
+- `cli.py` — `_resolve_client_credentials` gains an `onedrive` branch with the same `_TO_REPLACE` sentinel guard (B1 pattern). `dc auth add onedrive` reuses the shared `run_localhost_flow` runner with Microsoft endpoints + `prompt=select_account`. `dc auth test onedrive:<label>` runs a single-item list against Graph to prove the token still works. `dc auth remove onedrive:<label>` best-effort deletes local token; Microsoft has no revocation endpoint so it surfaces a link to `https://account.live.com/consent/Manage` for full app-level revoke. Same duplicate-account guard (B4) applies; same "unknown auth type" refusal for `dropbox` / etc.
+- `sources/__init__.py` — exports `OneDriveSource`.
+- `pyproject.toml` — adds `httpx>=0.27.0,<0.28` and `msal>=1.31.0,<2` to core deps.
+
+Explicitly deferred to sub-phase 5 (unchanged from sub-phase 3):
+- Cloud path validation architecture (`Path("onedrive:x://foo")` non-absolute). Same TODO marker in `apply/mover.py::_validate_report_paths` covers both providers.
+- Wiring `Source.move_to_trash` / `Source.restore_from_trash` from the mover for cloud discards.
+- Manifest schema extension (`source_id`, `cloud_file_id`, `cloud_trash_id`) — schema already backward-compatible with local-only manifests.
+- Cross-source scoring (`cloud_when_local_exists`, singleton-across-sources).
+- Microsoft Business tenant rejection at auth-add time (check token `tid` claim). Currently the `/consumers/` authority ensures Personal-only sign-in at the OAuth flow level; a token-claim double-check is desirable but not blocking for sub-phase 4.
+
+Invariants preserved:
+- All 215 baseline tests still pass; 28 new tests added.
+- `test_no_forbidden_calls.py` still passes. No destructive filesystem calls added; OneDrive trash flows through Graph's Recycle Bin.
+- `is_read_only_scan=True` tripwire enforced on `OneDriveSource` before any HTTP call.
+- Shared cloud files (`remoteItem` present OR `createdBy.user.id != account_user_id`) marked `is_shared=True` — informational-only invariant preserved.
+- OneDrive path scheme `onedrive:<account_id>://<path>` chosen for compatibility with sub-phase 5 Alt-C dispatch on `FileRecord.source_id`. Sub-phase 4 code does NOT rely on `Path.resolve()` semantics.
+- B1 placeholder guard applied to onedrive — `dc auth add onedrive` exits 1 loudly instead of surfacing a raw `invalid_client` from Entra.
+- No new hard-coded credentials. `BUNDLED_ONEDRIVE_CLIENT_ID_TO_REPLACE` is the pre-release sentinel, actively gated at the `_resolve_client_credentials` boundary.
+- Ruff clean on every changed source and test file. Mypy — same `unused-ignore` env quirks as the audit log documented for sub-phase 2; no new structural mypy errors introduced.
+
+Notes for review:
+- OneDrive Personal historically returns 501 for `POST /items/{id}/restore`. The design contract specifies "raise `SourceError` with a clear message pointing at the OneDrive web recycle bin"; we honour that AND additionally detect `error.code == "notSupported"` regardless of HTTP status, since Graph is inconsistent between 400 / 500 / 501 for this case. A 404 (permanently deleted) still surfaces as `SourceNotFoundError` per the shared contract.
+- The `account_user_id` constructor param on `OneDriveSource` is optional; when absent, non-`remoteItem` items default to `is_shared=True` (B2 mirror — never default to owner-is-me). CLI-level wiring can populate this via `GET /me` at auth-add time; that hookup lands cleanly in sub-phase 5.
+
+**Security pass 7 (fork+scaffold, 2026-09-05)** — verdict: **Ready with post-release notes.** Zero DATA-LOSS, zero invariants weakened. 7 findings. Sub-phase 5a schema surgery verified truly zero-behavior-change: no code path in sub-phase 5a dispatches on `source_id`; local rails run for every manifest entry; a poisoned v0.2 manifest with `source_id="gdrive:evil"` cannot trigger cloud action because the mover-to-source dispatch does not exist yet (deferred to 5b/5c). All 7 findings are latent under the sub-phase 4 code (mover does not wire cloud yet). Category counts: 3 safety (PLAUSIBLE), 1 correctness (CONFIRMED), 1 simplification (CONFIRMED), 1 test-coverage (CONFIRMED), 1 latent-DATA-LOSS-shape (PLAUSIBLE, folded into safety). Must-fix BEFORE sub-phase 5b lands:
+
+- safety/PLAUSIBLE (would become DATA-LOSS at 5b): `onedrive.py:414` — `move_to_trash` and `restore_from_trash` interpolate `cloud_file_id` into the URL path with no shape check or URL-encoding. A poisoned manifest with `cloud_file_id="root:/../foo"` would target the wrong item. Sub-phase 5b's `validate_cloud_entry` regex closes it; land the regex check inside the source method too as belt-and-suspenders.
+- safety/PLAUSIBLE (token exfil): `onedrive.py:76` — `httpx.Client(auth=_BearerAuth(...), follow_redirects=True)` forwards the Bearer to non-Graph origins on 302 redirects (Azure CDN for /content; any @odata.nextLink pointing elsewhere). Strip Authorization on cross-origin redirects, or manually re-issue the request without auth on the 302 target.
+- safety/PLAUSIBLE (token exfil): `onedrive.py:252` — `@odata.nextLink` is used verbatim as the next GET URL. Validate `link.startswith(GRAPH_ROOT + "/")` before assigning to `next_url`.
+
+Should-fix in sub-phase 5:
+- correctness/CONFIRMED: `onedrive.py:97` — 501 is classified retryable by `_is_retryable_status`; Personal's restore-not-supported case spends 5 retries + exponential backoff before surfacing the actionable error. Exclude 501 from the retry classifier and short-circuit on `error.code == "notSupported"` body.
+- safety/PLAUSIBLE: `onedrive.py:463` — the Personal-restore-unsupported SourceError embeds `loc.cloud_file_id!r` in the exception string. Drop it; the recycle-bin URL alone is actionable.
+- simplification/CONFIRMED: `pyproject.toml:24` — `msal>=1.31.0` is a core dep but not imported anywhere in `src/`. Move to `[project.optional-dependencies].onedrive` or defer until sub-phase 5 wires refresh.
+- test-coverage/CONFIRMED: `tests/test_sources_onedrive.py` — 25 tests, none pin cloud_file_id shape refusal, nextLink origin refusal, or Bearer-strip-on-cross-origin-redirect. Add three targeted tests to lock the safety findings above once fixed.
+
+Verified positives:
+- `test_no_forbidden_calls.py` still green over `onedrive.py` and `schema.py`. `shutil.move` still confined to `apply/undo.py`.
+- `is_read_only_scan=True` tripwire fires at `onedrive.py:405-409` before URL build, before any HTTP call.
+- `remoteItem` presence → `is_shared=True` (line 333-334); B2 mirror preserves `is_shared=True` default when `account_user_id`/`owner_user_id` absent (line 336-343). Informational-only invariant preserved.
+- B1 placeholder guard for OneDrive client id (`cli.py:718-732`) mirrors the gdrive shape correctly; `dc auth add onedrive` exits 1 with actionable text instead of Entra's raw `invalid_client`.
+- Schema back-compat: `test_v0_1_1_report_apply_dry_run_still_works` is a real load_report+apply_report integration test — v0.1.1 JSON with no `version` marker loads, every member defaults to `source_id="local"`, `apply_report --dry-run` produces byte-identical planned/verified counts.
+- `Manifest.model_dump_json()` only serializes non-sensitive fields (`manifest_version`, `created_at`, `roots`, `entries` with local + cloud id/etag fields). No token/refresh material can leak through the schema.
+- `_validate_report_paths` at `apply/mover.py:52-114` still rejects cloud discards by construction: `resolve_for_check(Path("onedrive:x://..."))` fails `is_within(root)` against any legitimate `report.roots` entry. The TODO(sub-phase 5) landmine at mover.py:46-51 remains latent — no cloud entry can reach a trash operation until 5b/5c.
+- `restore_from_manifest` in `apply/undo.py` never dispatches on `source_id` in 5a; a poisoned `source_id="gdrive:evil"` in a v0.2 manifest cannot dispatch to a cloud path because dispatch does not exist yet. Zero-behavior-change confirmed.
+
+215 baseline + 25 onedrive + 3 cli-auth-onedrive + 9 schema-back-compat = 252 tests passing. Ruff clean.
+
 ### v0.2 — cloud sources (sub-milestone 3: GoogleDriveSource trash + restore + bundled audit fixes)
 
 **Sub-milestone 3 Dev delivered** (2026-09-05): 16 new tests (215 total, 199 → 215). Ruff clean on all new/modified src + test files. `test_no_forbidden_calls.py` still green under the new path-relative allowlist match. Zero-behavior-change for local scans; default `--sources local` unchanged.
@@ -201,6 +294,22 @@ One deferrable finding:
 - simplification/PLAUSIBLE: `dc auth add --force` overwrites the token file locally but does NOT call the provider's `/revoke` endpoint on the previous refresh token. Old refresh token stays valid on Google's side until manually pruned or the user rotates via Google Account settings. Hygiene, not DATA-LOSS.
 
 Category counts: 1 simplification (PLAUSIBLE). Zero DATA-LOSS. Zero invariant-weakening. 215/215 tests passing, ruff clean.
+
+**Eighth audit (Code Review pass 8, coordinator-direct review, 2026-09-05)** — verdict: **Ready with must-fix follow-ups.** Zero DATA-LOSS, zero invariants weakened. Reviewed sub-milestones 4 (OneDriveSource) + 5a (schema surgery) end-to-end. Verified clean: `is_read_only_scan=True` tripwire fires before any HTTP call; `deleted` presence checked BEFORE `remoteItem` so a deleted-and-shared item is filtered (not surfaced); `file.hashes.sha256Hash` missing is a clean skip via `log.debug`; `foreign_hash` is `sha256:` prefixed with `sha256.lower()` (case normalised); DELETE → 204 handled via `raise_for_status`; POST /restore actionable-error path triggers on `status == 501 OR error.code == "notSupported"`; `_raise_mapped` covers 401/403/404/429/5xx; `@odata.nextLink` pagination follows correctly (0-item page with nextLink still advances); schema round-trip preserves `source_id="local"` explicitly on every member and manifest entry; v0.1.1 report loads with default `source_id="local"`.
+
+Category counts: 1 correctness (CONFIRMED), 3 simplification (2 CONFIRMED / 1 PLAUSIBLE), 1 safety (PLAUSIBLE), 1 test-coverage (PLAUSIBLE). Zero DATA-LOSS. Zero invariant-weakening.
+
+Must-fix BEFORE sub-milestone 5b (mover dispatch):
+- correctness/CONFIRMED: `sources/onedrive.py::_is_retryable_http_error` only checks `httpx.HTTPStatusError` — transient `httpx.TimeoutException` / `httpx.ConnectError` / `httpx.NetworkError` are NOT retried. gdrive relies on google-api-python-client's built-in retry; raw httpx needs explicit coverage.
+
+Should-fix same release:
+- safety/PLAUSIBLE: `OneDriveSource.move_to_trash` accepts any FileRecord without checking `record.source_id == self.id`. Asymmetric with `restore_from_trash` which does the check. Adding the guard is defense-in-depth for sub-phase 5b dispatch.
+- simplification/CONFIRMED: `apply/mover.py::_flush_manifest` is O(N²) — every successful move validates every existing entry via `ManifestEntry.model_validate(e) for e in entries` then dumps them all. Fix: keep validated `ManifestEntry` instances in the entries list (or skip re-validation on flush).
+- simplification/CONFIRMED: `msal>=1.31.0,<2` is in `pyproject.toml` core deps but not imported anywhere in `src/` or `tests/`. Aspirational for sub-phase 5 token refresh — move to sub-phase 5 pyproject changes or add a comment linking to the intended use.
+
+Deferrable:
+- simplification/PLAUSIBLE: 501 is classified retryable by `_is_retryable_status`, so `OneDrivePersonal /restore` burns ~31 s of exponential backoff (5 attempts × 1/2/4/8/16 s) before finally emitting the actionable "restore via web UI" error. Excluding 501 from retry (or short-circuiting when body carries `notSupported`) shortens the delay to sub-second.
+- test-coverage/PLAUSIBLE: design doc §11.6 explicitly calls for a `test_cloud_path_repr` locking in the `Path("<source_id>://foo")` → `<source_id>:/foo` collapse behavior. Absent — a future Python change to colon-in-path semantics could silently reactivate the pass-6 landmine.
 
 ## Deferred to v0.1.2
 

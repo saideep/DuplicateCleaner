@@ -81,6 +81,77 @@ def test_scan_accepts_bare_local_sources_flag(
     assert result.exit_code == 0, result.stdout
 
 
+def test_auth_add_onedrive_refuses_when_bundled_client_id_is_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B1 mirror: with the compiled-in Microsoft placeholder, exit 1 loudly.
+
+    The onedrive branch of ``_resolve_client_credentials`` must trip the
+    same ``.endswith('_TO_REPLACE')`` guard that the gdrive branch uses so
+    end users get an actionable message instead of Entra's raw
+    ``invalid_client`` error.
+    """
+    runner = CliRunner()
+    result = runner.invoke(app, ["auth", "add", "onedrive"])
+    assert result.exit_code == 1, result.stdout
+    assert (
+        "microsoft" in result.stdout.lower()
+        or "onedrive" in result.stdout.lower()
+        or "client" in result.stdout.lower()
+    )
+
+
+def test_auth_add_rejects_unknown_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown auth types (e.g. ``dropbox``) must exit 2 with an explanation."""
+    accounts_path = tmp_path / "accounts.toml"
+    tokens_dir = tmp_path / "tokens"
+
+    from duplicate_cleaner.auth.accounts import AccountsRegistry
+    from duplicate_cleaner.auth.tokens import TokenStore
+
+    monkeypatch.setattr(
+        "duplicate_cleaner.cli.AccountsRegistry",
+        lambda: AccountsRegistry(path=accounts_path),
+    )
+    monkeypatch.setattr(
+        "duplicate_cleaner.cli.TokenStore",
+        lambda: TokenStore(base_dir=tokens_dir),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["auth", "add", "dropbox"])
+    assert result.exit_code == 2, result.stdout
+    assert (
+        "unsupported" in result.stdout.lower()
+        or "gdrive" in result.stdout.lower()
+    )
+
+
+def test_scan_refuses_onedrive_source_until_sub_phase_5(
+    tmp_path: Path,
+    with_active_home_config: Path,
+) -> None:
+    """B3 mirror: ``--sources onedrive:main`` also blocked until sub-phase 5."""
+    report_dir = tmp_path / "report"
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(with_active_home_config),
+            "--report",
+            str(report_dir),
+            "--sources",
+            "local,onedrive:main",
+        ],
+    )
+    assert result.exit_code == 2, result.stdout
+    assert "sub-phase 5" in result.stdout
+
+
 def test_auth_add_gdrive_refuses_existing_account_in_non_interactive_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

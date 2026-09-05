@@ -328,6 +328,14 @@ class GoogleDriveSource:
                 f"GoogleDriveSource(id={self.id!r}) is read-only during scan; "
                 "construct with is_read_only_scan=False to enable trashing."
             )
+        # CR#3 (pass 8): mirror the restore_from_trash source_id guard here.
+        # Defense-in-depth against a sub-phase 5b dispatch bug that could
+        # route the wrong (source, record) pair.
+        if record.source_id != self.id:
+            raise SourceError(
+                f"FileRecord.source_id {record.source_id!r} does not match "
+                f"this GoogleDriveSource id {self.id!r}."
+            )
         if not record.cloud_file_id:
             raise SourceError(
                 f"{record.path}: cannot trash without cloud_file_id"

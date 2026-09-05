@@ -1,13 +1,15 @@
 """Bundled OAuth client IDs and provider endpoints.
 
-Compiled-in constants keep the zero-setup default: ``dc auth add gdrive`` works
-out-of-the-box without the user registering their own OAuth application.  The
-BYO override reads a Google Cloud Console-downloaded ``client_secret_*.json``
-via :func:`load_client_secret_json` and takes precedence.
+Compiled-in constants keep the zero-setup default: ``dc auth add gdrive`` (or
+``dc auth add onedrive``) works out-of-the-box without the user registering
+their own OAuth application.  The BYO override reads a provider-downloaded
+``client_secret_*.json`` via :func:`load_client_secret_json` and takes
+precedence.
 
-TODO(v0.2 pre-release): the placeholder value below must be replaced by a
-real Google Cloud Console-registered Desktop app client id + secret before
-v0.2 ships publicly.  Track under docs/AUDIT_LOG.md.
+TODO(v0.2 pre-release): the placeholder values below must be replaced by a
+real Google Cloud Console-registered Desktop app client id + secret AND a
+real Microsoft Entra App Registration (public client, Personal accounts) id
+before v0.2 ships publicly.  Track under docs/AUDIT_LOG.md.
 """
 from __future__ import annotations
 
@@ -27,6 +29,42 @@ GDRIVE_DEFAULT_SCOPES: tuple[str, ...] = (
 GDRIVE_FULL_SCOPES: tuple[str, ...] = (
     "https://www.googleapis.com/auth/drive",
 )
+
+# ---- Microsoft (OneDrive Personal) ------------------------------------------
+# Public-client PKCE flow — Microsoft desktop apps registered as "Public
+# client / native (mobile & desktop)" do NOT require a client secret with
+# PKCE, so ``BUNDLED_ONEDRIVE_CLIENT_SECRET`` stays empty.  The
+# ``/consumers`` authority scopes the app to personal Microsoft accounts and
+# rejects Business/Work tenants at the token endpoint — the v0.2 design
+# explicitly excludes OneDrive Business (which serves ``quickXorHash``
+# instead of SHA-256).
+BUNDLED_ONEDRIVE_CLIENT_ID = "BUNDLED_ONEDRIVE_CLIENT_ID_TO_REPLACE"
+BUNDLED_ONEDRIVE_CLIENT_SECRET = ""
+
+ONEDRIVE_AUTH_URL = (
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
+)
+ONEDRIVE_TOKEN_URL = (
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+)
+# Microsoft does not have a dedicated token-revocation endpoint the way
+# Google does — signing out (``/logout``) invalidates the browser session
+# but is not a client-credentialled revoke.  ``dc auth remove`` therefore
+# falls back to deleting the local token file (send2trash) which is what
+# users actually need.
+ONEDRIVE_LOGOUT_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/logout"
+
+# ``User.Read`` is required to look up the signed-in user's email at
+# auth-add time via ``GET /me``; ``Files.ReadWrite`` covers read + trash;
+# ``offline_access`` yields a refresh token.
+ONEDRIVE_DEFAULT_SCOPES: tuple[str, ...] = (
+    "Files.ReadWrite",
+    "offline_access",
+    "User.Read",
+)
+
+# Microsoft Graph v1.0 root — used by ``sources/onedrive.py``.
+GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 
 
 def load_client_secret_json(path: Path) -> tuple[str, str]:
