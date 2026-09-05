@@ -932,6 +932,59 @@ def test_check_drift_mismatch_raises_source_drift_error() -> None:
     assert scan_modified in msg or "drift" in msg.lower()
 
 
+def test_check_drift_runs_before_move_to_trash_ordering() -> None:
+    """Audit pass 10 finding #4: check_drift MUST fire before move_to_trash.
+
+    Records the sequence of ``get`` / ``delete`` calls on the shared client
+    to lock the ordering — a regression that swapped the two would still
+    pass the individual drift-error tests but not this one.
+    """
+    scan_modified = "2026-09-05T12:34:56.000Z"
+    client = MagicMock()
+    # GET for check_drift returns matching modifiedTime (no drift).
+    get_resp = MagicMock()
+    get_resp.raise_for_status.return_value = None
+    get_resp.json.return_value = {
+        "id": "cf001",
+        "eTag": '"etag-abc"',
+        "lastModifiedDateTime": scan_modified,
+    }
+    client.get.return_value = get_resp
+    # DELETE for move_to_trash returns 204.
+    del_resp = MagicMock()
+    del_resp.raise_for_status.return_value = None
+    del_resp.status_code = 204
+    client.delete.return_value = del_resp
+    src = OneDriveSource(
+        "onedrive:x",
+        token_provider=lambda: "t",
+        account_user_id="me-oid",
+        is_read_only_scan=False,
+        client_factory=lambda _tp: client,
+    )
+    rec = FileRecord(
+        path=Path("onedrive:x://foo"),
+        size=1,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="onedrive:x",
+        cloud_file_id="cf001",
+        etag=f"cf001:{scan_modified}",
+    )
+    src.check_drift(rec)
+    src.move_to_trash(rec)
+    # Extract order from client.method_calls (records method name +
+    # arguments in the exact call order across all method invocations).
+    method_names = [
+        c[0] for c in client.method_calls if c[0] in {"get", "delete"}
+    ]
+    assert method_names == ["get", "delete"], (
+        f"check_drift must run BEFORE move_to_trash — got {method_names}"
+    )
+
+
 def test_nextlink_refused_when_not_graph_origin() -> None:
     """A poisoned ``@odata.nextLink`` outside graph.microsoft.com aborts."""
     evil_page = {

@@ -665,12 +665,23 @@ def apply(
         # through Source.move_to_trash, so the summary carries a per-family
         # count.  ``moved_local`` / ``moved_cloud`` fall back to zero on a
         # v0.1.1-shaped result dict (no cloud entries).
+        # v0.2 sub-phase 5d: cloud entries can be per-entry skipped
+        # (SourceNotFoundError / SourcePermissionError during check_drift
+        # or move_to_trash — the file was already gone or the account lost
+        # permission).  Surface the skip count so users know the applied
+        # set is smaller than the planned set.
         moved_local = int(result.get("moved_local", result.get("moved", 0)))
         moved_cloud = int(result.get("moved_cloud", 0))
+        skipped_cloud = int(result.get("skipped_cloud", 0))
         console.print(
             f"[green]Moved {moved_local} local file(s), {moved_cloud} cloud "
             "file(s) to Trash.[/green]"
         )
+        if skipped_cloud:
+            console.print(
+                f"[yellow]Skipped {skipped_cloud} cloud file(s)[/yellow] "
+                "(source-not-found or permission errors — see logs)."
+            )
         console.print(f"Manifest: {result['manifest_path']}")
 
 
@@ -764,21 +775,72 @@ def _build_gdrive_source(
     )
 
 
-def _build_onedrive_source(
-    account_id: str, data: dict[str, object], *, force_refresh: bool
-) -> object:
-    """Instantiate an OneDriveSource with trash dispatch enabled.
 
-    Microsoft Graph does not auto-refresh the way google-auth does — we
-    plumb ``msal`` here to refresh the access token from the stored
-    refresh_token whenever it expires (or unconditionally when
-    ``force_refresh`` is set).  The source consumes the token via a
-    zero-arg callable so a refresh landing after construction is picked up
-    on the very next request.
+# Audit pass 10 finding #6 — msal.PublicClientApplication cache.  MSAL
+# builds an in-memory TokenCache internally, so re-constructing the app
+# per refresh call was throwing away MSAL's own bookkeeping alongside the
+# CPU cost of the constructor.  Cache once per account_id.  Single-threaded
+# CLI so a plain dict is fine.
+_MSAL_APP_CACHE: dict[str, Any] = {}
+
+
+def _msal_app_for(account_id: str, client_id: str) -> Any:
+    """Return a cached ``msal.PublicClientApplication`` for ``account_id``."""
+    key = f"{account_id}|{client_id}"
+    app_client = _MSAL_APP_CACHE.get(key)
+    if app_client is not None:
+        return app_client
+    try:
+        import msal  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise ApplyError(
+            "msal is required to refresh OneDrive tokens but is not "
+            "installed.  Install with `pip install msal>=1.31`."
+        ) from e
+    app_client = msal.PublicClientApplication(
+        client_id,
+        authority="https://login.microsoftonline.com/consumers",
+    )
+    _MSAL_APP_CACHE[key] = app_client
+    return app_client
+
+
+def _refresh_onedrive_token(
+    account_id: str,
+    *,
+    tokens: TokenStore | None = None,
+    initial_data: dict[str, object] | None = None,
+) -> str:
+    """Refresh the OneDrive access_token for ``account_id`` and return it.
+
+    Audit pass 10 finding #2: Microsoft rotates the ``refresh_token`` on
+    every ``acquire_token_by_refresh_token`` call — if we drop the new
+    value the stored refresh_token goes stale within days/weeks and every
+    later ``dc apply --commit`` fails auth.  This helper persists the new
+    refresh_token (and the new access_token) back into :class:`TokenStore`
+    whenever the response carries one.
+
+    ``initial_data`` is the pre-loaded token blob; the helper re-reads from
+    disk if omitted so that concurrent refreshes converge.  ``tokens`` is
+    injectable for tests.
     """
-    from duplicate_cleaner.sources.onedrive import OneDriveSource
-
+    store = tokens if tokens is not None else TokenStore()
+    if initial_data is None:
+        loaded = store.load(account_id)
+        if loaded is None:
+            raise ApplyError(
+                f"OneDrive account {account_id!r} has no stored token; "
+                "run `dc auth add onedrive --force` to re-authorize."
+            )
+        data: dict[str, Any] = dict(loaded)
+    else:
+        data = dict(initial_data)
     refresh_token = str(data.get("refresh_token") or "")
+    if not refresh_token:
+        raise ApplyError(
+            f"OneDrive account {account_id!r} has no refresh_token; "
+            "run `dc auth add onedrive --force` to re-authorize."
+        )
     client_id = str(data.get("client_id") or BUNDLED_ONEDRIVE_CLIENT_ID)
     scopes_raw = data.get("scopes")
     scopes: list[str] = (
@@ -790,6 +852,69 @@ def _build_onedrive_source(
     # access-token response; MSAL rejects it as a duplicate when passed
     # explicitly.  Filter it out for the refresh call.
     scopes = [s for s in scopes if s != "offline_access"]
+    app_client = _msal_app_for(account_id, client_id)
+    result = app_client.acquire_token_by_refresh_token(
+        refresh_token, scopes=scopes
+    )
+    if not isinstance(result, dict) or "access_token" not in result:
+        err = (
+            result.get("error_description")
+            if isinstance(result, dict)
+            else "unknown"
+        )
+        raise ApplyError(
+            f"OneDrive token refresh for {account_id!r} failed: {err}. "
+            "Run `dc auth add onedrive --force` to re-authorize."
+        )
+    access_token = str(result["access_token"])
+    # Persist the rotated refresh_token if Microsoft supplied one.  A
+    # successful response almost always carries a fresh refresh_token —
+    # but tolerate the (rare) case where it does not by leaving the old
+    # value in place.
+    new_refresh = result.get("refresh_token")
+    updated = dict(data)
+    updated["access_token"] = access_token
+    if isinstance(new_refresh, str) and new_refresh and new_refresh != refresh_token:
+        updated["refresh_token"] = new_refresh
+        log = logging.getLogger(__name__)
+        log.debug(
+            "Persisted rotated refresh_token for %s (MSAL rotation).",
+            account_id,
+        )
+    try:
+        store.save(account_id, updated)
+    except Exception as save_exc:
+        # A save failure MUST NOT abort the current apply — the returned
+        # access_token is still valid for this run.  Surface as a warning
+        # so the user knows to re-auth before the token rotates again.
+        log = logging.getLogger(__name__)
+        log.warning(
+            "Failed to persist rotated OneDrive token for %s: %s.  Next "
+            "apply may require `dc auth add onedrive --force`.",
+            account_id,
+            save_exc,
+        )
+    return access_token
+
+
+def _build_onedrive_source(
+    account_id: str, data: dict[str, object], *, force_refresh: bool
+) -> object:
+    """Instantiate an OneDriveSource with trash dispatch enabled.
+
+    Microsoft Graph does not auto-refresh the way google-auth does — we
+    plumb ``msal`` here to refresh the access token from the stored
+    refresh_token whenever it expires (or unconditionally when
+    ``force_refresh`` is set).  The source consumes the token via a
+    zero-arg callable so a refresh landing after construction is picked up
+    on the very next request.
+
+    Audit pass 10 finding #2: the returned refresh_token (Microsoft rotates
+    it on every acquire_token_by_refresh_token call) is now persisted back
+    to disk via :func:`_refresh_onedrive_token`.  Finding #6: the underlying
+    ``msal.PublicClientApplication`` is cached in ``_MSAL_APP_CACHE``.
+    """
+    from duplicate_cleaner.sources.onedrive import OneDriveSource
 
     # Cache the last known access_token so a source constructed without a
     # network hop still works for offline unit tests.  The provider
@@ -799,43 +924,12 @@ def _build_onedrive_source(
         "access_token": str(data.get("access_token") or ""),
     }
 
-    def _refresh_now() -> str:
-        try:
-            import msal  # type: ignore[import-not-found]
-        except ImportError as e:
-            raise ApplyError(
-                "msal is required to refresh OneDrive tokens but is not "
-                "installed.  Install with `pip install msal>=1.31`."
-            ) from e
-        app_client = msal.PublicClientApplication(
-            client_id,
-            authority="https://login.microsoftonline.com/consumers",
-        )
-        if not refresh_token:
-            raise ApplyError(
-                f"OneDrive account {account_id!r} has no refresh_token; "
-                "run `dc auth add onedrive --force` to re-authorize."
-            )
-        result = app_client.acquire_token_by_refresh_token(
-            refresh_token, scopes=scopes
-        )
-        if not isinstance(result, dict) or "access_token" not in result:
-            err = (
-                result.get("error_description")
-                if isinstance(result, dict)
-                else "unknown"
-            )
-            raise ApplyError(
-                f"OneDrive token refresh for {account_id!r} failed: {err}. "
-                "Run `dc auth add onedrive --force` to re-authorize."
-            )
-        cached_token["access_token"] = str(result["access_token"])
-        return cached_token["access_token"]
-
     if force_refresh or not cached_token["access_token"]:
         # Proactively refresh on --force-refresh, or when we never had one
         # (import-time bug — safer to fail fast).
-        _refresh_now()
+        cached_token["access_token"] = _refresh_onedrive_token(
+            account_id, initial_data=data
+        )
 
     def _token_provider() -> str:
         # If the cached token is empty (e.g. someone reset the dict), fall
@@ -844,7 +938,8 @@ def _build_onedrive_source(
         # path — retrying inside the provider would loop.
         tok = cached_token.get("access_token") or ""
         if not tok:
-            tok = _refresh_now()
+            tok = _refresh_onedrive_token(account_id, initial_data=data)
+            cached_token["access_token"] = tok
         return tok
 
     return OneDriveSource(
@@ -859,23 +954,61 @@ def undo(
     manifest: Annotated[
         Path, typer.Argument(help="Path to manifest.json from a previous apply.")
     ],
+    force_refresh: Annotated[
+        bool,
+        typer.Option(
+            "--force-refresh",
+            help=(
+                "Force a token refresh for every registered cloud account "
+                "before dispatch.  Useful after a long idle since the last "
+                "apply."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Restore files from a previous apply run."""
-    result = restore_from_manifest(manifest)
+    # v0.2 sub-phase 5d: build the sources map so ``restore_from_manifest``
+    # can dispatch each cloud manifest row to the correct source.  Local-
+    # only manifests continue to work with the map built (unused) — the
+    # extra registry-load is cheap and surfaces stale account state early.
+    registry = AccountsRegistry()
+    sources_map: dict[str, Any] = {}
+    try:
+        sources_map = _build_sources_for_apply(
+            registry, force_refresh=force_refresh
+        )
+    except ApplyError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+    try:
+        result = restore_from_manifest(
+            manifest,
+            registry=registry,
+            sources=sources_map or None,
+        )
+    except Exception as e:
+        # UndoError from a mid-run auth/rate abort surfaces here.
+        console.print(f"[red]Undo aborted[/red]: {e}")
+        raise typer.Exit(1) from e
+    restored_local = int(result.get("restored_local", result.get("restored", 0)))
+    restored_cloud = int(result.get("restored_cloud", 0))
+    skipped_cloud = int(result.get("skipped_cloud", 0))
+    total = int(result.get("total", 0))
     console.print(
-        f"Restored {result['restored']}/{result['total']} file(s)."
+        f"Restored {restored_local} local, {restored_cloud} cloud file(s) "
+        f"(of {total} manifest entries)."
     )
-    # CR#1 (pass 9): same treatment for cloud entries on undo.
-    cloud_deferred = result.get("cloud_deferred", 0)
-    if cloud_deferred:
+    if skipped_cloud:
         console.print(
-            f"[yellow]{cloud_deferred} cloud entry/entries deferred — "
-            "cloud restore lands in v0.2 sub-phase 5d.[/yellow]"
+            f"[yellow]Skipped {skipped_cloud} cloud file(s)[/yellow] "
+            "(recycle bin empty or provider does not support restore — "
+            "see errors below)."
         )
     if result["errors"]:
         console.print(f"[yellow]{len(result['errors'])} error(s):[/yellow]")
-        for e in result["errors"][:20]:
-            console.print(f"  • {e}")
+        for msg in result["errors"][:20]:
+            console.print(f"  • {msg}")
 
 
 @weights_app.command("show")

@@ -7,7 +7,7 @@ import re
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import blake3  # type: ignore[import-untyped]
 
@@ -22,6 +22,16 @@ from duplicate_cleaner.paths import (
     validate_not_excluded,
     validate_scan_root_candidate,
 )
+from duplicate_cleaner.sources.base import (
+    SourceAuthError,
+    SourceError,
+    SourceNotFoundError,
+    SourceRateLimitError,
+    TrashedLocation,
+)
+
+if TYPE_CHECKING:
+    from duplicate_cleaner.sources.base import Source
 
 log = logging.getLogger(__name__)
 
@@ -193,6 +203,7 @@ def restore_from_manifest(
     trash_dir_resolver: TrashResolver | None = None,
     allowed_trash_dirs: list[Path] | None = None,
     registry: AccountsRegistry | None = None,
+    sources: dict[str, Source] | None = None,
 ) -> dict[str, Any]:
     """Move each manifest entry from its trashed_at_path back to original_path.
 
@@ -218,6 +229,28 @@ def restore_from_manifest(
     ``allowed_trash_dirs`` overrides the production Trash-directory list —
     tests inject a temp-directory Trash so end-to-end undo flows don't
     require a real ``~/.Trash`` write.
+
+    v0.2 sub-phase 5d — cloud dispatch: ``sources`` maps ``source_id`` (e.g.
+    ``"gdrive:personal"``) to a concrete :class:`Source` whose
+    ``restore_from_trash`` method drives the provider-side un-trash.  For each
+    cloud manifest row we validate the entry shape (audit pass-10 finding #1
+    — ``cloud_trash_id`` MUST NOT be ``None`` on an entry produced by a
+    successful mover run; a null value means the mover logged-and-continued
+    on a ``SourceNotFoundError`` at trash time and there is nothing to
+    restore).  Semantics on cloud failures:
+
+    * :class:`SourceNotFoundError` — recycle bin emptied by user via web UI.
+      Log + increment ``errors``, continue.  (Personal restore is
+      ``notSupported`` anyway — user must use the web UI.)
+    * :class:`SourceAuthError` / :class:`SourceRateLimitError` — abort the
+      whole undo run.  Continuing under a bad token silently misses many
+      restores; better to fail loud with one action item.
+    * Other :class:`SourceError` — logged per-entry, continue.
+
+    ``sources=None`` means local-only mode: a manifest that carries any
+    cloud entry surfaces those entries as per-entry ``errors`` (no run
+    abort) so a v0.1.1 caller of ``restore_from_manifest`` continues to
+    work on a pure-local manifest untouched.
     """
     resolve_trash = trash_dir_resolver or trash_dir_for
     trash_roots: list[Path] = (
@@ -274,9 +307,10 @@ def restore_from_manifest(
     # manifest continues to restore without a real accounts.toml present.
     reg: AccountsRegistry = registry if registry is not None else AccountsRegistry()
 
-    restored = 0
+    restored_local = 0
+    restored_cloud = 0
+    skipped_cloud = 0
     errors: list[str] = []
-    cloud_deferred = 0
     for entry in entries:
         # v0.2 sub-phase 5b: dispatch by source_id BEFORE any local-path
         # validation.  Cloud entries never touch resolve_for_check or the
@@ -292,12 +326,90 @@ def restore_from_manifest(
                     f"{entry.get('original_path')!r}: {e}"
                 )
                 continue
-            # TODO(sub-phase 5d): wire Source.restore_from_trash here.  Look
-            # up the Source for ``sid`` (constructed from AccountsRegistry
-            # at CLI entry), build a TrashedLocation, and dispatch.  Until
-            # then the cloud row is validated but not restored — the count
-            # surfaces in the result dict.
-            cloud_deferred += 1
+            # Audit pass-10 finding #1: entries with cloud_trash_id=None
+            # are aborted-apply artifacts (the mover logged-and-continued
+            # on a SourceNotFoundError from move_to_trash because the file
+            # was already gone at trash time).  Restoring one would silently
+            # un-trash a file another client had trashed — reverse user
+            # intent.  REJECT loudly.
+            cloud_trash_id = entry.get("cloud_trash_id")
+            if not isinstance(cloud_trash_id, str) or not cloud_trash_id:
+                errors.append(
+                    f"Refuse to restore cloud entry "
+                    f"{entry.get('original_path')!r}: cloud entry from an "
+                    "aborted apply — nothing to restore (file was already "
+                    "gone at trash time)."
+                )
+                continue
+            # Local-only mode (v0.1.1 caller shape): surface as per-entry
+            # error, do not abort — the local part of the manifest still
+            # restores.
+            if sources is None:
+                errors.append(
+                    f"Refuse to restore cloud entry "
+                    f"{entry.get('original_path')!r}: no sources map "
+                    "provided (local-only undo mode)."
+                )
+                continue
+            cloud_src = sources.get(sid)
+            if cloud_src is None:
+                errors.append(
+                    f"Refuse to restore cloud entry "
+                    f"{entry.get('original_path')!r}: source_id {sid!r} not "
+                    f"present in sources map ({sorted(sources.keys())}). "
+                    f"Run `dc auth add {sid.split(':', 1)[0]} <label>` for "
+                    "the account and retry."
+                )
+                continue
+            cloud_file_id = entry.get("cloud_file_id")
+            if not isinstance(cloud_file_id, str):
+                # Belt-and-braces: validate_cloud_manifest_entry above
+                # already rejects a missing / non-string cloud_file_id.
+                errors.append(
+                    f"Refuse to restore cloud entry "
+                    f"{entry.get('original_path')!r}: cloud_file_id absent."
+                )
+                continue
+            original_path_raw = entry.get("original_path")
+            original_path_str = (
+                original_path_raw if isinstance(original_path_raw, str) else ""
+            )
+            loc = TrashedLocation(
+                source_id=sid,
+                original_path=original_path_str,
+                cloud_file_id=cloud_file_id,
+                cloud_trash_id=cloud_trash_id,
+            )
+            try:
+                cloud_src.restore_from_trash(loc)
+            except SourceNotFoundError as e:
+                # Web-UI empty-Trash / permanent-delete — nothing to un-trash.
+                # OneDrive Personal restore is 501/notSupported so this branch
+                # also catches the "you must use the web UI" case there.
+                log.warning(
+                    "Cloud restore skipped for %s: %s",
+                    original_path_str,
+                    e,
+                )
+                errors.append(
+                    f"{original_path_str}: cloud trash was emptied — "
+                    "unable to restore.  Check the provider's web UI."
+                )
+                skipped_cloud += 1
+                continue
+            except (SourceAuthError, SourceRateLimitError) as e:
+                # Abort — a bad token / hard rate-limit would silently miss
+                # every following entry.  Surface loudly with one action item.
+                raise UndoError(
+                    f"Aborted mid-undo: {type(e).__name__} restoring "
+                    f"{original_path_str}: {e}.  Fix the underlying issue "
+                    "(run `dc auth add --force` for auth) and retry."
+                ) from e
+            except SourceError as e:
+                # Provider-side failure — surface but keep restoring.
+                errors.append(f"{original_path_str}: {e}")
+                continue
+            restored_cloud += 1
             continue
 
         original = Path(entry["original_path"])
@@ -373,12 +485,22 @@ def restore_from_manifest(
         except OSError as exc:
             errors.append(f"Restore failed for {original}: {exc}")
             continue
-        restored += 1
+        restored_local += 1
 
+    # v0.2 sub-phase 5d: split ``restored`` into per-family counters + a
+    # ``skipped_cloud`` counter for source-not-found / permission failures.
+    # ``restored`` stays for backwards-compat with v0.1.1 callers (CLI
+    # summary + existing tests) as the sum of local + cloud restores.
+    # ``cloud_deferred`` is preserved as 0 in 5d — cloud entries either
+    # restore (counted in ``restored_cloud``), skip (``skipped_cloud``), or
+    # error out (in ``errors``).  A v0.1.1-shaped local-only manifest still
+    # returns ``cloud_deferred=0`` and ``restored=restored_local``.
     return {
-        "restored": restored,
+        "restored": restored_local + restored_cloud,
+        "restored_local": restored_local,
+        "restored_cloud": restored_cloud,
+        "skipped_cloud": skipped_cloud,
         "errors": errors,
         "total": len(entries),
-        # v0.2 sub-phase 5b: cloud entries validated but not yet restored.
-        "cloud_deferred": cloud_deferred,
+        "cloud_deferred": 0,
     }

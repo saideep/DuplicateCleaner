@@ -393,6 +393,12 @@ def apply_report(
         # ``cloud_deferred`` stays for backcompat with the 5b result-dict
         # shape but is always 0 in 5c.
         "cloud_deferred": 0,
+        # v0.2 sub-phase 5d: cloud entries skipped per-entry (SourceNotFound
+        # / SourcePermission during check_drift or move_to_trash) are counted
+        # here so the CLI can surface a "Skipped M cloud file(s)" line.
+        # ``moved_cloud`` counts successful dispatches; ``skipped_cloud`` is
+        # every log-and-continue path in the cloud dispatch loop.
+        "skipped_cloud": 0,
     }
 
     if not commit:
@@ -458,6 +464,7 @@ def apply_report(
     tf = trash_fn or _default_trash_fn
     moved_local = 0
     moved_cloud = 0
+    skipped_cloud = 0
     for i, (p, s, mt, _) in enumerate(verified):
         # Re-verify immediately before the mutation — the disk may have
         # changed between the batch verify and now.
@@ -536,6 +543,7 @@ def apply_report(
                     f"({moved_local + moved_cloud} file(s) moved so far)."
                 ) from e
             log.error("Drift-check failed for %s: %s", m.path, e)
+            skipped_cloud += 1
             continue
         # Move to cloud trash.  tenacity retry is already inside the source
         # implementation; a SourceRateLimitError here is post-retry.
@@ -560,6 +568,7 @@ def apply_report(
             ) from e
         except SourceError as e:
             log.error("Cloud trash failed for %s: %s", m.path, e)
+            skipped_cloud += 1
             continue
         # TrashedLocation might carry an updated cloud_trash_id (Drive keeps
         # the same id; OneDrive Personal too).  Record both.
@@ -576,5 +585,6 @@ def apply_report(
     result["moved"] = moved_local + moved_cloud
     result["moved_local"] = moved_local
     result["moved_cloud"] = moved_cloud
+    result["skipped_cloud"] = skipped_cloud
     result["committed"] = True
     return result

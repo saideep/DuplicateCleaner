@@ -390,3 +390,72 @@ def test_apply_cloud_entry_local_only_mode_refuses(tmp_path: Path) -> None:
             sources=None,
         )
     assert "local-only" in str(exc.value).lower() or "sources" in str(exc.value)
+
+
+def test_mid_batch_drift_abort_flushes_prior_entries(tmp_path: Path) -> None:
+    """Audit pass 10 finding #3: 3 cloud entries; entry 2 drifts; assert on-disk
+    manifest has entry[0] stamped with cloud_trash_id (a successful move) and
+    entries[1..2] with cloud_trash_id=None (never dispatched)."""
+    entries_meta = [
+        {
+            "cloud_file_id": _GDRIVE_REAL_ID,
+            "etag": f"{_GDRIVE_REAL_ID}:t1",
+            "path": Path("gdrive:personal://c1.bin"),
+        },
+        {
+            "cloud_file_id": _GDRIVE_REAL_ID_2,
+            "etag": f"{_GDRIVE_REAL_ID_2}:t2",
+            "path": Path("gdrive:personal://c2.bin"),
+        },
+        {
+            "cloud_file_id": "3XyZw" + "A" * 16,
+            "etag": "3XyZw" + "A" * 16 + ":t3",
+            "path": Path("gdrive:personal://c3.bin"),
+        },
+    ]
+    report_path = _mkreport(tmp_path, cloud_members=entries_meta)
+    reg = _FakeRegistry(ids=["gdrive:personal"])
+
+    call_index = {"n": 0}
+
+    def _drift_side_effect(rec: Any) -> None:
+        # Entry 0: pass drift.  Entry 1: raise drift.  Entry 2 is never
+        # reached because the run aborts.
+        n = call_index["n"]
+        call_index["n"] = n + 1
+        if n == 0:
+            return
+        raise SourceDriftError(f"drift on {rec.cloud_file_id}")
+
+    src = MagicMock()
+    src.id = "gdrive:personal"
+    src.is_read_only_scan = False
+    src.check_drift.side_effect = _drift_side_effect
+    # move_to_trash on entry 0 returns a plausible TrashedLocation.
+    src.move_to_trash.return_value = TrashedLocation(
+        source_id="gdrive:personal",
+        original_path="gdrive:personal://c1.bin",
+        cloud_file_id=_GDRIVE_REAL_ID,
+        cloud_trash_id=_GDRIVE_REAL_ID,
+    )
+
+    with pytest.raises(ApplyError):
+        apply_report(
+            report_path,
+            commit=True,
+            runs_dir=tmp_path / "runs",
+            registry=reg,  # type: ignore[arg-type]
+            sources={"gdrive:personal": src},
+        )
+
+    # Locate the flushed manifest — it is inside the runs_dir subdirectory.
+    manifest_candidates = list((tmp_path / "runs").rglob("manifest.json"))
+    assert len(manifest_candidates) == 1
+    data = json.loads(manifest_candidates[0].read_text())
+    cloud_rows = [e for e in data["entries"] if e["source_id"] == "gdrive:personal"]
+    assert len(cloud_rows) == 3
+    # Row 0 was a successful move — cloud_trash_id must be set.
+    assert cloud_rows[0]["cloud_trash_id"] == _GDRIVE_REAL_ID
+    # Rows 1 & 2 never dispatched — cloud_trash_id stays None.
+    assert cloud_rows[1]["cloud_trash_id"] is None
+    assert cloud_rows[2]["cloud_trash_id"] is None

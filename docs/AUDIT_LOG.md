@@ -24,6 +24,7 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Singleton files never a discard candidate**: enforced in scorer AND mover.
 - **Shared cloud files informational-only**: (v0.2) — never proposed for deletion.
 - **Cloud discards go to cloud trash; undo restores via API** (v0.2): tool cannot hard-delete cloud files. OAuth scopes are trash-only (`drive.file`, `Files.ReadWrite`). Undo dispatches by `source_id` to the correct `Source.restore_from_trash`.
+- **Cloud manifest entries with `cloud_trash_id=None` MUST be rejected on undo** (v0.2 sub-phase 5d): a null value signals an aborted-apply artifact — the mover logged-and-continued on a `SourceNotFoundError` at trash time because the file was already gone. Restoring one would silently un-trash a file another client had trashed, reversing user intent.
 - **Cloud drift check via etag** (v0.2): immediately before `move_to_trash` on any cloud member, the source re-reads the file's current etag and verifies it matches the scan-time etag. Etag mismatch aborts the run (same semantics as size+mtime drift for local).
 - **Manifest atomic-write applies to cloud entries too**: the tmpfile + fsync + os.replace + parent-dir-fsync pattern is unchanged; cloud manifest rows record `source_id`, `cloud_file_id`, `cloud_trash_id`, and pre-move `etag`.
 - **Cohesive units move atomically** (v0.3): music albums, book series, git projects, and photo or video event clusters. Every plan entry in a cohesion group carries `cohesion_group`; `dc organize apply` refuses to run if members target different destinations unless `--split-cohesive-units` is passed. The invariant is checked before the first move; no partial split can happen mid-run.
@@ -90,6 +91,64 @@ Must-address in 5d (or same release):
 - correctness/CONFIRMED: CLI apply summary hides skipped cloud entries (no `skipped_cloud` counter surfaced from the mover result dict).
 - simplification/CONFIRMED: `msal.PublicClientApplication` reconstructed on every `_refresh_now` call; cache once per account.
 - simplification/CONFIRMED: OneDrive `check_drift` fall-through to raw Graph eTag is unreachable dead code under 5c's composite-etag emission.
+
+### v0.2 — cloud sources (sub-milestone 5d: Source.restore_from_trash wired from undo + pass-10 follow-up closers)
+
+**Sub-milestone 5d Dev delivered** (2026-09-05): 12 new tests (288 → 300 total). Ruff clean on every changed source and test file. Zero-behavior-change for local scans; the v0.1.1 rails still run for every `source_id == "local"` entry in a manifest.
+
+Shipped:
+- `apply/undo.py::restore_from_manifest` — new keyword arg `sources: dict[str, Source] | None = None`. For each cloud manifest entry: `validate_cloud_manifest_entry` runs (5b), then the audit-pass-10 finding #1 rail rejects entries with `cloud_trash_id is None` (aborted-apply artifacts — restoring one would silently un-trash a file another client had trashed). On pass, the entry constructs a `TrashedLocation` and dispatches to `sources[source_id].restore_from_trash`. `SourceNotFoundError` → log + `skipped_cloud += 1` + per-entry error, continue. `SourceAuthError` / `SourceRateLimitError` → `UndoError` abort. Other `SourceError` → per-entry error, continue. `sources=None` on a manifest with cloud entries surfaces per-entry errors (no run abort — local entries still restore).
+- `apply/undo.py::restore_from_manifest` return-dict shape now includes `restored_local`, `restored_cloud`, `skipped_cloud`. `restored` is kept as the sum of local + cloud for backwards-compat with v0.1.1 CLI + tests. `cloud_deferred` is always 0 in 5d (was the 5b "cloud entry validated but not restored" counter — replaced by the per-family split).
+- `apply/mover.py` — result dict gains `skipped_cloud: int` for SourceNotFoundError / SourcePermissionError paths in check_drift + move_to_trash.  Both `continue` branches now increment the counter so the CLI can surface a "Skipped M cloud file(s)" line.
+- `cli.py::apply` — CLI summary now surfaces `skipped_cloud`: `"Moved N local file(s), M cloud file(s) to Trash. Skipped K cloud file(s)."` when K > 0.
+- `cli.py::undo` — grows a `--force-refresh` flag, builds the sources map via `_build_sources_for_apply`, passes it to `restore_from_manifest`, and prints the per-family counters + skip line.
+- `cli.py::_build_onedrive_source` + new `_refresh_onedrive_token` helper — Audit pass 10 finding #2 closer: MSAL rotates the `refresh_token` on every `acquire_token_by_refresh_token` call.  After a successful refresh we now extract `result.get("refresh_token")` and, when Microsoft supplied a new one, persist the whole token blob (including the rotated refresh_token) back to `TokenStore.save` so the stored value never goes stale.  A save failure logs a warning but does not abort the current run — the returned access_token is still valid for this batch.
+- `cli.py::_msal_app_for` + module-level `_MSAL_APP_CACHE` — Audit pass 10 finding #6 closer: `msal.PublicClientApplication` is now cached per `(account_id, client_id)` in a plain dict (CLI is single-threaded so no locking required).  Prevents both the constructor CPU cost AND the loss of MSAL's in-memory TokenCache across refreshes.
+- `sources/onedrive.py::check_drift` — Audit pass 10 finding #7 closer: removed the unreachable raw-Graph-eTag fallback branch (under the 5c composite-etag emission a bare `"etag-abc"` never equals `f"{id}:{modified}"`, so the fallback branch was dead code).  The `$select=id,eTag,lastModifiedDateTime` query stays for future rework and to keep the payload shape stable.
+
+Tests shipped:
+- `tests/test_undo_cloud_dispatch.py` (new file, 8 tests):
+  - `test_undo_cloud_entry_calls_source_restore_from_trash` — asserts TrashedLocation shape passed to source.
+  - `test_undo_cloud_entry_refused_when_source_not_in_map` — missing source in map → per-entry error.
+  - `test_undo_cloud_entry_with_null_cloud_trash_id_rejected` — audit pass 10 finding #1 lock.
+  - `test_undo_cloud_entry_with_bad_cloud_file_id_shape_rejected` — shape gate mirrored on undo side.
+  - `test_undo_mixed_local_and_cloud` — 2 local + 3 cloud entries; both families restore.
+  - `test_undo_cloud_source_not_found_logs_and_continues` — one 404, one success; skipped_cloud == 1.
+  - `test_undo_cloud_source_auth_error_aborts` — SourceAuthError → UndoError; second entry never dispatched.
+  - `test_undo_local_only_report_still_works` — v0.1.1-shaped manifest with no `source_id` field on entries.
+  - `test_undo_cloud_entry_local_only_mode_errors_per_entry` — sources=None + mixed manifest keeps local restore going while surfacing cloud entries as per-entry errors.
+- `tests/test_apply_cloud_dispatch.py::test_mid_batch_drift_abort_flushes_prior_entries` — Audit pass 10 finding #3 lock: 3 cloud entries, drift on entry 2, verify on-disk manifest has entry[0] stamped with cloud_trash_id and entries[1..2] with cloud_trash_id=None.
+- `tests/test_sources_gdrive.py::test_check_drift_runs_before_move_to_trash_ordering` — Audit pass 10 finding #4 lock: `files_client.method_calls` proves `get` (drift) fires before `update` (trash).
+- `tests/test_sources_onedrive.py::test_check_drift_runs_before_move_to_trash_ordering` — same ordering lock via `client.method_calls`.
+
+Tests updated (5b → 5d semantics — cloud entries now RESTORE, not defer):
+- `tests/test_undo_validation.py::test_undo_cloud_path_never_resolved` — supplies a MagicMock source; asserts `restored_cloud == 1` and `cloud_deferred == 0`.
+- `tests/test_undo_validation.py::test_undo_mixed_manifest_dispatches_correctly` — asserts both `restored_local == 1` and `restored_cloud == 1`; verifies `source.restore_from_trash` was called.
+- `tests/test_undo_validation.py::test_undo_archive_member_check_scoped_to_local` — asserts `restored_cloud == 1` (cloud original_path with `::` still dispatches through the cloud rails).
+
+Invariants preserved:
+- All 288 pre-existing tests still pass (three 5b-style tests updated for 5d semantics as noted above); 12 new tests added (300 total).
+- `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py`.
+- Cloud `Path` NEVER `.resolve()`d in the undo dispatch code (regression test `test_undo_cloud_path_never_resolved` locks it in via `resolve_for_check` spy).
+- Manifest cloud entries with `cloud_trash_id=None` are REJECTED (audit pass 10 finding #1 — critical for undo correctness).
+- H2/F12/H5 rails still enforced on local entries only — cloud dispatch bypasses them (Alt-C treats cloud `original_path` as opaque display data).
+- MSAL rotated refresh_token now persisted; stale-refresh-in-days-weeks bug closed.
+- Ruff clean on every changed source and test file. Mypy `--strict` clean on all changed files (pre-existing `unused-ignore` warnings on 3rd-party import stubs are unchanged — documented in sub-milestone 2 notes).
+
+Explicitly deferred to sub-milestone 5e:
+- Cross-source scoring (`cloud_when_local_exists`, `is_singleton_across_sources`, `retained_cloud_order`).
+- `FakeCloudSource` end-to-end integration test.
+
+**Eleventh audit (Combined Code Review + Security pass 11, coordinator-direct review, 2026-09-05)** — verdict: **Ready with post-release notes.** Zero DATA-LOSS in 5d, zero invariants weakened. Verified: audit-pass-10 finding #1 (null `cloud_trash_id` rejection) fires EARLY at `apply/undo.py:335-343` — before the `sources.get(sid)` lookup and before any provider API call — with an actionable "aborted apply — nothing to restore" message; the dispatch key is `sources[source_id].restore_from_trash(TrashedLocation)`, symmetric with mover's `sources[source_id].move_to_trash(record)`; missing source_id → typed per-entry error (not KeyError) via `sources.get(sid)` + None-check at `undo.py:354`; local v0.1.1 manifests still restore untouched (`test_undo_local_only_report_still_works`); `shutil.move` still confined to `apply/undo.py` per `test_no_forbidden_calls`; cloud `Path` never `.resolve()`d in the new dispatch (regression-locked by `test_undo_cloud_path_never_resolved`); H2/F12/H5 rails still gate every local entry; MSAL rotated `refresh_token` is extracted via `result.get("refresh_token")` and persisted back only when it differs from the stored value (fallback to existing value when Microsoft omits the field); `_MSAL_APP_CACHE` correctly keyed by `f"{account_id}|{client_id}"` so a BYO client_id override invalidates the cache; `skipped_cloud` incremented on mover's `SourceNotFoundError`/`SourcePermissionError` paths (via generic `except SourceError`) and on undo's `SourceNotFoundError` catch, NOT on abort paths (drift/auth/rate); dead OneDrive eTag fallback branch removed at `sources/onedrive.py::check_drift`.
+
+Category counts: 2 test-coverage (CONFIRMED), 1 correctness (PLAUSIBLE), 2 simplification (1 CONFIRMED / 1 PLAUSIBLE). Zero DATA-LOSS. Zero invariant-weakening.
+
+Findings (deferrable, post-release notes):
+- test-coverage/CONFIRMED: no test exercises `cli._refresh_onedrive_token` — the audit-pass-10 finding #2 closer (persist Microsoft-rotated refresh_token back to disk) has ZERO unit-test coverage. A regression that dropped `result.get("refresh_token")` or skipped the `store.save` path would go undetected until real-world tokens rotated (days/weeks in production).
+- test-coverage/CONFIRMED: no test verifies `cli._msal_app_for` reuses the cached `PublicClientApplication` across refresh calls (audit-pass-10 finding #6 closer). A regression that rebuilt the app per refresh would slip past every existing test; only user-visible symptom is slower refresh + loss of MSAL's internal in-memory TokenCache.
+- correctness/PLAUSIBLE: `apply/undo.py::restore_from_manifest` handles `SourceNotFoundError` with its own catch that increments `skipped_cloud`, but `SourcePermissionError` falls into the generic `except SourceError as e:` branch that only appends to `errors` — mover's cloud dispatch treats ALL non-abort `SourceError` subclasses (including `SourcePermissionError`) as `skipped_cloud++`. Asymmetric counter behavior; the CLI's undo summary `"Skipped M cloud file(s)"` line silently undercounts permission-denied restore attempts. Fix: increment `skipped_cloud` in the generic `except SourceError` branch too, or add an explicit `except SourcePermissionError` before it.
+- simplification/CONFIRMED (still open from pass 9): `restore_from_manifest` builds `reg = AccountsRegistry()` once at line 308 but `validate_cloud_manifest_entry(entry, reg)` calls `reg.load()` per manifest entry (each call does `enforce_secure_mode` stat + `tomllib.load`). On a 100-cloud-entry manifest that is 100 disk reads. Same shape in `_validate_report_paths` at mover. Fix: compute `authorized = {"local"} | {e.id for e in reg.load()}` once at the top of each entry and pass the pre-computed set to a lower-level validator (or memoize `.load()` on the registry).
+- simplification/PLAUSIBLE: when `SourceAuthError`/`SourceRateLimitError` aborts undo mid-run, the raised `UndoError` message lacks per-family counters — user cannot tell how many local + cloud entries had already restored. The mover's parallel abort path explicitly says `"(N file(s) moved so far)"`. Not data-loss (successful restores stay restored on the provider), but the missing count may lead a user to re-run undo and hit "Original already exists, refusing to overwrite" for the earlier batch. Fix: fold `restored_local`/`restored_cloud` into the abort message.
 
 ### v0.2 — cloud sources (sub-milestone 5c: Source.move_to_trash wired from mover + pre-trash drift check)
 

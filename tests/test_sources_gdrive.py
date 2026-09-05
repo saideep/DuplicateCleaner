@@ -700,3 +700,56 @@ def test_check_drift_mismatch_raises_source_drift_error() -> None:
         src.check_drift(rec)
     msg = str(exc.value)
     assert scan_modified in msg or "drift" in msg.lower()
+
+
+def test_check_drift_runs_before_move_to_trash_ordering() -> None:
+    """Audit pass 10 finding #4: pin the ordering of check_drift → move_to_trash.
+
+    Uses ``MagicMock`` with a shared parent to record call order across two
+    methods.  A regression that swapped the calls (or dropped the drift
+    check entirely) would slip past the drift-error tests but not this one.
+    """
+    scan_modified = "2026-09-05T12:34:56.000Z"
+    service = MagicMock()
+    # files().get(...).execute() returns matching modifiedTime (no drift).
+    get_request = MagicMock()
+    get_request.execute.return_value = {
+        "id": _REAL_ID,
+        "modifiedTime": scan_modified,
+    }
+    # files().update(...).execute() returns the trashed=true response.
+    update_request = MagicMock()
+    update_request.execute.return_value = {"id": _REAL_ID, "trashed": True}
+    files_client = service.files.return_value
+    files_client.get.return_value = get_request
+    files_client.update.return_value = update_request
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        is_read_only_scan=False,
+        service_factory=lambda _c: service,
+    )
+    from duplicate_cleaner.scan.walk import FileRecord
+
+    rec = FileRecord(
+        path=Path("gdrive:x://foo"),
+        size=1,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="gdrive:x",
+        cloud_file_id=_REAL_ID,
+        etag=f"{_REAL_ID}:{scan_modified}",
+    )
+    src.check_drift(rec)
+    src.move_to_trash(rec)
+    # The Drive REST client separates ``get`` (drift check) from ``update``
+    # (trash).  Extract the call ordering by inspecting ``method_calls`` on
+    # the shared parent ``files_client``.
+    method_names = [
+        c[0] for c in files_client.method_calls if c[0] in {"get", "update"}
+    ]
+    assert method_names == ["get", "update"], (
+        f"check_drift must run BEFORE move_to_trash — got {method_names}"
+    )

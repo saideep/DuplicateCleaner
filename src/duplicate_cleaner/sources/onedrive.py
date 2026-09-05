@@ -656,17 +656,21 @@ class OneDriveSource:
         )
 
     def check_drift(self, record: FileRecord) -> None:
-        """Re-fetch ``lastModifiedDateTime`` + ``eTag`` and verify no drift.
+        """Re-fetch ``lastModifiedDateTime`` and verify no drift.
 
         v0.2 sub-phase 5c: called by the mover immediately before
         :meth:`move_to_trash`.  Issues
-        ``GET /me/drive/items/{id}?$select=id,eTag,lastModifiedDateTime``.
-        The primary check is against the composite
-        ``f"{cloud_file_id}:{lastModifiedDateTime}"`` (the same shape
-        :meth:`list_files` stamps into ``FileRecord.etag``).  ``eTag`` is only
-        used as a secondary confirmation because Graph does not always echo
-        it on ``$select``.  A mismatch raises :class:`SourceDriftError` —
-        the mover aborts the entire apply run.
+        ``GET /me/drive/items/{id}?$select=id,eTag,lastModifiedDateTime``
+        and rebuilds the composite ``f"{cloud_file_id}:{lastModifiedDateTime}"``
+        that :meth:`list_files` stamps into ``FileRecord.etag`` at scan time.
+        A mismatch raises :class:`SourceDriftError` — the mover aborts the
+        entire apply run.
+
+        Audit pass 10 finding #7: the raw Graph ``eTag`` fallback branch was
+        unreachable under the sub-phase 5c composite-etag emission (the
+        composite is always ``id:modified``, never a bare ``"etag-abc"``).
+        Removed.  ``eTag`` remains in the ``$select`` for future scheme
+        rework and to keep the payload shape stable.
         """
         if not record.cloud_file_id:
             raise SourceError(
@@ -702,16 +706,10 @@ class OneDriveSource:
         current_composite = f"{record.cloud_file_id}:{modified or ''}"
         if current_composite == record.etag:
             return
-        # Fall back to the provider-supplied ``eTag`` for a defense-in-depth
-        # second chance: if the record.etag happens to be the raw Graph eTag
-        # (older scans or a future scheme change), accept an eTag match too.
-        graph_etag = body.get("eTag")
-        if isinstance(graph_etag, str) and graph_etag and graph_etag == record.etag:
-            return
         raise SourceDriftError(
             f"Cloud etag drift for {record.path}: scan={record.etag!r} "
-            f"now={current_composite!r} (graph eTag={graph_etag!r}) — the "
-            "file changed on the provider since scan.  Rescan and retry."
+            f"now={current_composite!r} — the file changed on the provider "
+            "since scan.  Rescan and retry."
         )
 
 

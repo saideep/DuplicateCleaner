@@ -156,7 +156,13 @@ def test_undo_cloud_path_never_resolved(tmp_path: Path) -> None:
     Patches ``paths.resolve_for_check`` to record every call.  A cloud
     manifest entry must NOT surface at ``resolve_for_check`` — the dispatch
     branch runs cloud rails only.
+
+    v0.2 sub-phase 5d: the cloud dispatch now calls
+    ``Source.restore_from_trash``; we supply a MagicMock source so the entry
+    routes through cloud rails and never touches ``resolve_for_check``.
     """
+    from unittest.mock import MagicMock
+
     manifest = _write_manifest(
         tmp_path,
         entries=[
@@ -168,6 +174,7 @@ def test_undo_cloud_path_never_resolved(tmp_path: Path) -> None:
                 "hash": "H" * 32,
                 "trashed_at_path": None,
                 "cloud_file_id": _GDRIVE_REAL_ID,
+                "cloud_trash_id": _GDRIVE_REAL_ID,
                 "etag": f"{_GDRIVE_REAL_ID}:1",
             }
         ],
@@ -182,14 +189,19 @@ def test_undo_cloud_path_never_resolved(tmp_path: Path) -> None:
         resolve_calls.append(p)
         return original(p)
 
+    stub_src = MagicMock()
+    stub_src.id = "gdrive:personal"
+    stub_src.restore_from_trash.return_value = None
     with patch.object(undo_mod, "resolve_for_check", side_effect=_spy):
         result = restore_from_manifest(
             manifest,
             allowed_trash_dirs=[tmp_path],
             registry=_FakeRegistry(["gdrive:personal"]),  # type: ignore[arg-type]
+            sources={"gdrive:personal": stub_src},
         )
-    # Cloud entry validated but not yet restored (5d wire-up).
-    assert result["cloud_deferred"] == 1
+    # v0.2 sub-phase 5d: cloud entry restored (was cloud_deferred in 5b).
+    assert result["restored_cloud"] == 1
+    assert result["cloud_deferred"] == 0
     # No call recorded a cloud path.
     for p in resolve_calls:
         assert "gdrive:" not in str(p), (
@@ -228,11 +240,16 @@ def test_undo_local_flow_still_runs_local_rails(tmp_path: Path) -> None:
 
 
 def test_undo_mixed_manifest_dispatches_correctly(tmp_path: Path) -> None:
-    """Cloud entries validate cleanly and local entries continue to restore.
+    """Cloud entries validate + dispatch cleanly and local entries continue to restore.
 
     The local entry uses the trashed-basename fallback (no trashed_at_path)
     against a fake Trash directory injected via ``allowed_trash_dirs``.
+
+    v0.2 sub-phase 5d: the cloud entry now dispatches through the mock
+    source's ``restore_from_trash`` — both count in ``restored``.
     """
+    from unittest.mock import MagicMock
+
     fake_trash = tmp_path / "trash"
     fake_trash.mkdir()
     original_local = tmp_path / "restored.txt"
@@ -257,19 +274,27 @@ def test_undo_mixed_manifest_dispatches_correctly(tmp_path: Path) -> None:
                 "hash": "H" * 32,
                 "trashed_at_path": None,
                 "cloud_file_id": _GDRIVE_REAL_ID,
+                "cloud_trash_id": _GDRIVE_REAL_ID,
                 "etag": f"{_GDRIVE_REAL_ID}:1",
             },
         ],
     )
+    stub_src = MagicMock()
+    stub_src.id = "gdrive:personal"
+    stub_src.restore_from_trash.return_value = None
     result = restore_from_manifest(
         manifest,
         allowed_trash_dirs=[fake_trash],
         registry=_FakeRegistry(["gdrive:personal"]),  # type: ignore[arg-type]
+        sources={"gdrive:personal": stub_src},
     )
-    # The local entry restored; the cloud entry was validated but deferred.
-    assert result["restored"] == 1
-    assert result["cloud_deferred"] == 1
+    # Both entries restored — one local, one cloud.
+    assert result["restored_local"] == 1
+    assert result["restored_cloud"] == 1
+    assert result["restored"] == 2
+    assert result["cloud_deferred"] == 0
     assert original_local.exists()
+    stub_src.restore_from_trash.assert_called_once()
 
 
 def test_undo_archive_member_check_scoped_to_local(tmp_path: Path) -> None:
@@ -279,7 +304,11 @@ def test_undo_archive_member_check_scoped_to_local(tmp_path: Path) -> None:
     scope is intentionally locked to LOCAL entries so a future cloud path
     scheme with ``::`` (unlikely but permissible in the opaque display slot)
     cannot brick undo.
+
+    v0.2 sub-phase 5d: cloud entries now dispatch to ``Source.restore_from_trash``.
     """
+    from unittest.mock import MagicMock
+
     manifest = _write_manifest(
         tmp_path,
         entries=[
@@ -294,18 +323,23 @@ def test_undo_archive_member_check_scoped_to_local(tmp_path: Path) -> None:
                 "hash": "H" * 32,
                 "trashed_at_path": None,
                 "cloud_file_id": _GDRIVE_REAL_ID,
+                "cloud_trash_id": _GDRIVE_REAL_ID,
                 "etag": f"{_GDRIVE_REAL_ID}:1",
             }
         ],
     )
-    # Would previously raise UndoError up-front; now the cloud dispatch runs
-    # the cloud rails and the entry is deferred to 5d.
+    stub_src = MagicMock()
+    stub_src.id = "gdrive:personal"
+    stub_src.restore_from_trash.return_value = None
+    # Would previously raise UndoError up-front; the cloud dispatch runs the
+    # cloud rails and the entry restores.
     result = restore_from_manifest(
         manifest,
         allowed_trash_dirs=[tmp_path],
         registry=_FakeRegistry(["gdrive:personal"]),  # type: ignore[arg-type]
+        sources={"gdrive:personal": stub_src},
     )
-    assert result["cloud_deferred"] == 1
+    assert result["restored_cloud"] == 1
     assert result["errors"] == []
 
 
