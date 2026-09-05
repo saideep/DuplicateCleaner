@@ -10,6 +10,7 @@ import os
 import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from duplicate_cleaner.constants import (
     EXCLUDED_DIR_NAMES,
@@ -17,6 +18,10 @@ from duplicate_cleaner.constants import (
     EXCLUDED_PATH_SUBSTRINGS,
     EXCLUDED_ROOTS,
 )
+
+if TYPE_CHECKING:
+    from duplicate_cleaner.auth.accounts import AccountsRegistry
+    from duplicate_cleaner.report.schema import ReportMember
 
 # Any /Users/<X>/Library subtree — for every user on the box, not just the current one.
 _USER_LIBRARY_RE = re.compile(r"^/Users/[^/]+/Library(?:/|$)")
@@ -203,3 +208,148 @@ def is_inside_any_trash(path: Path, uid: int | None = None) -> bool:
 
 
 TrashResolver = Callable[[Path], Path]
+
+
+# ---------------------------------------------------------------------------
+# v0.2 sub-phase 5b — cloud entry validation
+#
+# Cloud ``FileRecord.path`` / ``ReportMember.path`` / ``ManifestEntry.original_path``
+# strings look like ``gdrive:personal://My Drive/Photos/Bali.jpg``.  On POSIX
+# they collapse to relative paths — nothing in this module may ``.resolve()``
+# them.  Instead, dispatch happens on ``source_id`` and cloud entries flow
+# through :func:`validate_cloud_entry`, which enforces:
+#
+# * ``source_id`` is registered in ``AccountsRegistry`` (so a poisoned report
+#   / manifest cannot dispatch an unknown source),
+# * ``cloud_file_id`` is present and matches the per-provider shape regex,
+# * ``etag`` is present and non-empty (required by the 5c pre-move drift
+#   check),
+# * ``is_shared`` is False (shared cloud files are informational-only per
+#   the AUDIT_LOG invariant).
+#
+# See ``docs/design/v0.2-subphase5-cloud-path-validation.md`` §4.1 and §4.2.
+# ---------------------------------------------------------------------------
+
+
+# Google Drive object ids are Base64url-ish and always long (typical id ~28
+# chars; ``root`` alias is 4 chars but never appears in a report).  20-char
+# minimum rejects the 4-char alias and any short poisoned value like
+# ``../foo``; the character class rejects slashes and path separators.
+_GDRIVE_CLOUD_FILE_ID_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_-]{20,}$")
+
+# OneDrive Personal driveItem ids use Base64url plus ``!`` as a separator
+# between the drive id and item id (e.g. ``ABC!123``); 20 chars matches the
+# real minimum length observed in Graph responses.  No dots, no slashes —
+# so ``root:/../foo`` fails the shape check even before URL-encoding.
+_ONEDRIVE_CLOUD_FILE_ID_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9!]{20,}$")
+
+_PROVIDER_ID_PATTERNS: dict[str, re.Pattern[str]] = {
+    "gdrive": _GDRIVE_CLOUD_FILE_ID_RE,
+    "onedrive": _ONEDRIVE_CLOUD_FILE_ID_RE,
+}
+
+
+def _cloud_file_id_pattern_for(source_id: str) -> re.Pattern[str] | None:
+    """Return the per-provider cloud_file_id regex for ``source_id`` (or None).
+
+    Providers are keyed by the prefix before the first ``:`` — ``gdrive:x``
+    and ``gdrive:personal`` both dispatch to the ``gdrive`` pattern.
+    """
+    provider = source_id.split(":", 1)[0]
+    return _PROVIDER_ID_PATTERNS.get(provider)
+
+
+def validate_cloud_entry(
+    member: ReportMember,
+    registry: AccountsRegistry,
+) -> None:
+    """Enforce cloud-entry safety rails on one ReportMember.
+
+    Raises ``ValueError`` with an actionable message on any violation; the
+    caller wraps it into ``ApplyError`` / ``UndoError`` per site.  Cloud
+    ``Path`` is NEVER ``.resolve()``d here or elsewhere — dispatch is by
+    ``source_id`` only.
+    """
+    sid = member.source_id
+    if sid == "local":
+        raise ValueError(
+            f"validate_cloud_entry called on local member (path={member.path!r})"
+        )
+    authorized = {"local"} | {e.id for e in registry.load()}
+    if sid not in authorized:
+        raise ValueError(
+            f"unknown source_id {sid!r}: not registered in AccountsRegistry "
+            f"({sorted(authorized)}). Re-run `dc auth add {sid.split(':', 1)[0]} "
+            f"<label>` or rescan."
+        )
+    cfid = member.cloud_file_id
+    if not isinstance(cfid, str) or not cfid:
+        raise ValueError(
+            f"cloud entry {member.path!r} has no cloud_file_id; refusing "
+            "to trash without a stable provider-side id."
+        )
+    pattern = _cloud_file_id_pattern_for(sid)
+    if pattern is not None and not pattern.match(cfid):
+        raise ValueError(
+            f"cloud_file_id {cfid!r} does not match the "
+            f"{sid.split(':', 1)[0]} id shape ({pattern.pattern}). "
+            "Refusing to interpolate a suspicious id into a provider URL."
+        )
+    etag = member.etag
+    if not isinstance(etag, str) or not etag:
+        raise ValueError(
+            f"cloud entry {member.path!r} has no etag; required for the "
+            "pre-move drift check in sub-phase 5c."
+        )
+    if member.is_shared:
+        raise ValueError(
+            f"cloud entry {member.path!r} is shared (is_shared=True). "
+            "Shared cloud files are informational-only and MUST NOT be "
+            "proposed for discard — see AUDIT_LOG invariants."
+        )
+
+
+def validate_cloud_manifest_entry(
+    entry: dict[str, object],
+    registry: AccountsRegistry,
+) -> None:
+    """Enforce cloud-entry safety rails on one manifest entry (undo side).
+
+    Symmetric to :func:`validate_cloud_entry` but operates on a raw manifest
+    dict — the manifest schema records ``source_id``, ``cloud_file_id``, and
+    ``etag`` but has no ``is_shared`` field (shared files never reach the
+    manifest because the mover refuses them).  Raises ``ValueError`` on any
+    violation; callers wrap in ``UndoError``.
+    """
+    sid_raw = entry.get("source_id", "local")
+    if not isinstance(sid_raw, str):
+        raise ValueError(f"manifest entry source_id is not a string: {sid_raw!r}")
+    if sid_raw == "local":
+        raise ValueError(
+            "validate_cloud_manifest_entry called on local entry "
+            f"(original_path={entry.get('original_path')!r})"
+        )
+    authorized = {"local"} | {e.id for e in registry.load()}
+    if sid_raw not in authorized:
+        raise ValueError(
+            f"unknown source_id {sid_raw!r} in manifest entry: not registered "
+            f"in AccountsRegistry ({sorted(authorized)})."
+        )
+    cfid = entry.get("cloud_file_id")
+    if not isinstance(cfid, str) or not cfid:
+        raise ValueError(
+            "manifest cloud entry has no cloud_file_id "
+            f"(original_path={entry.get('original_path')!r})."
+        )
+    pattern = _cloud_file_id_pattern_for(sid_raw)
+    if pattern is not None and not pattern.match(cfid):
+        raise ValueError(
+            f"manifest cloud_file_id {cfid!r} does not match the "
+            f"{sid_raw.split(':', 1)[0]} id shape ({pattern.pattern})."
+        )
+    etag = entry.get("etag")
+    if not isinstance(etag, str) or not etag:
+        raise ValueError(
+            "manifest cloud entry has no etag "
+            f"(original_path={entry.get('original_path')!r})."
+        )

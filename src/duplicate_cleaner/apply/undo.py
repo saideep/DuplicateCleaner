@@ -11,12 +11,14 @@ from typing import Any
 
 import blake3  # type: ignore[import-untyped]
 
+from duplicate_cleaner.auth.accounts import AccountsRegistry
 from duplicate_cleaner.compare.archive import ARCHIVE_SEP
 from duplicate_cleaner.paths import (
     is_within,
     known_trash_dirs,
     resolve_for_check,
     trash_dir_for,
+    validate_cloud_manifest_entry,
     validate_not_excluded,
     validate_scan_root_candidate,
 )
@@ -190,6 +192,7 @@ def restore_from_manifest(
     *,
     trash_dir_resolver: TrashResolver | None = None,
     allowed_trash_dirs: list[Path] | None = None,
+    registry: AccountsRegistry | None = None,
 ) -> dict[str, Any]:
     """Move each manifest entry from its trashed_at_path back to original_path.
 
@@ -245,11 +248,14 @@ def restore_from_manifest(
     # separator ``::`` — the mover would never trash an archive member
     # individually, so a manifest that claims one must be malformed or
     # poisoned. Raising up-front prevents restore-time creation of
-    # ``foo.zip::etc/passwd``-shaped directories.
+    # ``foo.zip::etc/passwd``-shaped directories.  Scoped to LOCAL entries
+    # only: a cloud original_path is opaque display text (e.g.
+    # ``gdrive:x://foo``) and does not represent a real filesystem target.
     offending = [
         entry.get("original_path")
         for entry in entries
-        if isinstance(entry.get("original_path"), str)
+        if entry.get("source_id", "local") == "local"
+        and isinstance(entry.get("original_path"), str)
         and ARCHIVE_SEP in entry["original_path"]
     ]
     if offending:
@@ -263,9 +269,37 @@ def restore_from_manifest(
         resolved = resolve_for_check(src)
         return any(is_within(resolved, root) for root in trash_roots)
 
+    # A registry read is required for cloud dispatch.  Construction is cheap
+    # (no disk I/O until .load()) so we build it lazily — every v0.1.1 local
+    # manifest continues to restore without a real accounts.toml present.
+    reg: AccountsRegistry = registry if registry is not None else AccountsRegistry()
+
     restored = 0
     errors: list[str] = []
+    cloud_deferred = 0
     for entry in entries:
+        # v0.2 sub-phase 5b: dispatch by source_id BEFORE any local-path
+        # validation.  Cloud entries never touch resolve_for_check or the
+        # trash containment checks — Alt-C treats their ``original_path``
+        # as opaque display data.
+        sid = entry.get("source_id", "local")
+        if sid != "local":
+            try:
+                validate_cloud_manifest_entry(entry, reg)
+            except ValueError as e:
+                errors.append(
+                    f"Refuse to restore cloud entry "
+                    f"{entry.get('original_path')!r}: {e}"
+                )
+                continue
+            # TODO(sub-phase 5d): wire Source.restore_from_trash here.  Look
+            # up the Source for ``sid`` (constructed from AccountsRegistry
+            # at CLI entry), build a TrashedLocation, and dispatch.  Until
+            # then the cloud row is validated but not restored — the count
+            # surfaces in the result dict.
+            cloud_deferred += 1
+            continue
+
         original = Path(entry["original_path"])
         size = int(entry.get("size", 0))
         trashed_at_raw = entry.get("trashed_at_path")
@@ -341,4 +375,10 @@ def restore_from_manifest(
             continue
         restored += 1
 
-    return {"restored": restored, "errors": errors, "total": len(entries)}
+    return {
+        "restored": restored,
+        "errors": errors,
+        "total": len(entries),
+        # v0.2 sub-phase 5b: cloud entries validated but not yet restored.
+        "cloud_deferred": cloud_deferred,
+    }

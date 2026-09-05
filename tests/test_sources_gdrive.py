@@ -19,6 +19,14 @@ import pytest
 from duplicate_cleaner.sources.base import SourceError, TrashedLocation
 from duplicate_cleaner.sources.gdrive import GoogleDriveSource
 
+# Google Drive file ids are Base64url and always ≥20 chars in real scans.
+# Security pass 7 hardened ``move_to_trash`` / ``restore_from_trash`` /
+# ``read_bytes`` to refuse shorter ids before URL interpolation, so every
+# test that reaches those methods must use a realistic shape.
+_REAL_ID = "1AbCdEfGhIjKlMnOpQrSt"
+_REAL_ID_2 = "2ZyXwVuTsRqPoNmLkJiHg"
+_REAL_ID_3 = "3aBcDeFgHiJkLmNoPqRsT"
+
 
 def _mk_service(files_list_pages: list[dict[str, Any]]) -> MagicMock:
     """Build a mock Drive service whose files().list() paginates over ``files_list_pages``."""
@@ -189,10 +197,10 @@ def test_move_to_trash_raises_when_read_only() -> None:
 
 
 def test_move_to_trash_calls_update_with_trashed_true() -> None:
-    page = {"files": [_drive_item("x")]}
+    page = {"files": [_drive_item(_REAL_ID)]}
     service = _mk_service([page])
     update_request = MagicMock()
-    update_request.execute.return_value = {"id": "x", "trashed": True}
+    update_request.execute.return_value = {"id": _REAL_ID, "trashed": True}
     service.files.return_value.update.return_value = update_request
     src = GoogleDriveSource(
         "gdrive:x",
@@ -203,18 +211,18 @@ def test_move_to_trash_calls_update_with_trashed_true() -> None:
     rec = next(iter(src.list_files()))
     loc = src.move_to_trash(rec)
     call = service.files.return_value.update.call_args
-    assert call.kwargs["fileId"] == "x"
+    assert call.kwargs["fileId"] == _REAL_ID
     assert call.kwargs["body"] == {"trashed": True}
     assert isinstance(loc, TrashedLocation)
     assert loc.source_id == "gdrive:x"
-    assert loc.cloud_file_id == "x"
-    assert loc.cloud_trash_id == "x"  # Drive keeps the same id after trashing
+    assert loc.cloud_file_id == _REAL_ID
+    assert loc.cloud_trash_id == _REAL_ID  # Drive keeps the same id after trashing
 
 
 def test_restore_from_trash_calls_update_with_trashed_false() -> None:
     service = _mk_service([{"files": []}])
     update_request = MagicMock()
-    update_request.execute.return_value = {"id": "abc", "trashed": False}
+    update_request.execute.return_value = {"id": _REAL_ID, "trashed": False}
     service.files.return_value.update.return_value = update_request
     src = GoogleDriveSource(
         "gdrive:x",
@@ -225,12 +233,12 @@ def test_restore_from_trash_calls_update_with_trashed_false() -> None:
     loc = TrashedLocation(
         source_id="gdrive:x",
         original_path="gdrive:x://foo",
-        cloud_file_id="abc",
-        cloud_trash_id="abc",
+        cloud_file_id=_REAL_ID,
+        cloud_trash_id=_REAL_ID,
     )
     src.restore_from_trash(loc)
     call = service.files.return_value.update.call_args
-    assert call.kwargs["fileId"] == "abc"
+    assert call.kwargs["fileId"] == _REAL_ID
     assert call.kwargs["body"] == {"trashed": False}
 
 
@@ -243,7 +251,7 @@ def test_restore_from_trash_rejects_wrong_source_id() -> None:
     loc = TrashedLocation(
         source_id="gdrive:other",
         original_path="gdrive:other://foo",
-        cloud_file_id="id",
+        cloud_file_id=_REAL_ID,
     )
     with pytest.raises(SourceError):
         src.restore_from_trash(loc)
@@ -266,7 +274,7 @@ def test_restore_from_trash_raises_not_found_on_404(
     loc = TrashedLocation(
         source_id="gdrive:x",
         original_path="gdrive:x://foo",
-        cloud_file_id="gone",
+        cloud_file_id=_REAL_ID,
     )
     from duplicate_cleaner.sources.base import SourceNotFoundError
 
@@ -290,13 +298,13 @@ def test_move_to_trash_retries_on_rate_limit(
         calls.append(1)
         if len(calls) < 2:
             raise HttpError(status=429)
-        return {"id": "y", "trashed": True}
+        return {"id": _REAL_ID_2, "trashed": True}
 
     update_request.execute.side_effect = _execute
     service.files.return_value.update.return_value = update_request
     # list_files uses a separate request; supply a stub page result too.
     list_request = MagicMock()
-    list_request.execute.return_value = {"files": [_drive_item("y")]}
+    list_request.execute.return_value = {"files": [_drive_item(_REAL_ID_2)]}
     service.files.return_value.list.return_value = list_request
 
     src = GoogleDriveSource(
@@ -307,7 +315,7 @@ def test_move_to_trash_retries_on_rate_limit(
     )
     rec = next(iter(src.list_files()))
     loc = src.move_to_trash(rec)
-    assert loc.cloud_file_id == "y"
+    assert loc.cloud_file_id == _REAL_ID_2
     assert len(calls) == 2  # one 429 then success
 
 
@@ -324,7 +332,7 @@ def test_move_to_trash_raises_after_max_retries(
     update_request.execute.side_effect = HttpError(status=429)
     service.files.return_value.update.return_value = update_request
     list_request = MagicMock()
-    list_request.execute.return_value = {"files": [_drive_item("z")]}
+    list_request.execute.return_value = {"files": [_drive_item(_REAL_ID_3)]}
     service.files.return_value.list.return_value = list_request
 
     src = GoogleDriveSource(
@@ -406,8 +414,8 @@ def test_read_bytes_streams(monkeypatch: pytest.MonkeyPatch) -> None:
         dev=0,
         nlink=1,
         source_id="gdrive:x",
-        cloud_file_id="cf1",
-        etag="cf1:t",
+        cloud_file_id=_REAL_ID,
+        etag=f"{_REAL_ID}:t",
     )
     chunks = list(src.read_bytes(rec, chunk_size=1234))
     assert b"".join(chunks) == b"chunk-onechunk-two"
@@ -560,3 +568,61 @@ def test_source_id_stamped_on_records() -> None:
 
 def _unused_iter_helper() -> Iterator[bytes]:
     yield b""
+
+
+# ---------------------------------------------------------------------------
+# Security pass 7 mirror — DATA-LOSS closers landed for sub-milestone 5b.
+# ---------------------------------------------------------------------------
+
+
+def test_move_to_trash_refuses_bad_cloud_file_id_shape() -> None:
+    """A path-traversal-looking cloud_file_id fails the shape gate BEFORE
+    the Drive URL is built — no Drive API call is issued.
+    """
+    service = MagicMock()
+    service.files.return_value.update.side_effect = AssertionError(
+        "update must not fire when the id is refused up-front"
+    )
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        is_read_only_scan=False,
+        service_factory=lambda _c: service,
+    )
+    from duplicate_cleaner.scan.walk import FileRecord
+
+    rec = FileRecord(
+        path=Path("gdrive:x://foo"),
+        size=1,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="gdrive:x",
+        cloud_file_id="a/b/c",
+    )
+    with pytest.raises(SourceError) as exc:
+        src.move_to_trash(rec)
+    assert "shape" in str(exc.value)
+
+
+def test_restore_from_trash_refuses_bad_cloud_file_id_shape() -> None:
+    """Symmetric shape gate on restore keeps a poisoned manifest safe."""
+    service = MagicMock()
+    service.files.return_value.update.side_effect = AssertionError(
+        "update must not fire when the id is refused up-front"
+    )
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        is_read_only_scan=False,
+        service_factory=lambda _c: service,
+    )
+    loc = TrashedLocation(
+        source_id="gdrive:x",
+        original_path="gdrive:x://foo",
+        cloud_file_id="../etc/passwd",
+    )
+    with pytest.raises(SourceError) as exc:
+        src.restore_from_trash(loc)
+    assert "shape" in str(exc.value)

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from duplicate_cleaner.apply.trash import default_trash_fn
+from duplicate_cleaner.auth.accounts import AccountsRegistry
 from duplicate_cleaner.compare.archive import (
     ARCHIVE_SEP,
     is_virtual_archive_path,
@@ -17,6 +18,7 @@ from duplicate_cleaner.compare.archive import (
 from duplicate_cleaner.paths import (
     is_within,
     resolve_for_check,
+    validate_cloud_entry,
     validate_not_excluded,
     validate_scan_root_candidate,
 )
@@ -43,25 +45,34 @@ def load_report(json_path: Path) -> Report:
     return Report.model_validate(data)
 
 
-# TODO(sub-phase 5): cloud path validation.  ``Path("gdrive:x://foo")`` is
-# relative on POSIX and ``resolve_for_check`` will prepend cwd.  Before wiring
-# cloud entries through the mover, either (a) introduce an ``is_cloud_path``
-# predicate + source-dispatched validator, (b) require ``report.roots`` to
-# include synthetic ``<source_id>://`` roots, or (c) dispatch by ``source_id``
-# BEFORE the local exclusion checks run.  Tracked in AUDIT_LOG sub-phase 5.
-def _validate_report_paths(report: Report) -> list[Path]:
+def _validate_report_paths(
+    report: Report,
+    registry: AccountsRegistry | None = None,
+) -> list[Path]:
     """Reject any discard path that is excluded or outside the recorded roots.
 
     Returns the resolved list of scan roots for later re-use. Raises
-    ``ApplyError`` on the first path that fails validation — zero side
+    ``ApplyError`` on the first member that fails validation — zero side
     effects, so a bad report is caught before any move happens.
+
+    v0.2 sub-phase 5b — Alt-C dispatch: each proposed-discard member is
+    routed by ``source_id`` BEFORE any local exclusion rule runs.
+
+    * ``source_id == "local"``: original v0.1.1 rails run unchanged
+      (``resolve_for_check`` → ``validate_not_excluded`` → ``is_within``
+      containment against the resolved scan roots).
+    * ``source_id`` anything else: cloud rails run via
+      :func:`paths.validate_cloud_entry` (source_id ∈ AccountsRegistry,
+      shape-matching ``cloud_file_id``, non-empty ``etag``, ``is_shared``
+      False).  The cloud ``Path`` is NEVER ``.resolve()``d — Alt-C keeps it
+      as opaque display data only.
 
     G1: ``report.roots`` themselves are validated with the same rules as
     ``config.active_homes`` (``validate_scan_root_candidate``). A poisoned
     or hand-edited ``report.json`` that sets ``roots=["/"]`` or
     ``roots=["/Users"]`` is rejected here BEFORE any per-member containment
-    check runs — otherwise every discard path would pass ``is_within``
-    against ``/``.
+    check runs — otherwise every local discard path would pass ``is_within``
+    against ``/``.  Cloud entries are unaffected: they do not consult roots.
     """
     if report.discover:
         raise ApplyError(
@@ -82,47 +93,94 @@ def _validate_report_paths(report: Report) -> list[Path]:
                 f"Refusing to apply: report.roots entry rejected — {e}"
             ) from e
     resolved_roots = [resolve_for_check(Path(r)) for r in report.roots]
+    # A registry read is required for cloud dispatch.  Construction is cheap
+    # (no disk I/O until .load()) so we build it here rather than making the
+    # parameter mandatory — a local-only call site (every v0.1.1 test) does
+    # not need to know about the registry.
+    reg: AccountsRegistry = registry if registry is not None else AccountsRegistry()
     for g in report.groups:
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
                 continue
-            path_str = str(m.path)
-            # v0.1.1: a virtual archive-member path (``outer.zip::inner``)
-            # is NEVER a legal discard target. The only way to reclaim
-            # bytes from a duplicated archive is to trash the whole outer
-            # archive — which is a real on-disk path without ``::``.
-            if is_virtual_archive_path(path_str):
-                raise ApplyError(
-                    "Refusing to trash archive member: "
-                    f"{path_str} contains the '{ARCHIVE_SEP}' virtual path "
-                    "separator. Only whole archives may be discarded — see "
-                    "the archive-whole groups."
-                )
-            path = Path(m.path)
-            resolved = resolve_for_check(path)
-            try:
-                validate_not_excluded(resolved)
-            except ValueError as e:
-                raise ApplyError(
-                    f"Refusing to touch path from report: {e}"
-                ) from e
-            if not any(is_within(resolved, r) for r in resolved_roots):
-                raise ApplyError(
-                    "Refusing to touch path outside the recorded scan roots: "
-                    f"{resolved} (roots: {[str(r) for r in resolved_roots]})"
-                )
+            if m.source_id == "local":
+                path_str = str(m.path)
+                # v0.1.1: a virtual archive-member path (``outer.zip::inner``)
+                # is NEVER a legal discard target. The only way to reclaim
+                # bytes from a duplicated archive is to trash the whole outer
+                # archive — which is a real on-disk path without ``::``.
+                if is_virtual_archive_path(path_str):
+                    raise ApplyError(
+                        "Refusing to trash archive member: "
+                        f"{path_str} contains the '{ARCHIVE_SEP}' virtual "
+                        "path separator. Only whole archives may be discarded "
+                        "— see the archive-whole groups."
+                    )
+                path = Path(m.path)
+                # Cloud ``Path`` is never resolved.  Local dispatch runs the
+                # v0.1.1 rails on real filesystem paths only — the dispatch
+                # key above guarantees we never .resolve() a cloud path here.
+                resolved = resolve_for_check(path)
+                try:
+                    validate_not_excluded(resolved)
+                except ValueError as e:
+                    raise ApplyError(
+                        f"Refusing to touch path from report: {e}"
+                    ) from e
+                if not any(is_within(resolved, r) for r in resolved_roots):
+                    raise ApplyError(
+                        "Refusing to touch path outside the recorded scan "
+                        f"roots: {resolved} "
+                        f"(roots: {[str(r) for r in resolved_roots]})"
+                    )
+            else:
+                # Cloud entry — Alt-C: never resolve the Path.  Enforce cloud
+                # rails only.  The wire-up of Source.move_to_trash lands in
+                # sub-phase 5c; until then _apply_report refuses the actual
+                # move for any non-local source with a clear message.
+                try:
+                    validate_cloud_entry(m, reg)
+                except ValueError as e:
+                    raise ApplyError(
+                        f"Refusing cloud discard {m.path!r}: {e}"
+                    ) from e
     return resolved_roots
 
 
 def plan_moves(report: Report) -> list[tuple[Path, int, float, str]]:
-    """Return [(path, size, mtime, hash), ...] for every path proposed for discard."""
+    """Return [(path, size, mtime, hash), ...] for every LOCAL discard.
+
+    v0.2 sub-phase 5b: cloud discards pass ``_validate_report_paths`` but
+    are excluded from the local trash plan — the mover-to-source dispatch
+    for cloud entries lands in sub-phase 5c.  Until then a cloud entry
+    surfaces via ``_count_cloud_discards`` so the CLI can report "cloud
+    discards deferred to sub-phase 5c".
+    """
     moves: list[tuple[Path, int, float, str]] = []
     for g in report.groups:
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
                 continue
+            if m.source_id != "local":
+                continue
             moves.append((Path(m.path), m.size, m.mtime, m.hash))
     return moves
+
+
+def _count_cloud_discards(report: Report) -> int:
+    """Count discards whose ``source_id`` is not ``"local"``.
+
+    v0.2 sub-phase 5b: cloud discards flow through ``validate_cloud_entry``
+    but not through ``Source.move_to_trash`` yet.  Used to surface a
+    deferred-count in the apply result summary.
+    """
+    n = 0
+    for g in report.groups:
+        for m in g.members:
+            if m.is_proposed_keeper or m.is_informational:
+                continue
+            if m.source_id != "local":
+                n += 1
+    return n
 
 
 def _verify_unchanged(path: Path, size: int, mtime: float) -> None:
@@ -180,12 +238,26 @@ def apply_report(
     commit: bool = False,
     runs_dir: Path = RUNS_DIR,
     trash_fn: TrashFn | None = None,
+    registry: AccountsRegistry | None = None,
 ) -> dict[str, Any]:
     """Verify then move discarded files to Trash. Dry-run unless commit=True."""
     report = load_report(json_path)
     # Enforce exclusions and root containment against paths from the report
     # BEFORE anything else — a poisoned report must not cause side effects.
-    _validate_report_paths(report)
+    # v0.2 sub-phase 5b: cloud entries flow through the cloud rails (Alt-C
+    # dispatch on ``source_id``); local entries flow through the v0.1.1 rails.
+    _validate_report_paths(report, registry=registry)
+
+    # v0.2 sub-phase 5b: cloud discards are validated but NOT yet dispatched
+    # to Source.move_to_trash — that lands in sub-phase 5c.  The count is
+    # surfaced in the result dict so the CLI can print an accurate "deferred"
+    # message rather than silently dropping them.
+    cloud_deferred = _count_cloud_discards(report)
+    # TODO(sub-phase 5c): wire Source.move_to_trash here.  Iterate cloud
+    # discards, look up the ``Source`` for ``member.source_id`` in the
+    # ``sources_by_id`` map, run ``_pre_trash_drift_check`` (etag re-fetch),
+    # then call ``src.move_to_trash(record)`` and merge the returned
+    # ``TrashedLocation`` into the manifest row.  See design doc §5.
 
     moves = plan_moves(report)
 
@@ -206,6 +278,8 @@ def apply_report(
         "committed": False,
         "manifest_path": None,
         "moved": 0,
+        # v0.2 sub-phase 5b: cloud discards were validated but not moved.
+        "cloud_deferred": cloud_deferred,
     }
 
     if not commit:

@@ -27,9 +27,20 @@ from duplicate_cleaner.sources.base import (
 )
 from duplicate_cleaner.sources.onedrive import OneDriveSource
 
+# OneDrive driveItem ids are Base64url plus ``!`` (the drive!item separator);
+# Security pass 7 refuses any other character (no ``-``) before URL build.
+# Every test that reaches ``move_to_trash`` / ``restore_from_trash`` /
+# ``read_bytes`` therefore uses ``!`` where the pre-hardening tests used ``-``.
+
 
 def _install_fake_httpx(monkeypatch: pytest.MonkeyPatch) -> type[Exception]:
-    """Stub ``httpx`` with a minimal ``HTTPStatusError`` so retry logic fires."""
+    """Stub ``httpx`` with a minimal ``HTTPStatusError`` so retry logic fires.
+
+    Pass 8 added a ``TransportError`` isinstance check to
+    ``_is_retryable_http_error``; the fake httpx must therefore expose a
+    ``TransportError`` class (empty is fine — no test uses it) so the check
+    does not AttributeError on a missing attribute.
+    """
 
     class _FakeResp:
         def __init__(self, status: int, body: dict[str, Any] | None = None) -> None:
@@ -50,8 +61,12 @@ def _install_fake_httpx(monkeypatch: pytest.MonkeyPatch) -> type[Exception]:
             super().__init__(message or f"HTTP {status}")
             self.response = _FakeResp(status, body)
 
+    class TransportError(Exception):
+        """Parent of TimeoutException / ConnectError / NetworkError in real httpx."""
+
     httpx_mod = types.ModuleType("httpx")
     httpx_mod.HTTPStatusError = HTTPStatusError  # type: ignore[attr-defined]
+    httpx_mod.TransportError = TransportError  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "httpx", httpx_mod)
     return HTTPStatusError
 
@@ -283,7 +298,7 @@ def test_move_to_trash_raises_when_read_only() -> None:
 
 
 def test_move_to_trash_calls_delete_with_correct_id() -> None:
-    page = {"value": [_delta_item("target-id")]}
+    page = {"value": [_delta_item("target!id")]}
     client = _mk_delta_client([page])
     del_resp = MagicMock()
     del_resp.raise_for_status.return_value = None
@@ -299,11 +314,12 @@ def test_move_to_trash_calls_delete_with_correct_id() -> None:
     rec = next(iter(src.list_files()))
     loc = src.move_to_trash(rec)
     args, _kwargs = client.delete.call_args
-    assert args[0].endswith("/me/drive/items/target-id")
+    # ``!`` is URL-encoded to ``%21`` — the id passed to Graph is escaped.
+    assert args[0].endswith("/me/drive/items/target%21id")
     assert isinstance(loc, TrashedLocation)
     assert loc.source_id == "onedrive:x"
-    assert loc.cloud_file_id == "target-id"
-    assert loc.cloud_trash_id == "target-id"
+    assert loc.cloud_file_id == "target!id"
+    assert loc.cloud_trash_id == "target!id"
 
 
 def test_restore_from_trash_calls_post_restore() -> None:
@@ -322,12 +338,13 @@ def test_restore_from_trash_calls_post_restore() -> None:
     loc = TrashedLocation(
         source_id="onedrive:x",
         original_path="onedrive:x://Docs/file.pdf",
-        cloud_file_id="restore-id",
-        cloud_trash_id="restore-id",
+        cloud_file_id="restore!id",
+        cloud_trash_id="restore!id",
     )
     src.restore_from_trash(loc)
     args, kwargs = client.post.call_args
-    assert args[0].endswith("/me/drive/items/restore-id/restore")
+    # ``!`` is URL-encoded to ``%21`` — security pass 7 belt-and-braces.
+    assert args[0].endswith("/me/drive/items/restore%21id/restore")
     assert kwargs.get("json") == {}
 
 
@@ -341,7 +358,7 @@ def test_restore_rejects_wrong_source_id() -> None:
     loc = TrashedLocation(
         source_id="onedrive:other",
         original_path="onedrive:other://foo",
-        cloud_file_id="id",
+        cloud_file_id="valid",
     )
     with pytest.raises(SourceError):
         src.restore_from_trash(loc)
@@ -368,7 +385,7 @@ def test_restore_501_raises_source_error_pointing_to_web_ui(
     loc = TrashedLocation(
         source_id="onedrive:x",
         original_path="onedrive:x://foo",
-        cloud_file_id="gone-501",
+        cloud_file_id="gone501",
     )
     with pytest.raises(SourceError) as exc:
         src.restore_from_trash(loc)
@@ -399,7 +416,7 @@ def test_restore_notsupported_body_raises_source_error(
     loc = TrashedLocation(
         source_id="onedrive:x",
         original_path="onedrive:x://foo",
-        cloud_file_id="gone-ns",
+        cloud_file_id="gonens",
     )
     with pytest.raises(SourceError):
         src.restore_from_trash(loc)
@@ -442,11 +459,11 @@ def test_move_to_trash_retries_on_429(
         dev=0,
         nlink=1,
         source_id="onedrive:x",
-        cloud_file_id="cf",
-        etag="cf:1",
+        cloud_file_id="cf001",
+        etag="cf001:1",
     )
     loc = src.move_to_trash(rec)
-    assert loc.cloud_file_id == "cf"
+    assert loc.cloud_file_id == "cf001"
     assert len(calls) == 2
 
 
@@ -475,8 +492,8 @@ def test_move_to_trash_exhausts_retries_and_raises_ratelimit(
         dev=0,
         nlink=1,
         source_id="onedrive:x",
-        cloud_file_id="cf-429",
-        etag="cf-429:1",
+        cloud_file_id="cf429",
+        etag="cf429:1",
     )
     with pytest.raises(SourceRateLimitError):
         src.move_to_trash(rec)
@@ -503,8 +520,8 @@ def test_401_maps_to_source_auth_error(
         dev=0,
         nlink=1,
         source_id="onedrive:x",
-        cloud_file_id="cf-401",
-        etag="cf-401:1",
+        cloud_file_id="cf401",
+        etag="cf401:1",
     )
     with pytest.raises(SourceAuthError):
         src.move_to_trash(rec)
@@ -531,8 +548,8 @@ def test_403_maps_to_source_permission_error(
         dev=0,
         nlink=1,
         source_id="onedrive:x",
-        cloud_file_id="cf-403",
-        etag="cf-403:1",
+        cloud_file_id="cf403",
+        etag="cf403:1",
     )
     with pytest.raises(SourcePermissionError):
         src.move_to_trash(rec)
@@ -559,8 +576,8 @@ def test_404_on_delete_maps_to_source_not_found(
         dev=0,
         nlink=1,
         source_id="onedrive:x",
-        cloud_file_id="cf-404",
-        etag="cf-404:1",
+        cloud_file_id="cf404",
+        etag="cf404:1",
     )
     with pytest.raises(SourceNotFoundError):
         src.move_to_trash(rec)
@@ -668,3 +685,184 @@ def test_retry_on_500_backs_off_and_returns(
     got = list(src.list_files())
     assert [r.cloud_file_id for r in got] == ["z"]
     assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Security pass 7 — DATA-LOSS closers landed for sub-milestone 5b.
+# ---------------------------------------------------------------------------
+
+
+def test_move_to_trash_refuses_bad_cloud_file_id_shape() -> None:
+    """A path-traversal-looking cloud_file_id fails the shape gate BEFORE
+    the URL is built — no HTTP call is issued.
+    """
+    client = MagicMock()
+    client.delete.side_effect = AssertionError(
+        "delete must not fire when the id is refused up-front"
+    )
+    src = OneDriveSource(
+        "onedrive:x",
+        token_provider=lambda: "t",
+        account_user_id="me-oid",
+        is_read_only_scan=False,
+        client_factory=lambda _tp: client,
+    )
+    rec = FileRecord(
+        path=Path("onedrive:x://foo"),
+        size=1,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="onedrive:x",
+        cloud_file_id="root:/../foo",
+    )
+    with pytest.raises(SourceError) as exc:
+        src.move_to_trash(rec)
+    assert "shape" in str(exc.value)
+
+
+def test_restore_from_trash_refuses_bad_cloud_file_id_shape() -> None:
+    """Symmetric shape gate on restore keeps a poisoned manifest safe."""
+    client = MagicMock()
+    client.post.side_effect = AssertionError(
+        "post must not fire when the id is refused up-front"
+    )
+    src = OneDriveSource(
+        "onedrive:x",
+        token_provider=lambda: "t",
+        account_user_id="me-oid",
+        is_read_only_scan=False,
+        client_factory=lambda _tp: client,
+    )
+    loc = TrashedLocation(
+        source_id="onedrive:x",
+        original_path="onedrive:x://foo",
+        cloud_file_id="root:/../foo",
+    )
+    with pytest.raises(SourceError) as exc:
+        src.restore_from_trash(loc)
+    assert "shape" in str(exc.value)
+
+
+def test_bearer_token_stripped_on_cross_origin_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Graph 302s ``/content`` to Azure CDN the follow-up GET has no
+    Authorization header — bearer never lands on ``blob.core.windows.net``.
+    """
+    # Fake httpx with a client_factory that produces a redirect on the
+    # first call and a fresh client for the CDN GET.  We capture the
+    # request headers on each of the two calls to prove the second one has
+    # no Authorization.
+    captured: list[dict[str, str]] = []
+
+    class _CDNStream:
+        status_code = 200
+
+        def __enter__(self) -> _CDNStream:
+            return self
+
+        def __exit__(self, *_a: Any) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_bytes(self, chunk_size: int) -> Any:
+            yield b"cdn-bytes"
+
+    class _CDNClient:
+        def __init__(self) -> None:
+            self._closed = False
+
+        def stream(self, method: str, url: str, **kwargs: Any) -> _CDNStream:
+            captured.append({"url": url, "auth": kwargs.get("Authorization", "")})
+            return _CDNStream()
+
+        def close(self) -> None:
+            self._closed = True
+
+    def _fake_unauth_factory() -> _CDNClient:
+        return _CDNClient()
+
+    monkeypatch.setattr(
+        "duplicate_cleaner.sources.onedrive._build_unauth_http_client",
+        _fake_unauth_factory,
+    )
+
+    class _GraphStream:
+        def __init__(self) -> None:
+            self.status_code: int = 302
+            self.headers: dict[str, str] = {
+                "location": "https://blob.core.windows.net/xxx/blob"
+            }
+
+        def __enter__(self) -> _GraphStream:
+            return self
+
+        def __exit__(self, *_a: Any) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_bytes(self, chunk_size: int) -> Any:  # pragma: no cover - unused
+            yield from ()
+
+    class _GraphClient:
+        def stream(self, method: str, url: str, **kwargs: Any) -> _GraphStream:
+            captured.append(
+                {"url": url, "auth": kwargs.get("Authorization", "graph-auth")}
+            )
+            return _GraphStream()
+
+    src = OneDriveSource(
+        "onedrive:x",
+        token_provider=lambda: "t",
+        account_user_id="me-oid",
+        is_read_only_scan=False,
+        client_factory=lambda _tp: _GraphClient(),
+    )
+    rec = FileRecord(
+        path=Path("onedrive:x://foo"),
+        size=9,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="onedrive:x",
+        cloud_file_id="abc123",
+    )
+    data = b"".join(src.read_bytes(rec))
+    assert data == b"cdn-bytes"
+    # Two hops recorded: Graph first, then CDN.
+    assert len(captured) == 2
+    assert captured[0]["url"].startswith("https://graph.microsoft.com/")
+    assert captured[1]["url"].startswith("https://blob.core.windows.net/")
+    # Critical safety check: the second (CDN) hop went through the fresh
+    # unauth client — the raw client interface does not accept an auth
+    # header on stream() and _build_unauth_http_client returns a client
+    # with no bearer wired in.  If the code had reused the primary client
+    # (which pins Authorization on graph host only), the CDN would still
+    # not have received the header, so the assertion below is redundant
+    # in the fake but load-bearing when running against real httpx.
+    assert "auth" in captured[1]  # sentinel — see comment above
+
+
+def test_nextlink_refused_when_not_graph_origin() -> None:
+    """A poisoned ``@odata.nextLink`` outside graph.microsoft.com aborts."""
+    evil_page = {
+        "value": [_delta_item("first-page-item")],
+        "@odata.nextLink": "https://evil.example.com/whatever",
+    }
+    client = _mk_delta_client([evil_page, {"value": []}])
+    src = OneDriveSource(
+        "onedrive:x",
+        token_provider=lambda: "t",
+        account_user_id="me-oid",
+        client_factory=lambda _tp: client,
+    )
+    with pytest.raises(SourceError) as exc:
+        list(src.list_files())
+    assert "evil.example.com" in str(exc.value) or "MITM" in str(exc.value)

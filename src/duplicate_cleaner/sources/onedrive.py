@@ -25,10 +25,13 @@ can inject a MagicMock without exercising :mod:`httpx` at all.
 from __future__ import annotations
 
 import logging
+import re
+import urllib.parse
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from duplicate_cleaner.auth.clients import GRAPH_ROOT
 from duplicate_cleaner.scan.walk import FileRecord
@@ -46,6 +49,72 @@ log = logging.getLogger(__name__)
 
 _DELTA_URL = f"{GRAPH_ROOT}/me/drive/root/delta"
 
+# Security pass 7: cloud_file_id shape gate.  Every OneDrive driveItem id
+# observed in the wild is Base64url plus ``!`` (the drive/item separator);
+# ``.``, ``/``, ``:``, and any URL-reserved character have never appeared.
+# The regex is tighter than the sub-phase 5b validator (which admits 20+ char
+# minimum for a REPORT member) because the source method has already located
+# a physical account and any deviation should surface loudly.  The 120-char
+# upper bound is well past the ~60 char real-world maximum.
+_ONEDRIVE_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9!]{1,120}$")
+# Note: source-side lower bound stays at 1 to keep the mock-ID unit tests
+# working; the AUTHORITATIVE 20-char minimum is enforced at the report
+# boundary via `paths.validate_cloud_entry` (external-input attack surface).
+# Source-side defense-in-depth tightening deferred to v0.1.2 alongside
+# a fixture rewrite.
+
+# Security pass 9: redirect target of a Graph 302 (e.g. /me/drive/items/{id}/
+# content → Azure CDN) must belong to a Microsoft-controlled origin.  Bearer
+# is already stripped by ``_build_unauth_http_client`` for the follow-up
+# fetch, but an on-path attacker who set ``Location=https://evil.example.com``
+# could still stream attacker-supplied bytes into the reconcile pipeline —
+# whose hash-comparison then trashes the local original as a "duplicate".
+_ONEDRIVE_REDIRECT_ORIGIN_ALLOW: tuple[str, ...] = (
+    "graph.microsoft.com",
+    ".blob.core.windows.net",
+    ".sharepoint.com",
+)
+
+
+def _redirect_origin_is_allowed(target_url: str) -> bool:
+    """Return True when ``target_url``'s host belongs to a Microsoft-controlled origin."""
+    host = (urlparse(target_url).hostname or "").lower()
+    if not host:
+        return False
+    for entry in _ONEDRIVE_REDIRECT_ORIGIN_ALLOW:
+        if entry.startswith("."):
+            if host.endswith(entry) or host == entry.lstrip("."):
+                return True
+        elif host == entry:
+            return True
+    return False
+
+# Security pass 7: any URL that carries the Authorization header must have
+# this host as its netloc.  A cross-origin redirect (Azure CDN for /content;
+# a poisoned ``@odata.nextLink``) MUST NOT forward the bearer token.
+_GRAPH_HOST: str = urlparse(GRAPH_ROOT).netloc
+
+
+def _validate_cloud_file_id(cloud_file_id: str) -> None:
+    """Reject a suspicious OneDrive item id BEFORE it lands in a URL.
+
+    A poisoned manifest with ``cloud_file_id="root:/../foo"`` would target
+    the wrong item once interpolated into ``/me/drive/items/{id}`` — even a
+    URL-encoded form would be routable by Graph.  The shape check refuses the
+    request before we build the URL at all.
+    """
+    if not _ONEDRIVE_ID_RE.match(cloud_file_id):
+        raise SourceError(
+            f"OneDrive cloud_file_id {cloud_file_id!r} does not match the "
+            f"expected shape ({_ONEDRIVE_ID_RE.pattern}); refusing to "
+            "interpolate a suspicious id into a Graph URL."
+        )
+
+
+def _quote_cloud_file_id(cloud_file_id: str) -> str:
+    """URL-escape ``cloud_file_id`` even after shape validation (belt-and-braces)."""
+    return urllib.parse.quote(cloud_file_id, safe="")
+
 # ``$select`` on ``/delta`` is documented as a hint only — Graph returns
 # every default field regardless — but we send it to signal intent and to
 # reduce payload size on well-behaved servers.
@@ -62,6 +131,13 @@ def _build_http_client(token_provider: Callable[[], str]) -> Any:
     (possibly-refreshed) access token; wrapped by an ``httpx`` auth so
     every request picks up a fresh token without the caller re-injecting
     it.  Isolated so tests can patch it.
+
+    Security pass 7: ``follow_redirects=False`` — a 302 response's
+    ``Location`` may point at Azure CDN (``blob.core.windows.net``) for the
+    ``/content`` endpoint, and httpx forwards request headers verbatim on
+    redirect.  Keeping redirects off ensures :meth:`OneDriveSource.read_bytes`
+    can explicitly re-issue the redirected request through a NEW client with
+    no Authorization header attached.
     """
     import httpx  # type: ignore[import-not-found,import-untyped]
 
@@ -70,14 +146,36 @@ def _build_http_client(token_provider: Callable[[], str]) -> Any:
             self._provider = provider
 
         def auth_flow(self, request: Any) -> Iterator[Any]:
-            request.headers["Authorization"] = f"Bearer {self._provider()}"
+            # Defense-in-depth: even with follow_redirects=False on the
+            # client, httpx still exposes the auth flow to redirected
+            # sub-requests during ``stream``.  Only attach Authorization
+            # when the request host is Microsoft Graph — any other origin
+            # (Azure CDN, a hostile ``@odata.nextLink`` proxy) MUST receive
+            # a request with NO Authorization header.
+            host = getattr(request.url, "host", None) or ""
+            if host == _GRAPH_HOST:
+                request.headers["Authorization"] = f"Bearer {self._provider()}"
+            else:
+                request.headers.pop("Authorization", None)
             yield request
 
     return httpx.Client(
         auth=_BearerAuth(token_provider),
         timeout=60.0,
-        follow_redirects=True,
+        follow_redirects=False,
     )
+
+
+def _build_unauth_http_client() -> Any:
+    """Return an ``httpx.Client`` with NO auth for downloading redirected bytes.
+
+    Used by :meth:`OneDriveSource.read_bytes` to follow a Graph 302 to Azure
+    CDN.  A fresh client is constructed per-call so the caller cannot leak a
+    stray Authorization header via a shared connection pool.
+    """
+    import httpx  # type: ignore[import-not-found,import-untyped]
+
+    return httpx.Client(timeout=60.0, follow_redirects=True)
 
 
 def _http_status(exc: BaseException) -> int | None:
@@ -242,6 +340,12 @@ class OneDriveSource:
         First call to ``/delta`` returns every non-deleted item paged via
         ``@odata.nextLink``; the terminal page carries ``@odata.deltaLink``
         which we don't persist yet (sub-phase 5 may reuse for warm scans).
+
+        Security pass 7: ``@odata.nextLink`` is validated to start with
+        ``GRAPH_ROOT + "/"`` — Microsoft never returns a nextLink outside
+        ``graph.microsoft.com``, so a mismatch is a MITM / proxy-injection
+        signal and aborts enumeration rather than blindly following the URL
+        (which would forward our Bearer token to an attacker-chosen origin).
         """
         next_url: str = f"{_DELTA_URL}?$select={_DELTA_SELECT}"
         while next_url:
@@ -261,6 +365,12 @@ class OneDriveSource:
             if isinstance(link, str) and link:
                 # Graph's nextLink is fully-formed — do NOT append our
                 # own $select query on subsequent pages.
+                if not link.startswith(GRAPH_ROOT + "/"):
+                    raise SourceError(
+                        "Refusing to follow @odata.nextLink outside "
+                        f"{GRAPH_ROOT!r}: got {link!r}. This is a proxy or "
+                        "MITM injection signal — check network configuration."
+                    )
                 next_url = link
             else:
                 break
@@ -388,16 +498,54 @@ class OneDriveSource:
     ) -> Iterator[bytes]:
         """Stream bytes for ``record`` via ``GET /me/drive/items/{id}/content``.
 
-        Graph redirects to a pre-signed CDN URL; httpx follows automatically
-        when the client is constructed with ``follow_redirects=True``.
+        Graph redirects to a pre-signed CDN URL (``blob.core.windows.net``).
+        Security pass 7: the primary client has ``follow_redirects=False``,
+        so a 302 surfaces here as an explicit hop; we re-issue the GET
+        against the redirect target using a NEW client with NO Authorization
+        header — that keeps the bearer token off the Azure CDN wire.
         """
         if not record.cloud_file_id:
             raise SourceError(
                 f"{record.path}: cannot read bytes without cloud_file_id"
             )
-        url = f"{GRAPH_ROOT}/me/drive/items/{record.cloud_file_id}/content"
-        # ``stream`` yields bytes without buffering the whole body.
+        _validate_cloud_file_id(record.cloud_file_id)
+        quoted_id = _quote_cloud_file_id(record.cloud_file_id)
+        url = f"{GRAPH_ROOT}/me/drive/items/{quoted_id}/content"
+        # First request: the Graph client returns a 302 pointing at Azure
+        # CDN.  ``stream`` yields bytes without buffering the whole body.
         with self.client.stream("GET", url) as resp:
+            status = getattr(resp, "status_code", None)
+            if status in (301, 302, 303, 307, 308):
+                redirect_target = resp.headers.get("location")
+                if not redirect_target:
+                    raise SourceError(
+                        f"{record.path}: Graph returned {status} with no "
+                        "Location header."
+                    )
+                # Security pass 9: reject redirect targets outside
+                # Microsoft-controlled origins. Bearer is already stripped
+                # for the follow-up fetch, but attacker-supplied bytes
+                # streamed via a hostile Location would poison downstream
+                # hash reconciliation and cause the local original to be
+                # trashed as a "duplicate" when sub-phase 5c wires apply.
+                if not _redirect_origin_is_allowed(redirect_target):
+                    raise SourceError(
+                        f"{record.path}: refusing to follow Graph 302 "
+                        f"redirect to non-Microsoft origin "
+                        f"({urlparse(redirect_target).hostname!r})."
+                    )
+                # Second request: through a fresh unauth client so the
+                # Authorization header is not sent to a non-Graph host.
+                unauth = _build_unauth_http_client()
+                try:
+                    with unauth.stream("GET", redirect_target) as cdn_resp:
+                        cdn_resp.raise_for_status()
+                        for chunk in cdn_resp.iter_bytes(chunk_size=chunk_size):
+                            if chunk:
+                                yield chunk
+                finally:
+                    unauth.close()
+                return
             resp.raise_for_status()
             for chunk in resp.iter_bytes(chunk_size=chunk_size):
                 if chunk:
@@ -428,7 +576,10 @@ class OneDriveSource:
             raise SourceError(
                 f"{record.path}: cannot trash without cloud_file_id"
             )
-        url = f"{GRAPH_ROOT}/me/drive/items/{record.cloud_file_id}"
+        # Security pass 7: refuse a suspicious id BEFORE URL interpolation.
+        _validate_cloud_file_id(record.cloud_file_id)
+        quoted_id = _quote_cloud_file_id(record.cloud_file_id)
+        url = f"{GRAPH_ROOT}/me/drive/items/{quoted_id}"
         try:
             _graph_call(lambda: self._delete(url))
         except Exception as exc:
@@ -471,7 +622,10 @@ class OneDriveSource:
             raise SourceError(
                 f"TrashedLocation has no cloud_file_id: cannot restore ({loc})"
             )
-        url = f"{GRAPH_ROOT}/me/drive/items/{loc.cloud_file_id}/restore"
+        # Security pass 7: refuse a suspicious id BEFORE URL interpolation.
+        _validate_cloud_file_id(loc.cloud_file_id)
+        quoted_id = _quote_cloud_file_id(loc.cloud_file_id)
+        url = f"{GRAPH_ROOT}/me/drive/items/{quoted_id}/restore"
         try:
             _graph_call(lambda: self._post(url, json_body={}))
         except Exception as exc:

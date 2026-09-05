@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import io
 import logging
+import re
+import urllib.parse
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +34,28 @@ from duplicate_cleaner.sources.base import (
 log = logging.getLogger(__name__)
 
 _GOOGLE_NATIVE_MIME_PREFIX = "application/vnd.google-apps."
+
+# Security pass 7 mirror: Google Drive file ids are Base64url and always
+# ≥20 characters in real-world scans.  Any deviation (path components,
+# ``..`` traversal, URL-reserved characters) surfaces loudly BEFORE the id
+# is interpolated into a Drive REST URL — googleapiclient does not escape
+# fileId for us and a poisoned id would target the wrong Drive object.
+_GDRIVE_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+
+
+def _validate_cloud_file_id(cloud_file_id: str) -> None:
+    """Reject a suspicious Google Drive file id BEFORE it lands in a URL."""
+    if not _GDRIVE_ID_RE.match(cloud_file_id):
+        raise SourceError(
+            f"Google Drive cloud_file_id {cloud_file_id!r} does not match "
+            f"the expected shape ({_GDRIVE_ID_RE.pattern}); refusing to "
+            "interpolate a suspicious id into a Drive URL."
+        )
+
+
+def _quote_cloud_file_id(cloud_file_id: str) -> str:
+    """URL-escape ``cloud_file_id`` even after shape validation (belt-and-braces)."""
+    return urllib.parse.quote(cloud_file_id, safe="")
 
 _LIST_FIELDS = (
     "nextPageToken,"
@@ -298,6 +322,9 @@ class GoogleDriveSource:
             raise SourceError(
                 f"{record.path}: cannot read bytes without cloud_file_id"
             )
+        # Security pass 7 mirror: refuse a suspicious id before Drive
+        # interpolates it into ``/files/{fileId}``.
+        _validate_cloud_file_id(record.cloud_file_id)
         from googleapiclient.http import (
             MediaIoBaseDownload,  # type: ignore[import-not-found,import-untyped]
         )
@@ -340,6 +367,8 @@ class GoogleDriveSource:
             raise SourceError(
                 f"{record.path}: cannot trash without cloud_file_id"
             )
+        # Security pass 7 mirror: refuse a suspicious id BEFORE URL build.
+        _validate_cloud_file_id(record.cloud_file_id)
         try:
             _drive_call(
                 self.service.files().update(
@@ -375,6 +404,8 @@ class GoogleDriveSource:
             raise SourceError(
                 f"TrashedLocation has no cloud_file_id: cannot restore ({loc})"
             )
+        # Security pass 7 mirror: refuse a suspicious id BEFORE URL build.
+        _validate_cloud_file_id(loc.cloud_file_id)
         try:
             _drive_call(
                 self.service.files().update(

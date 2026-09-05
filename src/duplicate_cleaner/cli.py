@@ -634,6 +634,17 @@ def apply(
             f"[green]Moved {result['moved']} file(s) to Trash.[/green]"
         )
         console.print(f"Manifest: {result['manifest_path']}")
+        # CR#1 (pass 9): surface cloud discards that were validated but not
+        # trashed yet — until sub-phase 5c wires Source.move_to_trash, cloud
+        # entries flow through _validate_report_paths and land in the report
+        # but are NEVER sent to any cloud provider.  Silent-drop would erode
+        # user trust.
+        cloud_deferred = result.get("cloud_deferred", 0)
+        if cloud_deferred:
+            console.print(
+                f"[yellow]{cloud_deferred} cloud discard(s) deferred — "
+                "cloud apply lands in v0.2 sub-phase 5c.[/yellow]"
+            )
 
 
 @app.command()
@@ -647,6 +658,13 @@ def undo(
     console.print(
         f"Restored {result['restored']}/{result['total']} file(s)."
     )
+    # CR#1 (pass 9): same treatment for cloud entries on undo.
+    cloud_deferred = result.get("cloud_deferred", 0)
+    if cloud_deferred:
+        console.print(
+            f"[yellow]{cloud_deferred} cloud entry/entries deferred — "
+            "cloud restore lands in v0.2 sub-phase 5d.[/yellow]"
+        )
     if result["errors"]:
         console.print(f"[yellow]{len(result['errors'])} error(s):[/yellow]")
         for e in result["errors"][:20]:
