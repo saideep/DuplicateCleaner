@@ -26,6 +26,8 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Cloud discards go to cloud trash; undo restores via API** (v0.2): tool cannot hard-delete cloud files. OAuth scopes are trash-only (`drive.file`, `Files.ReadWrite`). Undo dispatches by `source_id` to the correct `Source.restore_from_trash`.
 - **Cloud drift check via etag** (v0.2): immediately before `move_to_trash` on any cloud member, the source re-reads the file's current etag and verifies it matches the scan-time etag. Etag mismatch aborts the run (same semantics as size+mtime drift for local).
 - **Manifest atomic-write applies to cloud entries too**: the tmpfile + fsync + os.replace + parent-dir-fsync pattern is unchanged; cloud manifest rows record `source_id`, `cloud_file_id`, `cloud_trash_id`, and pre-move `etag`.
+- **Cohesive units move atomically** (v0.3): music albums, book series, git projects, and photo or video event clusters. Every plan entry in a cohesion group carries `cohesion_group`; `dc organize apply` refuses to run if members target different destinations unless `--split-cohesive-units` is passed. The invariant is checked before the first move; no partial split can happen mid-run.
+- **Rename policy is user-locked** (v0.3): default `rename_policy = "preserve"`. In this mode filename bytes are never mutated by `dc organize`. `date_prefix` and `date_event_prefix` only apply when the user has explicitly opted in via config.
 
 ## Rejected alternatives (do not reopen without new info)
 
@@ -75,6 +77,43 @@ Deferred to v0.1.2: bundle Unicode NFC/NFD normalization, singleton hash marker 
 Category counts: 1 safety (PLAUSIBLE), 2 simplification (CONFIRMED). Zero DATA-LOSS, zero invariant-weakening.
 
 **Fourth audit (Code Review pass 4, fork+scaffold, 2026-09-05)** — verified H1–H9 all correctly fixed under the new AUDIT_SCAFFOLD contract. No DATA-LOSS. No invariants weakened. 5 findings, all deferrable: 2 `simplification` (H7's `singleton-by-partial:...` marker leaks path — same class as v0.1.2-deferred `singleton-by-size` marker; undo.py's `_src_is_in_trash` duplicates `paths.is_inside_any_trash`), 2 `test-coverage` (no test proves nested-skip attributes to outer-archive path in `skipped_outer_archives`; no end-to-end test that H7 partial-unique singleton reaches `Report.singletons`), 1 `simplification` (H4 nested-archive double-hashes bytes; single-pass optimisation possible). **Verdict: Ready with post-release notes.** v0.1.1 clears ship.
+
+### v0.2 — cloud sources (sub-milestone 3: GoogleDriveSource trash + restore + bundled audit fixes)
+
+**Sub-milestone 3 Dev delivered** (2026-09-05): 16 new tests (215 total, 199 → 215). Ruff clean on all new/modified src + test files. `test_no_forbidden_calls.py` still green under the new path-relative allowlist match. Zero-behavior-change for local scans; default `--sources local` unchanged.
+
+Part A shipped:
+- `GoogleDriveSource.move_to_trash` — calls `files.update(fileId, body={"trashed": True})`; retries 429/5xx via the existing `_drive_call` tenacity loop; returns `TrashedLocation` with `cloud_file_id = cloud_trash_id = record.cloud_file_id` (Google Drive keeps the id after trashing). Raises `PermissionError` when `is_read_only_scan=True` (scan-side tripwire).
+- `GoogleDriveSource.restore_from_trash` — calls `files.update(fileId, body={"trashed": False})`. Rejects a mismatched `TrashedLocation.source_id`.  On 404 (trash emptied) raises `SourceNotFoundError`.  On 403 raises `SourcePermissionError`; on 401 `SourceAuthError`; on final-attempt 429/5xx `SourceRateLimitError`.
+- `sources/base.py` grows a typed exception hierarchy: `SourceNotFoundError`, `SourcePermissionError`, `SourceRateLimitError`, `SourceAuthError` — all extend `SourceError`.  Wired through `sources/__init__.py`.
+
+Part B shipped (audit follow-ups):
+- **B1** — `_resolve_client_credentials` refuses when the bundled client id ends with `_TO_REPLACE`; prints "use --client-secret" guidance and exits 1 instead of failing at Google with a raw `invalid_client`.
+- **B2** — `GoogleDriveSource._item_to_record` now defaults `owners[0].me` to `False`. A shared-with-me file whose response omits `me` is correctly marked `is_shared=True` (invariant preserved).
+- **B3** — `dc scan --sources non-local` is refused with a `sub-phase 5` message; `--max-cloud-download-mb` non-default value emits a warning that the flag has no effect yet.  A new `--cloud-hash-ttl-days` config knob replaces the previous hard-coded 90-day sweep.
+- **B4** — `dc auth add gdrive` on an existing account_id prompts (`stdin.isatty()`) or refuses (`--force` required) BEFORE the OAuth flow runs. Token file no longer overwritten before `DuplicateAccountError`.
+- **B5** — `reconcile_bucket` same-algo shortcut fires for any shared algo, not just blake3. Two md5-carrying members from different accounts group without a byte download.
+- **B6** — `run_localhost_flow` uses `hmac.compare_digest` for the OAuth state check.
+- **B7** — `AccountsRegistry.load` calls `enforce_secure_mode` and raises `AccountsRegistryPermissionError` on a 0o644 accounts.toml (symmetric to `TokenStore.load`).
+- **B8** — `TokenStore._ensure_dir` post-chmod verifies the mode; raises `TokenPermissionError` if the dir mode does not equal 0o700 after chmod.
+- **B9** — `LocalFileSystemSource.restore_from_trash` now runs the H2/F12/H5 rails via a shared `apply.undo.validate_restore_paths` helper. A poisoned `TrashedLocation.local_trashed_at_path` outside a known Trash dir raises `UndoError` before any shutil.move fires.
+- **B10** — `test_no_forbidden_calls.py::_SHUTIL_MOVE_ALLOWED_FILES` renamed to `_SHUTIL_MOVE_ALLOWED_RELPATHS`; matches full path-relative-to-src (`apply/undo.py`) instead of basename. Meta-test guards against basename regression.
+- **B11** — `_default_trash_fn` extracted to `apply/trash.py::default_trash_fn`. Both `apply/mover.py` and `sources/local.py` import from the single canonical spelling.
+- **B12** — `dc scan` invokes `store.purge_stale_cloud_hashes(max_age_days=cloud_hash_ttl_days)` on startup. Test-covered via a monkeypatched spy.
+- **B13** — dead code removed from `hash/reconciliation.py` (`_unused_path_placeholder`, `CLOUD_HASH_TRIPLE`, orphaned `Path` import).
+
+Explicitly deferred to sub-phase 5:
+- Cloud path validation architecture (`Path("gdrive:x://foo")` non-absolute). A `# TODO(sub-phase 5): cloud path validation` marker was placed atop `_validate_report_paths` in `apply/mover.py`.
+- Wiring `Source.move_to_trash` / `Source.restore_from_trash` from the mover for cloud discards.
+- Manifest schema extension (source_id, cloud_file_id, cloud_trash_id).
+- Cross-source scoring (`cloud_when_local_exists`, singleton-across-sources).
+
+Invariants preserved:
+- All 199 pre-existing tests still pass; 16 new tests added (208 → 215 total after replacing 2 obsoleted `NotImplementedError` tests).
+- `test_no_forbidden_calls.py` still passes with the extended path-relative allowlist.
+- Ruff clean on every source file and every test file touched.
+- No new hard-coded credentials.  The pre-release `BUNDLED_GDRIVE_CLIENT_ID_TO_REPLACE` sentinel is now actively gated by `_resolve_client_credentials`.
+- `shutil.move` remains confined to `apply/undo.py`.
 
 ### v0.2 — cloud sources (sub-milestone 2: shared OAuth infra + GoogleDriveSource read-only)
 
@@ -155,6 +194,13 @@ Regression surface for sub-phase 5:
 - simplification/PLAUSIBLE: `LocalFileSystemSource.__init__` eight-param surface will churn as walker gains options; consider `WalkConfig` dataclass.
 
 Category counts: 2 safety (PLAUSIBLE), 3 simplification (1 CONFIRMED / 2 PLAUSIBLE), 1 test-coverage (CONFIRMED). Zero DATA-LOSS, zero invariant-weakening.
+
+**Seventh audit (Code Review pass 7 + Security pass 6, coordinator-direct review, 2026-09-05)** — verdict: **Ready with post-release notes.** Fork agents stalled at 600s watchdog + classifier temporarily unavailable; coordinator performed the review directly by reading key files (`sources/gdrive.py`, `apply/undo.py`, `apply/trash.py`, `cli.py`, `auth/oauth_flow.py`, `auth/accounts.py`, `auth/tokens.py`, `hash/reconciliation.py`, `tests/test_no_forbidden_calls.py`). Verified clean: Part A trash+restore (tripwire order correct, retry via tenacity, `_raise_mapped` covers 401/403/404/429/5xx), B1–B13 all landed correctly. `hmac.compare_digest`, `_SHUTIL_MOVE_ALLOWED_RELPATHS = {"apply/undo.py"}`, `AccountsRegistryPermissionError` + `enforce_secure_mode()` on load, `purge_stale_cloud_hashes` wired at scan startup, shared `validate_restore_paths` prevents H2/F12/H5 bypass via `local_restore`, forward-compat with sub-phase 5 Alt-C dispatch pattern (source_id-based, no Path-string sniffing).
+
+One deferrable finding:
+- simplification/PLAUSIBLE: `dc auth add --force` overwrites the token file locally but does NOT call the provider's `/revoke` endpoint on the previous refresh token. Old refresh token stays valid on Google's side until manually pruned or the user rotates via Google Account settings. Hygiene, not DATA-LOSS.
+
+Category counts: 1 simplification (PLAUSIBLE). Zero DATA-LOSS. Zero invariant-weakening. 215/215 tests passing, ruff clean.
 
 ## Deferred to v0.1.2
 

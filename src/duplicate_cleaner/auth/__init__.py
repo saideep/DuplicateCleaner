@@ -5,6 +5,7 @@ from duplicate_cleaner.auth.accounts import (
     ACCOUNTS_PATH,
     AccountEntry,
     AccountsRegistry,
+    AccountsRegistryPermissionError,
     DuplicateAccountError,
 )
 from duplicate_cleaner.auth.clients import (
@@ -36,6 +37,7 @@ __all__ = [
     "TOKENS_DIR",
     "AccountEntry",
     "AccountsRegistry",
+    "AccountsRegistryPermissionError",
     "DuplicateAccountError",
     "OAuthFlowError",
     "TokenPermissionError",

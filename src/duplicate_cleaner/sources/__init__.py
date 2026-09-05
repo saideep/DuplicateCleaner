@@ -4,8 +4,12 @@ from __future__ import annotations
 from duplicate_cleaner.sources.base import (
     ForeignHash,
     Source,
+    SourceAuthError,
     SourceError,
     SourceMetadata,
+    SourceNotFoundError,
+    SourcePermissionError,
+    SourceRateLimitError,
     TrashedLocation,
 )
 from duplicate_cleaner.sources.gdrive import GoogleDriveSource
@@ -16,7 +20,11 @@ __all__ = [
     "GoogleDriveSource",
     "LocalFileSystemSource",
     "Source",
+    "SourceAuthError",
     "SourceError",
     "SourceMetadata",
+    "SourceNotFoundError",
+    "SourcePermissionError",
+    "SourceRateLimitError",
     "TrashedLocation",
 ]

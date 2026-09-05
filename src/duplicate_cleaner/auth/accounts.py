@@ -33,6 +33,10 @@ class DuplicateAccountError(ValueError):
     """Raised when adding an account with an id already in the registry."""
 
 
+class AccountsRegistryPermissionError(RuntimeError):
+    """Raised when accounts.toml has a filesystem mode looser than 0o600."""
+
+
 @dataclass(frozen=True)
 class AccountEntry:
     """A single registered cloud account."""
@@ -80,6 +84,10 @@ class AccountsRegistry:
         """Return every registered account (empty list if the file is absent)."""
         if not self._path.exists():
             return []
+        # B7: symmetrise with TokenStore.load — refuse to consume an
+        # accounts.toml whose mode has drifted looser than 0o600.  Silently
+        # loading a world-readable registry masks a real misconfiguration.
+        self.enforce_secure_mode()
         with self._path.open("rb") as fh:
             data: dict[str, Any] = tomllib.load(fh)
         raw = data.get("accounts", [])
@@ -169,7 +177,7 @@ class AccountsRegistry:
             return
         mode_bits = stat.S_IMODE(self._path.stat().st_mode)
         if mode_bits & 0o077:
-            raise PermissionError(
+            raise AccountsRegistryPermissionError(
                 f"accounts.toml at {self._path} has mode {oct(mode_bits)}; "
                 f"must be 0o600.  Run: chmod 600 {self._path}"
             )

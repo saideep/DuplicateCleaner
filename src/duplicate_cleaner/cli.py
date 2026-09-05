@@ -292,10 +292,37 @@ def scan(
             ),
         ),
     ] = 1000.0,
+    cloud_hash_ttl_days: Annotated[
+        float,
+        typer.Option(
+            "--cloud-hash-ttl-days",
+            help=(
+                "Discard cached cloud BLAKE3 hashes older than N days at scan "
+                "start. Default 90."
+            ),
+        ),
+    ] = 90.0,
 ) -> None:
     """Walk, hash, group, score, and write a report."""
-    _ = sources  # sub-phase 2 records the flag; wire-up lands in sub-phase 5.
-    _ = max_cloud_download_mb
+    # B3: refuse non-local source ids until sub-phase 5 wires cloud sources
+    # into the scan pipeline.  Accepting them silently produced reports
+    # missing entire sources — surface the gap loudly instead.
+    requested_sources = [s.strip() for s in sources.split(",") if s.strip()]
+    for s in requested_sources:
+        if s != "local":
+            console.print(
+                f"[red]Refusing to scan[/red]: source {s!r} is not enabled. "
+                "Cross-source scan is not enabled until v0.2 sub-phase 5. "
+                "Currently only 'local' is supported."
+            )
+            raise typer.Exit(2)
+    if max_cloud_download_mb != 1000.0:
+        log = logging.getLogger(__name__)
+        log.warning(
+            "--max-cloud-download-mb accepted (value=%s) but has no effect "
+            "until v0.2 sub-phase 5 wires cloud sources into scan.",
+            max_cloud_download_mb,
+        )
     cfg = load_config()
     if not cfg.active_homes:
         console.print(
@@ -339,6 +366,11 @@ def scan(
 
     weights = load_weights()
     store = Store()
+    # B12: sweep stale cloud-hash-cache rows on every scan start.  Prevents
+    # unbounded growth of ``cloud_hash_cache`` after long stretches without a
+    # cache clear.  Cheap SQL DELETE; rows only get "stale" 90+ days after
+    # their last successful hash so warm entries are not touched.
+    store.purge_stale_cloud_hashes(max_age_days=cloud_hash_ttl_days)
 
     file_count = 0
     archive_paths: list[Path] = []
@@ -662,7 +694,19 @@ def _resolve_client_credentials(
     if client_secret is not None:
         return load_client_secret_json(client_secret)
     if type_ == "gdrive":
-        return BUNDLED_GDRIVE_CLIENT_ID, BUNDLED_GDRIVE_CLIENT_SECRET
+        client_id = BUNDLED_GDRIVE_CLIENT_ID
+        # B1: refuse to launch a doomed OAuth flow when the bundled client id
+        # is still the pre-release placeholder — Google would return a raw
+        # ``invalid_client`` that is confusing to end users.
+        if client_id.endswith("_TO_REPLACE"):
+            console.print(
+                "[red]This build's bundled Google OAuth client is not "
+                "registered yet.[/red] Use [cyan]--client-secret path/to/oauth.json"
+                "[/cyan] with your own Cloud Console-downloaded client "
+                "credentials until the release build ships."
+            )
+            raise typer.Exit(1)
+        return client_id, BUNDLED_GDRIVE_CLIENT_SECRET
     raise typer.BadParameter(f"Unknown auth type: {type_}")
 
 
@@ -716,6 +760,16 @@ def auth_add(
             help="OAuth callback port hint (0 = random). For testing only.",
         ),
     ] = 0,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help=(
+                "Overwrite an existing account with the same id (non-interactive "
+                "callers must pass this to re-authorise)."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Register a cloud account by running the OAuth localhost flow."""
     if type_ != "gdrive":
@@ -723,9 +777,29 @@ def auth_add(
         raise typer.Exit(2)
     registry = AccountsRegistry()
     tokens = TokenStore()
-    account_id = _default_account_id(
-        type_, label, [e.id for e in registry.load()]
-    )
+    existing_ids = [e.id for e in registry.load()]
+    account_id = _default_account_id(type_, label, existing_ids)
+    # B4: refuse to overwrite an existing account before starting the OAuth
+    # flow — the previous flow silently clobbered the token file (via
+    # ``TokenStore.save``) BEFORE the ``DuplicateAccountError`` check tripped.
+    if account_id in existing_ids and not force:
+        import sys
+
+        if sys.stdin.isatty():
+            confirm = typer.confirm(
+                f"Account {account_id!r} already registered. Re-authorize?",
+                default=False,
+            )
+            if not confirm:
+                console.print("[yellow]Aborted.[/yellow]")
+                raise typer.Exit(1)
+        else:
+            console.print(
+                f"[red]Account {account_id!r} already exists.[/red] "
+                f"Use [cyan]dc auth remove {account_id}[/cyan] first, "
+                "or pass [cyan]--force[/cyan] to overwrite."
+            )
+            raise typer.Exit(2)
     try:
         client_id, secret = _resolve_client_credentials(type_, client_secret)
     except (ValueError, FileNotFoundError) as e:
@@ -762,6 +836,11 @@ def auth_add(
     )
     tokens.save(account_id, token_data)
     user_email = str(token_data.get("user_email") or token_data.get("email") or "")
+    # B4: when re-authorising an existing id (interactive confirm or --force),
+    # drop the stale accounts.toml row so ``registry.add`` succeeds without
+    # tripping DuplicateAccountError.
+    if account_id in existing_ids:
+        registry.remove(account_id)
     try:
         registry.add(
             AccountEntry(

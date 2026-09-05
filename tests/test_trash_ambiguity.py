@@ -15,8 +15,9 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from duplicate_cleaner.apply import mover as mover_mod
-from duplicate_cleaner.apply.mover import _default_trash_fn, apply_report
+from duplicate_cleaner.apply import trash as trash_mod
+from duplicate_cleaner.apply.mover import apply_report
+from duplicate_cleaner.apply.trash import default_trash_fn as _default_trash_fn
 from duplicate_cleaner.report.schema import Report, ReportGroup, ReportMember
 
 
@@ -33,8 +34,8 @@ def test_default_trash_fn_returns_none_on_zero_diff(tmp_path: Path) -> None:
         def send2trash(_path: str) -> None:
             pass  # no filesystem side effect
 
-    with patch.object(mover_mod, "trash_dir_for", fake_trash_dir_for), patch.object(
-        mover_mod, "send2trash", _NoopSend
+    with patch.object(trash_mod, "trash_dir_for", fake_trash_dir_for), patch.object(
+        trash_mod, "send2trash", _NoopSend
     ):
         # An arbitrary source path — no side effects from send2trash means
         # ``after - before`` is empty, so we're in the ambiguity branch.
@@ -56,8 +57,8 @@ def test_default_trash_fn_returns_none_on_multi_new(tmp_path: Path) -> None:
             (trash / "landed_a.txt").write_bytes(b"x")
             (trash / "landed_b.txt").write_bytes(b"y")
 
-    with patch.object(mover_mod, "trash_dir_for", fake_trash_dir_for), patch.object(
-        mover_mod, "send2trash", _MultiSend
+    with patch.object(trash_mod, "trash_dir_for", fake_trash_dir_for), patch.object(
+        trash_mod, "send2trash", _MultiSend
     ):
         result = _default_trash_fn(tmp_path / "some.txt")
     assert result is None

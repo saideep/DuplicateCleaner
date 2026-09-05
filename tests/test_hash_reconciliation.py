@@ -90,9 +90,16 @@ def test_shared_algo_bucket_uses_foreign_hash_and_skips_download(tmp_path: Path)
 
 
 def test_cache_hit_skips_download(tmp_path: Path) -> None:
+    """B5: two members with different algos force the cache-lookup path.
+
+    The same-algo shortcut (B5) fires first when EVERY member shares an algo.
+    To exercise the cache-hit branch we mix algos — one gdrive/md5, one
+    onedrive/sha256 — so ``_shared_algo`` returns None and the reconcile
+    stage falls through to the per-member cache lookup.
+    """
     store = Store(path=tmp_path / "cache.db")
     store.put_cloud_hash("gdrive:x", "a", "etagA", "cached-hash", size=1000)
-    store.put_cloud_hash("gdrive:x", "b", "etagB", "cached-hash", size=1000)
+    store.put_cloud_hash("onedrive:y", "b", "etagB", "cached-hash", size=1000)
 
     calls: list[FileRecord] = []
 
@@ -109,9 +116,9 @@ def test_cache_hit_skips_download(tmp_path: Path) -> None:
             etag="etagA",
         ),
         _rec(
-            source="gdrive:x",
+            source="onedrive:y",
             size=1000,
-            foreign="md5:BBB",
+            foreign="sha256:BBB",
             cloud_id="b",
             etag="etagB",
         ),
@@ -121,6 +128,39 @@ def test_cache_hit_skips_download(tmp_path: Path) -> None:
     assert calls == []
     assert {r.blake3 for r in got} == {"cached-hash"}
     assert all(r.from_cache for r in got)
+    store.close()
+
+
+def test_shared_md5_algo_skips_download(tmp_path: Path) -> None:
+    """B5: two members sharing md5 — not just blake3 — skip download entirely."""
+    store = Store(path=tmp_path / "cache.db")
+    calls: list[FileRecord] = []
+
+    def _reader(r: FileRecord) -> Iterator[bytes]:
+        calls.append(r)
+        yield b""
+
+    members = [
+        _rec(
+            source="gdrive:a",
+            size=10,
+            foreign="md5:DEADBEEF",
+            cloud_id="a1",
+            etag="e1",
+        ),
+        _rec(
+            source="gdrive:b",
+            size=10,
+            foreign="md5:DEADBEEF",
+            cloud_id="b1",
+            etag="e2",
+        ),
+    ]
+    got = reconcile_bucket(members, store, _reader)
+    assert got is not None
+    assert calls == []  # B5: no download for same-algo bucket
+    # Both files carry the same MD5 → they group under the same key.
+    assert {r.blake3 for r in got} == {"DEADBEEF"}
     store.close()
 
 

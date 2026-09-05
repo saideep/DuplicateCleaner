@@ -95,3 +95,23 @@ def test_invalid_account_id_rejected(tmp_path: Path) -> None:
     for bad in ("", "..", ".", "a/b"):
         with pytest.raises(ValueError):
             store.save(bad, {"access_token": "x"})
+
+
+def test_ensure_dir_raises_when_chmod_cannot_reach_0o700(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B8: chmod-verify path — if the dir mode drifts, save() must raise."""
+    import os
+
+    tdir = tmp_path / "tokens"
+    tdir.mkdir()
+    os.chmod(tdir, 0o755)
+
+    # Make os.chmod a no-op so the post-chmod verify sees the drifted mode.
+    def _no_chmod(path: str, mode: int) -> None:
+        return None
+
+    monkeypatch.setattr(os, "chmod", _no_chmod)
+    store = TokenStore(base_dir=tdir)
+    with pytest.raises(TokenPermissionError):
+        store.save("gdrive:x", {"access_token": "x"})

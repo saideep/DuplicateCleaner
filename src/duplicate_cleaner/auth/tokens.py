@@ -49,11 +49,21 @@ class TokenStore:
         return self._dir / f"{account_id}.json"
 
     def _ensure_dir(self) -> None:
+        """Create the tokens dir if missing and verify mode is 0o700 on exit.
+
+        B8: silently swallowing chmod failures let a stale 0o755 (or worse)
+        directory persist, which every later ``save`` inherited.  Now we
+        re-stat after chmod and raise :class:`TokenPermissionError` on any
+        mismatch — token secrets are too sensitive to leave to best-effort.
+        """
         self._dir.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self._dir, _DIR_MODE)
-        except OSError as exc:  # pragma: no cover - defensive
-            log.warning("Cannot chmod %s to 0o700: %s", self._dir, exc)
+        os.chmod(self._dir, _DIR_MODE)
+        actual = stat.S_IMODE(self._dir.stat().st_mode)
+        if actual != _DIR_MODE:
+            raise TokenPermissionError(
+                f"Tokens directory {self._dir} has mode {oct(actual)}; "
+                f"expected {oct(_DIR_MODE)}.  Run: chmod 700 {self._dir}"
+            )
 
     def save(self, account_id: str, token_data: dict[str, Any]) -> None:
         """Write a token blob atomically at mode 0o600 with parent 0o700."""

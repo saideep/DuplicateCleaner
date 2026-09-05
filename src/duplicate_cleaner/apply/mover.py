@@ -9,8 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import send2trash  # type: ignore[import-untyped]
-
+from duplicate_cleaner.apply.trash import default_trash_fn
 from duplicate_cleaner.compare.archive import (
     ARCHIVE_SEP,
     is_virtual_archive_path,
@@ -18,7 +17,6 @@ from duplicate_cleaner.compare.archive import (
 from duplicate_cleaner.paths import (
     is_within,
     resolve_for_check,
-    trash_dir_for,
     validate_not_excluded,
     validate_scan_root_candidate,
 )
@@ -45,6 +43,12 @@ def load_report(json_path: Path) -> Report:
     return Report.model_validate(data)
 
 
+# TODO(sub-phase 5): cloud path validation.  ``Path("gdrive:x://foo")`` is
+# relative on POSIX and ``resolve_for_check`` will prepend cwd.  Before wiring
+# cloud entries through the mover, either (a) introduce an ``is_cloud_path``
+# predicate + source-dispatched validator, (b) require ``report.roots`` to
+# include synthetic ``<source_id>://`` roots, or (c) dispatch by ``source_id``
+# BEFORE the local exclusion checks run.  Tracked in AUDIT_LOG sub-phase 5.
 def _validate_report_paths(report: Report) -> list[Path]:
     """Reject any discard path that is excluded or outside the recorded roots.
 
@@ -135,30 +139,11 @@ def _verify_unchanged(path: Path, size: int, mtime: float) -> None:
         )
 
 
-def _default_trash_fn(path: Path) -> Path | None:
-    """Trash ``path`` and best-effort record where it landed.
-
-    ``send2trash`` returns nothing, so we snapshot the volume-appropriate
-    Trash directory before and after the call and diff the basename set to
-    pick the destination. On ambiguity (0 or >1 new entries) we return
-    ``None`` and the caller records ``trashed_at_path=None``; undo falls
-    back to a name+hash+size scan of the Trash directory (see
-    ``apply.undo._locate_by_basename_and_size``).
-    """
-    trash = trash_dir_for(path)
-    before: set[str] = set()
-    if trash.exists():
-        before = {p.name for p in trash.iterdir()}
-    send2trash.send2trash(str(path))
-    after: set[str] = set()
-    if trash.exists():
-        after = {p.name for p in trash.iterdir()}
-    new = after - before
-    if len(new) == 1:
-        return trash / next(iter(new))
-    # Ambiguous — record None so callers do not stamp a specific-but-wrong
-    # path into the manifest. Undo will locate the file by basename+hash.
-    return None
+# The default trash callable — shared verbatim with LocalFileSystemSource
+# via ``apply.trash.default_trash_fn`` so the send2trash + basename-diff
+# implementation lives in exactly one place.  Kept as a module-level alias
+# so ``apply_report(trash_fn=None)`` still resolves to a concrete callable.
+_default_trash_fn = default_trash_fn
 
 
 def _write_manifest(manifest_path: Path, data: dict[str, Any]) -> None:

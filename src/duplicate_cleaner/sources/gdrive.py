@@ -20,8 +20,12 @@ from typing import Any
 
 from duplicate_cleaner.scan.walk import FileRecord
 from duplicate_cleaner.sources.base import (
+    SourceAuthError,
     SourceError,
     SourceMetadata,
+    SourceNotFoundError,
+    SourcePermissionError,
+    SourceRateLimitError,
     TrashedLocation,
 )
 
@@ -70,7 +74,10 @@ def _drive_call(callable_: Callable[[], Any]) -> Any:
 
     Imported lazily so unit tests can exercise the module without ``tenacity``
     installed.  A test that wants to bypass retry logic entirely patches
-    :func:`_drive_call` directly.
+    :func:`_drive_call` directly.  On the final retry exhaustion, the original
+    ``HttpError`` is re-raised — ``_raise_mapped`` (used by
+    ``move_to_trash`` / ``restore_from_trash``) then translates it to a
+    :class:`SourceRateLimitError` or other typed error so callers can react.
     """
     from tenacity import (  # type: ignore[import-not-found,import-untyped]
         Retrying,
@@ -88,6 +95,46 @@ def _drive_call(callable_: Callable[[], Any]) -> Any:
         with attempt:
             return callable_()
     raise RuntimeError("tenacity Retrying loop completed without a result")
+
+
+def _http_status(exc: BaseException) -> int | None:
+    """Return the numeric HTTP status on a ``googleapiclient.HttpError``."""
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status is None:
+        return None
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
+def _raise_mapped(exc: BaseException) -> None:
+    """Translate a Drive HttpError into the closest ``SourceError`` subtype.
+
+    Called from within ``except`` blocks; returns normally on unrecognised
+    errors so the original exception falls through to the caller's re-raise.
+    """
+    try:
+        from googleapiclient.errors import (
+            HttpError,  # type: ignore[import-not-found,import-untyped]
+        )
+    except ImportError:
+        return
+    if not isinstance(exc, HttpError):
+        return
+    status = _http_status(exc)
+    if status is None:
+        return
+    if status == 404:
+        raise SourceNotFoundError(str(exc)) from exc
+    if status == 403:
+        raise SourcePermissionError(str(exc)) from exc
+    if status == 401:
+        raise SourceAuthError(str(exc)) from exc
+    if status == 429 or 500 <= status < 600:
+        # Reached only after tenacity exhausted its retry budget — surface
+        # a caller-actionable rate-limit error rather than a raw HttpError.
+        raise SourceRateLimitError(str(exc)) from exc
 
 
 class GoogleDriveSource:
@@ -168,12 +215,16 @@ class GoogleDriveSource:
 
         owners = item.get("owners") or []
         owner_email: str | None = None
-        owner_is_me = True
+        # B2: default owner_is_me=False.  When Drive omits ``owners[0].me`` we
+        # cannot prove the file is owned by us — safer to treat as shared so
+        # the "shared cloud files informational-only" invariant is not
+        # violated by a missing-field response.
+        owner_is_me = False
         if isinstance(owners, list) and owners:
             first = owners[0] or {}
             if isinstance(first, dict):
                 owner_email = first.get("emailAddress")
-                owner_is_me = bool(first.get("me", True))
+                owner_is_me = bool(first.get("me", False))
 
         is_shared = bool(item.get("shared")) or (not owner_is_me)
 
@@ -264,21 +315,69 @@ class GoogleDriveSource:
                 buf.truncate(0)
 
     def move_to_trash(self, record: FileRecord) -> TrashedLocation:
-        """Sub-phase 3 will implement; scan-time constructions raise instead."""
+        """Set ``trashed=true`` on the Drive file — Drive keeps the file id.
+
+        Returns a :class:`TrashedLocation` with ``cloud_file_id = cloud_trash_id``
+        because Google Drive does not mint a separate trash id: the same file id
+        is used to un-trash the file later.  Sub-phase 5 wires the mover to
+        this method for real cloud discards; sub-phase 3 exercises it via unit
+        tests only.
+        """
         if self.is_read_only_scan:
             raise PermissionError(
                 f"GoogleDriveSource(id={self.id!r}) is read-only during scan; "
-                "trash + restore land in v0.2 sub-phase 3."
+                "construct with is_read_only_scan=False to enable trashing."
             )
-        raise NotImplementedError(
-            "GoogleDriveSource.move_to_trash: implemented in v0.2 sub-phase 3."
+        if not record.cloud_file_id:
+            raise SourceError(
+                f"{record.path}: cannot trash without cloud_file_id"
+            )
+        try:
+            _drive_call(
+                self.service.files().update(
+                    fileId=record.cloud_file_id,
+                    body={"trashed": True},
+                    fields="id,trashed",
+                ).execute
+            )
+        except Exception as exc:
+            _raise_mapped(exc)
+            raise
+        return TrashedLocation(
+            source_id=self.id,
+            original_path=str(record.path),
+            cloud_file_id=record.cloud_file_id,
+            cloud_trash_id=record.cloud_file_id,
         )
 
     def restore_from_trash(self, loc: TrashedLocation) -> None:
-        """Sub-phase 3 will implement; called only by ``dc undo`` on cloud entries."""
-        raise NotImplementedError(
-            "GoogleDriveSource.restore_from_trash: implemented in v0.2 sub-phase 3."
-        )
+        """Un-trash the Drive file whose id is recorded on ``loc``.
+
+        Rejects a mismatched ``source_id`` so a poisoned manifest cannot
+        dispatch a Google entry to a different source implementation.
+        Raises :class:`SourceNotFoundError` when the trashed object has
+        been permanently deleted (trash emptied).
+        """
+        if loc.source_id != self.id:
+            raise SourceError(
+                f"TrashedLocation source_id {loc.source_id!r} does not match "
+                f"this GoogleDriveSource id {self.id!r}."
+            )
+        if not loc.cloud_file_id:
+            raise SourceError(
+                f"TrashedLocation has no cloud_file_id: cannot restore ({loc})"
+            )
+        try:
+            _drive_call(
+                self.service.files().update(
+                    fileId=loc.cloud_file_id,
+                    body={"trashed": False},
+                    fields="id,trashed",
+                ).execute
+            )
+        except Exception as exc:
+            _raise_mapped(exc)
+            raise
 
     def get_metadata(self, record: FileRecord) -> SourceMetadata:
         """Return metadata already populated at scan time — no re-fetch."""

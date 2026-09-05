@@ -132,7 +132,9 @@ def test_local_source_restore_from_trash_roundtrip(tmp_path: Path) -> None:
     assert trashed.exists()
 
     src = LocalFileSystemSource(
-        roots=[tmp_path], is_read_only_scan=False
+        roots=[tmp_path],
+        is_read_only_scan=False,
+        allowed_trash_dirs=[fake_trash],
     )
     loc = TrashedLocation(
         source_id="local",
@@ -143,6 +145,57 @@ def test_local_source_restore_from_trash_roundtrip(tmp_path: Path) -> None:
     assert original.exists()
     assert original.read_bytes() == b"payload"
     assert not trashed.exists()
+
+
+def test_local_source_restore_rejects_non_trash_source(tmp_path: Path) -> None:
+    """B9: a poisoned TrashedLocation must not shutil.move an arbitrary file."""
+    from duplicate_cleaner.apply.undo import UndoError
+
+    # Point ``trashed_at`` at a fake but not-inside-Trash location.
+    fake_trash = tmp_path / "trash"
+    fake_trash.mkdir()
+    poisoned_src = tmp_path / "outside_trash.txt"
+    _touch(poisoned_src, b"secret")
+    dst = tmp_path / "docs" / "attacker_target.txt"
+
+    src = LocalFileSystemSource(
+        roots=[tmp_path],
+        is_read_only_scan=False,
+        allowed_trash_dirs=[fake_trash],
+    )
+    loc = TrashedLocation(
+        source_id="local",
+        original_path=str(dst),
+        local_trashed_at_path=poisoned_src,
+    )
+    with pytest.raises(UndoError):
+        src.restore_from_trash(loc)
+    # And the poisoned source is still on disk — no shutil.move happened.
+    assert poisoned_src.exists()
+    assert not dst.exists()
+
+
+def test_local_source_restore_rejects_archive_member_original(tmp_path: Path) -> None:
+    """B9: ``::`` in original_path must be rejected before any move."""
+    from duplicate_cleaner.apply.undo import UndoError
+
+    fake_trash = tmp_path / "trash"
+    fake_trash.mkdir()
+    trashed = fake_trash / "inner.txt"
+    _touch(trashed, b"x")
+    src = LocalFileSystemSource(
+        roots=[tmp_path],
+        is_read_only_scan=False,
+        allowed_trash_dirs=[fake_trash],
+    )
+    loc = TrashedLocation(
+        source_id="local",
+        original_path=str(tmp_path / "outer.zip::inner.txt"),
+        local_trashed_at_path=trashed,
+    )
+    with pytest.raises(UndoError):
+        src.restore_from_trash(loc)
+    assert trashed.exists()  # nothing moved
 
 
 def test_local_source_restore_missing_source_raises(tmp_path: Path) -> None:

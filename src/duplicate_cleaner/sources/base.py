@@ -19,6 +19,22 @@ class SourceError(Exception):
     """Base class for every failure originating in a Source implementation."""
 
 
+class SourceNotFoundError(SourceError):
+    """The cloud object no longer exists (permanently deleted or moved)."""
+
+
+class SourcePermissionError(SourceError):
+    """The account lacks permission for the requested operation."""
+
+
+class SourceRateLimitError(SourceError):
+    """The provider throttled us past the retry cap."""
+
+
+class SourceAuthError(SourceError):
+    """The stored token was rejected (401) — interactive re-auth required."""
+
+
 @dataclass(frozen=True)
 class SourceMetadata:
     """Snapshot of cloud-side metadata pulled during list_files()."""

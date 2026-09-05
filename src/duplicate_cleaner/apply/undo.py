@@ -35,15 +35,62 @@ class UndoError(RuntimeError):
 TrashResolver = Callable[[Path], Path]
 
 
-def local_restore(src: Path, dst: Path) -> None:
+def validate_restore_paths(
+    original_path: Path,
+    trashed_at_path: Path,
+    *,
+    allowed_trash_dirs: list[Path] | None = None,
+) -> None:
+    """Enforce H2/F12/H5 rails on a single (original, trashed_at) pair.
+
+    Shared between :func:`restore_from_manifest` (batch undo) and
+    :func:`local_restore` (per-entry Source.restore_from_trash).  Callers of
+    the low-level source method now go through the same rails as the manifest
+    driver, so a poisoned ``TrashedLocation`` cannot coerce ``shutil.move``
+    into relocating ``~/.ssh/id_rsa`` (H2), restoring into an excluded root
+    like ``/System`` (F12), or materialising an archive-member path (H5).
+    """
+    if ARCHIVE_SEP in str(original_path):
+        raise UndoError(
+            f"Refuse to restore archive-member path (contains {ARCHIVE_SEP!r}): "
+            f"{original_path}"
+        )
+    resolved_original = resolve_for_check(original_path)
+    try:
+        validate_not_excluded(resolved_original)
+    except ValueError as e:
+        raise UndoError(
+            f"Refuse to restore into excluded location {original_path}: {e}"
+        ) from e
+    trash_roots: list[Path] = (
+        [resolve_for_check(p) for p in allowed_trash_dirs]
+        if allowed_trash_dirs is not None
+        else known_trash_dirs()
+    )
+    resolved_src = resolve_for_check(trashed_at_path)
+    if not any(is_within(resolved_src, root) for root in trash_roots):
+        raise UndoError(
+            f"Refuse to restore: trashed_at_path {trashed_at_path} is not "
+            f"inside a known Trash directory "
+            f"({[str(r) for r in trash_roots]})"
+        )
+
+
+def local_restore(
+    src: Path,
+    dst: Path,
+    *,
+    allowed_trash_dirs: list[Path] | None = None,
+) -> None:
     """Move ``src`` back to ``dst`` — keeps ``shutil.move`` centralised here.
 
     ``LocalFileSystemSource.restore_from_trash`` calls this so the
     forbidden-calls whitelist can continue to name exactly one file
-    (``apply/undo.py``) as the legitimate holder of ``shutil.move``.
-    The caller is responsible for validating that ``src`` lives inside a
-    known Trash directory and that ``dst`` is not under an excluded root.
+    (``apply/undo.py``) as the legitimate holder of ``shutil.move``.  Every
+    call flows through :func:`validate_restore_paths` — no caller can skip
+    the H2/F12/H5 rails even by wiring the source's method directly.
     """
+    validate_restore_paths(dst, src, allowed_trash_dirs=allowed_trash_dirs)
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst))
 

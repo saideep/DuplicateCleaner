@@ -11,35 +11,11 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import ClassVar
 
-import send2trash  # type: ignore[import-untyped]
-
-from duplicate_cleaner.paths import trash_dir_for
+from duplicate_cleaner.apply.trash import default_trash_fn as _default_local_trash_fn
 from duplicate_cleaner.scan.walk import FileRecord, WalkStats, iter_files
 from duplicate_cleaner.sources.base import SourceMetadata, TrashedLocation
 
 TrashFn = Callable[[Path], Path | None]
-
-
-def _default_local_trash_fn(path: Path) -> Path | None:
-    """Trash ``path`` via ``send2trash`` and best-effort record the destination.
-
-    Mirrors ``apply.mover._default_trash_fn``: snapshot the trash dir before
-    and after so the caller can stamp a specific ``trashed_at_path`` into the
-    manifest when unambiguous.  On ambiguity (0 or >1 new entries) returns
-    ``None`` so undo falls back to a basename+hash scan.
-    """
-    trash = trash_dir_for(path)
-    before: set[str] = set()
-    if trash.exists():
-        before = {p.name for p in trash.iterdir()}
-    send2trash.send2trash(str(path))
-    after: set[str] = set()
-    if trash.exists():
-        after = {p.name for p in trash.iterdir()}
-    new = after - before
-    if len(new) == 1:
-        return trash / next(iter(new))
-    return None
 
 
 class LocalFileSystemSource:
@@ -64,6 +40,7 @@ class LocalFileSystemSource:
         stats: WalkStats | None = None,
         is_read_only_scan: bool = True,
         trash_fn: TrashFn | None = None,
+        allowed_trash_dirs: list[Path] | None = None,
     ) -> None:
         self.roots: list[Path] = list(roots) if roots else []
         self.follow_symlinks = follow_symlinks
@@ -73,6 +50,13 @@ class LocalFileSystemSource:
         self.stats = stats
         self.is_read_only_scan = is_read_only_scan
         self._trash_fn: TrashFn = trash_fn or _default_local_trash_fn
+        # B9: mirror ``restore_from_manifest``'s ``allowed_trash_dirs`` override
+        # so tests can restore from a temp-directory Trash without touching
+        # ``~/.Trash``.  Real callers leave this None; ``local_restore`` then
+        # uses ``paths.known_trash_dirs()``.
+        self._allowed_trash_dirs: list[Path] | None = (
+            list(allowed_trash_dirs) if allowed_trash_dirs is not None else None
+        )
 
     def list_files(self) -> Iterator[FileRecord]:
         """Yield walker records for every configured root."""
@@ -115,12 +99,11 @@ class LocalFileSystemSource:
     def restore_from_trash(self, loc: TrashedLocation) -> None:
         """Move a previously-trashed file back to its recorded ``original_path``.
 
-        Sub-milestone 1 keeps the CLI ``dc undo`` path going through
-        ``apply.undo.restore_from_manifest``; this method exists to satisfy
-        the Source protocol and will be wired into the mover/undo dispatch
-        in sub-phase 5.  Full poisoned-manifest validation lives in
-        ``restore_from_manifest``; callers of this low-level entry point are
-        expected to have already validated both endpoints.
+        Delegates to :func:`apply.undo.local_restore`, which runs the same
+        H2/F12/H5 poisoned-manifest rails that :func:`restore_from_manifest`
+        enforces (trash-containment, ``::`` rejection, EXCLUDED_ROOTS).  A
+        wire-up bug in sub-phase 5 that pointed this method at ``~/.ssh``
+        would trip the guard, not shutil.move ~/.ssh into a scan root.
         """
         src = loc.local_trashed_at_path
         if src is None:
@@ -130,12 +113,15 @@ class LocalFileSystemSource:
             )
         if not src.exists():
             raise FileNotFoundError(f"Trashed file missing: {src}")
-        # Delegate the actual move to apply.undo so shutil.move stays in the
-        # one file the forbidden-calls whitelist names.  Import lazily to
-        # avoid a hard cycle if apply.undo later imports sources.
+        # Import lazily so ``apply.undo`` can freely import from ``sources``
+        # in a future refactor without introducing a cycle here.
         from duplicate_cleaner.apply.undo import local_restore
 
-        local_restore(src, Path(loc.original_path))
+        local_restore(
+            src,
+            Path(loc.original_path),
+            allowed_trash_dirs=self._allowed_trash_dirs,
+        )
 
     def get_metadata(self, record: FileRecord) -> SourceMetadata:
         """Return an empty SourceMetadata — local files carry no cloud fields."""

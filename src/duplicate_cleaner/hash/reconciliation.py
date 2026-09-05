@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import blake3  # type: ignore[import-untyped]
 
@@ -88,6 +87,11 @@ def _members_share_algo(members: list[FileRecord]) -> str | None:
     return None
 
 
+def _shared_algo(members: list[FileRecord]) -> str | None:
+    """Alias — the public spelling used by callers wanting the shared prefix."""
+    return _members_share_algo(members)
+
+
 def reconcile_bucket(
     members: list[FileRecord],
     store: Store,
@@ -107,8 +111,14 @@ def reconcile_bucket(
         # Singleton across sources — never a duplicate candidate; skip.
         return []
 
-    shared = _members_share_algo(members)
-    if shared is not None and shared == "blake3":
+    shared = _shared_algo(members)
+    if shared is not None:
+        # B5: any shared algorithm — not just blake3 — means we can group by
+        # foreign_hash directly and skip the download.  Two files that share
+        # md5 (e.g. two Google accounts) still bucket into the same group;
+        # they simply carry the foreign digest as their canonical ``blake3``
+        # field.  Group-membership is the only downstream consumer, so the
+        # tag string is opaque as long as it collides consistently.
         return [
             ReconciledRecord(
                 record=m,
@@ -182,14 +192,3 @@ def _stream_blake3(chunks: Iterator[bytes]) -> str:
 def purge_stale_cache(store: Store, max_age_days: float = _MAX_CACHE_AGE_DAYS) -> int:
     """Drop cloud_hash_cache rows older than ``max_age_days``."""
     return store.purge_stale_cloud_hashes(max_age_days=max_age_days)
-
-
-# Public path spellings for callers using duck-typed dicts (e.g. tests
-# building a FakeSource from JSON) — the reconcile step does not care about
-# the concrete ``Path`` instance, only about the ``(source_id, cloud_file_id,
-# etag)`` triple.
-CLOUD_HASH_TRIPLE = ("source_id", "cloud_file_id", "etag")
-
-
-def _unused_path_placeholder() -> Path:
-    return Path("/dev/null")

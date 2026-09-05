@@ -25,6 +25,10 @@ Shipping in v0.1.1 (current release):
 - Singleton "Unique files" section in every report — files with no duplicates are enumerated so a scan doubles as a directory census.
 - `--discover` mode. `dc scan --discover` produces an enumeration-only report and proposes zero deletions. Useful for surveying an unfamiliar drive before running a real scan.
 
+Next up in v0.3 (in development):
+
+- Domain-aware organizer. `dc organize discover` proposes a folder taxonomy for what remains after dedup — HR, Personal, Finances, Photos, Videos, Work, Projects, Media, Unsorted — derived from the signals the tool actually saw in your data. Three-phase workflow (discover, review, apply) with dry-run default, undo manifest, and cohesion preservation so albums, book series, git projects, and photo events move atomically. Full detail in [docs/organize.md](docs/organize.md).
+
 In development for v0.2:
 
 - Cloud sources. Google Drive and OneDrive Personal accounts are scanned alongside local trees. Duplicates that span local and cloud propose the cloud copy for deletion (local wins any cross-source tie).
@@ -37,12 +41,12 @@ In development for v0.2:
 
 Later milestones:
 
-- Perceptual image near-duplicate detection *(coming in v0.3)*.
 - Project directory tree aggregation — collapse two copies of the same repo to one tree-diff line *(coming in v0.4)*.
-- Semantic PDF and text matching via normalized-text hash plus fuzzy fallback *(coming in v0.5)*.
-- Google Photos and iCloud Photos sources *(coming in v0.6)*.
-- Audio and video near-duplicate detection using Chromaprint fingerprints and keyframe pHash *(coming in v0.6)*.
-- Adaptive weights that learn from your overrides and gate auto-apply behind a confidence threshold *(coming in v0.7)*.
+- Cloud consolidation via `dc migrate` — copy files between clouds, verify by hash, then optionally trash on the source *(coming in v0.5)*.
+- Google Photos and iCloud Photos sources for unified photo metadata across every account *(coming in v0.6)*.
+- Perceptual image near-duplicate detection *(coming in v0.7)*.
+- Audio and video near-duplicate detection using Chromaprint fingerprints and keyframe pHash *(coming in v0.8)*.
+- Adaptive weights that learn from your overrides and gate auto-apply behind a confidence threshold — later.
 
 ## Requirements
 
@@ -112,6 +116,10 @@ Full detail in [docs/safety.md](docs/safety.md).
 | `dc auth test <id>` | Verify an account's token still works. (v0.2) | `dc auth test gdrive:personal` |
 | `dc auth remove <id>` | Remove an account and revoke its tokens. (v0.2) | `dc auth remove gdrive:family` |
 | `dc sources list` | List sources plus per-source file counts. (v0.2) | `dc sources list` |
+| `dc organize discover <dir>...` | Propose a folder taxonomy for the roots. Writes a plan JSON and HTML view. Zero filesystem changes. (v0.3) | `dc organize discover ~/Downloads --plan ~/plan.json` |
+| `dc organize review <plan.json>` | Interactive Rich TUI for editing the plan file. (v0.3) | `dc organize review ~/plan.json` |
+| `dc organize apply <plan.json>` | Create target folders and move files. Dry-run by default. (v0.3) | `dc organize apply ~/plan.json --commit` |
+| `dc organize undo <manifest.json>` | Restore every file moved in a prior organize run. (v0.3) | `dc organize undo ~/.local/share/duplicate_cleaner/runs/<ts>/manifest.json` |
 | `dc weights show` | Print current scoring weights. | `dc weights show` |
 | `dc weights reset` | Restore weights to the shipped defaults. | `dc weights reset` |
 | `dc cache stats` | Print cache size and hit rate. | `dc cache stats` |
@@ -143,6 +151,15 @@ exclude_globs = [
 # max_workers = 4              # default: os.cpu_count() // 2
 # throttle_on_cpu_pct = 85     # set to 100 to disable throttling
 # min_free_disk_gb = 5
+
+# Organizer (v0.3)
+# [organize]
+# organize_confidence_threshold = 0.75
+# organize_dir_mode = 0o755
+# rename_policy = "preserve"       # or "date_prefix" | "date_event_prefix"
+# event_gap_hours = 12
+# min_event_photos = 5
+# enforce_dedup_ordering = false
 ```
 
 Full reference: [docs/config.md](docs/config.md).
@@ -156,8 +173,9 @@ MIT.
 - [x] **v0.1 — Exact-only.** Walk, size bucket, BLAKE3 pipeline, SQLite cache, rule-based scorer, HTML report, `apply` to Trash, `undo`. Shipped.
 - [x] **v0.1.1 — Archives, bundles, monitoring, clones.** Archive recursion, macOS bundle handling, `psutil`-based system monitoring, APFS clone detection, singleton report, `--discover` mode. Shipped.
 - [ ] **v0.2 — Cloud sources.** Google Drive and OneDrive Personal listings compared against local trees; OAuth 2.0 with bundled clients; multi-account support; trash-only cloud deletion with cross-source undo. **In progress.**
-- [ ] **v0.3 — Organizer.** Project-tree aggregation and directory rollup for backup-folder collapse.
-- [ ] **v0.4 — Image near-duplicate.** Perceptual hash comparator plus thumbnails in the report.
-- [ ] **v0.5 — PDF and text semantic.** Normalized-text hashing plus fuzzy fallback.
-- [ ] **v0.6 — Google Photos, iCloud Photos, audio + video near-duplicate.** Chromaprint fingerprints and keyframe pHash.
-- [ ] **v0.7 — Adaptive weights.** Decisions log wired into weight updates plus `--auto-high-confidence`.
+- [ ] **v0.3 — Organizer.** Domain-aware `dc organize` (discover, review, apply) with PDF content classification, EXIF event clustering, cohesion preservation for albums, book series, git projects, and photo events, and an Unsorted safety net for uncertain classifications. **Next up.**
+- [ ] **v0.4 — Project-tree aggregation.** Directory rollup for backup-folder collapse.
+- [ ] **v0.5 — Cloud consolidation (`dc migrate`).** Copy files between clouds, verify by hash, then optionally trash on the source.
+- [ ] **v0.6 — Google Photos and iCloud Photos.** Unified photo metadata across sources for the v0.3 organizer's event clustering.
+- [ ] **v0.7 — Image near-duplicate.** Perceptual hash comparator plus thumbnails in the report.
+- [ ] **v0.8 — Audio and video near-duplicate.** Chromaprint fingerprints and keyframe pHash.

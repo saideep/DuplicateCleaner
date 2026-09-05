@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import secrets
@@ -176,7 +177,10 @@ def run_localhost_flow(
             f"OAuth provider returned error: {received.get('error')} "
             f"({received.get('error_description', 'no description')})"
         )
-    if received.get("state") != state:
+    # B6: constant-time comparison — realistic attack surface for a loopback
+    # OAuth flow is thin, but ``hmac.compare_digest`` is the canonical spelling
+    # for opaque-value equality checks and rules out timing side-channels.
+    if not hmac.compare_digest(received.get("state", ""), state):
         raise OAuthFlowError(
             "OAuth state mismatch — possible CSRF; aborting the flow."
         )

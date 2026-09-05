@@ -20,7 +20,7 @@ import pytest
 from tests.test_no_forbidden_calls import (
     _FORBIDDEN,
     _RM_LITERAL_PAT,
-    _SHUTIL_MOVE_ALLOWED_FILES,
+    _SHUTIL_MOVE_ALLOWED_RELPATHS,
     _SHUTIL_MOVE_PAT,
     _SUBPROCESS_PAT,
 )
@@ -31,14 +31,15 @@ def _scan_for_offenders(src: Path) -> list[str]:
     offenders: list[str] = []
     for py in src.rglob("*.py"):
         text = py.read_text()
+        rel = py.relative_to(src).as_posix()
         for pat in _FORBIDDEN:
             for m in pat.finditer(text):
-                offenders.append(f"{py.name}: {m.group(0)}")
-        if py.name not in _SHUTIL_MOVE_ALLOWED_FILES:
+                offenders.append(f"{rel}: {m.group(0)}")
+        if rel not in _SHUTIL_MOVE_ALLOWED_RELPATHS:
             for m in _SHUTIL_MOVE_PAT.finditer(text):
-                offenders.append(f"{py.name}: {m.group(0)}")
+                offenders.append(f"{rel}: {m.group(0)}")
         if _SUBPROCESS_PAT.search(text) and _RM_LITERAL_PAT.search(text):
-            offenders.append(f"{py.name}: subprocess+rm literal")
+            offenders.append(f"{rel}: subprocess+rm literal")
     return offenders
 
 

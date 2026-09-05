@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file. Format: Kee
 
 ## [Unreleased]
 
+### v0.3 — Organizer (planned)
+
+Design contract: [docs/design/v0.3-organizer.md](docs/design/v0.3-organizer.md). User-facing docs: [docs/organize.md](docs/organize.md), [docs/cli.md](docs/cli.md), [docs/config.md](docs/config.md), [docs/safety.md](docs/safety.md).
+
+Planned surface for the milestone:
+
+- **`dc organize` command group with three sub-commands.** `discover` extracts signals and writes a plan JSON plus an HTML view; `review` opens a Rich-based TUI for editing the plan; `apply` creates target folders and moves files with a dry-run default. `undo` reverses a run from its manifest.
+- **Nine-domain taxonomy tuned to the user's data.** `HR/Payslips/`, `HR/OfferLetters/`, `HR/Tax/`, `Personal/IDs/`, `Personal/Insurance/`, `Personal/Legal/`, `Finances/Receipts/`, `Finances/Statements/`, `Finances/Invoices/`, `Finances/Investments/`, `Photos/`, `Videos/`, `Work/`, `Projects/`, `Media/Music/`, `Media/Books/`, `Unsorted/`. Every rule surfaces the exact signals that fired so the classification is auditable.
+- **Cohesion preservation.** Music albums (ID3), book series (topic or filename-prefix plus author), git projects (`.git`/`package.json`/`Cargo.toml`/`pyproject.toml`/`go.mod`/`pom.xml`/`.hg`), and photo or video event clusters move atomically. `--split-cohesive-units` required to break a cohesion group; without it, apply refuses to run before the first move.
+- **PDF content classification.** Keyword lexicon per class (payslip, receipt, bank_statement, tax_form, invoice, offer_letter, insurance, investment, id_document, legal) scored against first-page text via `pdfplumber`, gated by threshold `0.6`. Optional `--ocr` for scanned PDFs with too little extractable text.
+- **EXIF event clustering for photos and videos.** Time-gap splitting with an optional GPS-outlier split. Offline naming by default (`YYYY-MM-DD` or `YYYY-MM-DD_to_YYYY-MM-DD`). `--enable-geocode` opts in to Nominatim reverse-geocode for locality suffixes.
+- **Confidence gating.** `organize_confidence_threshold` (default `0.75`) below which files go to `Unsorted/`. Files whose best rule scored at least `0.4` land in `Unsorted/<Domain>/` for bulk triage.
+- **Rename policy user-locked to `preserve`.** `date_prefix` and `date_event_prefix` are opt-in via config. The tool never mutates filename bytes in the default mode.
+- **Dedup ordering.** Soft warning by default when the most recent scan still has pending proposed discards. `enforce_dedup_ordering = true` upgrades it to a hard refusal.
+- **Cross-volume move safety.** Cross-volume moves go `copy2` + fsync + `send2trash`, never `os.remove`, so hash-mismatch on the destination is recoverable via undo.
+- **Path collisions.** Identical-hash collisions skip the move and are logged; different-hash collisions get a `_<hash8>` stem suffix and are logged under `collisions[]` in the manifest.
+- **Directory mode `0o755` default.** `organize_dir_mode` config knob for users who want owner-only trees.
+
+Two new invariants tracked in [AUDIT_LOG.md](docs/AUDIT_LOG.md#invariants-do-not-weaken):
+
+- Cohesive units move atomically. Splitting requires `--split-cohesive-units`.
+- Rename policy is user-locked. Default `preserve` never mutates filename bytes.
+
+New Python dependencies planned for the milestone:
+
+- Core: `mutagen` (ID3), `pikepdf` (PDF Info dict), `hachoir` (video metadata), `geopy` (reverse-geocode; network usage opt-in).
+- `[docs]` optional-extra: `python-docx`, `python-pptx`, `openpyxl` for Office metadata.
+- `[gps]` optional-extra: `piexif` for EXIF GPS fallback where Pillow does not parse the block.
+- `[ocr]` optional-extra: `pytesseract` (requires system `tesseract`).
+- `[mime]` optional-extra: `python-magic` (stdlib `mimetypes` is the primary path).
+
+Sub-milestones (0.3-a → 0.3-b + 0.3-c → 0.3-d + 0.3-e → 0.3-f → 0.3-g): discovery + rules + TUI, then apply + undo, then PDF classifier, then event clustering, then cohesion enforcement, then HTML view, then cross-source. Cross-source (v0.3-g) depends on v0.2 landing first.
+
 ### In progress (v0.2 — cloud sources)
 
 - **Sub-phase 1 — source abstraction refactor.** Introduces `src/duplicate_cleaner/sources/` with the `Source` protocol, shared dataclasses, and exception hierarchy in `sources/base.py`. `LocalFileSystemSource` in `sources/local.py` wraps the existing walker and mover code with zero behaviour change. `FileRecord` gains six optional cloud-related fields (all defaulted so existing constructions work unchanged). Mover and undo dispatch by `source_id`; local-only reports remain byte-identical to v0.1.1. Exit gate: all existing tests pass unchanged; no new tests required. **In progress.**

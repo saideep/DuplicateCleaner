@@ -146,6 +146,70 @@ onedrive:main               612 files    (last scan 2026-09-04)
 
 `local` is always shown. Each configured account contributes one entry. File counts come from the last scan's cache; `-` if the source has never been scanned.
 
+## `dc organize` (v0.3)
+
+Three-phase organizer: propose a folder taxonomy for a set of roots, review it, then apply. Full behaviour and worked examples in [organize.md](organize.md).
+
+### `dc organize discover [ROOTS...] [--sources SRC_LIST] [--dest DIR] [--plan PATH] [--confidence-threshold FLOAT] [--event-gap-hours INT] [--enable-geocode] [--ocr] [--skip-dedup-check]`
+
+Walk the sources, extract signals, classify each file, and write the plan JSON and its HTML view. Zero filesystem changes outside the plan artifacts and the SQLite cache.
+
+Options:
+
+- `ROOTS` — local directories to include (for the `local` source). Ignored for cloud sources.
+- `--sources` — comma-separated source IDs. Default `local`. Non-`local` values are rejected until v0.3-g wires cross-source organize.
+- `--dest DIR` — root of the target tree. Default `~/organized`.
+- `--plan PATH` — where to write the plan JSON. Default `~/organize-plan.json`. A `<plan>.html` view is written alongside.
+- `--confidence-threshold FLOAT` — override `organize_confidence_threshold` for this run. Default from config (`0.75`).
+- `--event-gap-hours INT` — override `event_gap_hours` for this run. Default from config (`12`).
+- `--enable-geocode` — reverse-geocode event centroids via Nominatim to add a locality suffix to event folder names. Off by default. Rate-limits at one request per second per user-agent per Nominatim policy.
+- `--ocr` — OCR PDFs whose text extraction returns less than 100 characters. Requires the `[ocr]` extra and a system `tesseract` binary.
+- `--skip-dedup-check` — suppress the soft warning when pending duplicate proposals exist. Use in scripts.
+
+Examples:
+
+```shell
+uv run dc organize discover ~/Downloads --plan ~/plan.json
+uv run dc organize discover ~/Downloads ~/OldMac --dest ~/organized \
+    --plan ~/plan.json --enable-geocode
+uv run dc organize discover ~/Downloads --ocr --confidence-threshold 0.85 \
+    --plan ~/plan.json
+```
+
+### `dc organize review <plan.json>`
+
+Interactive Rich TUI for editing the plan. Keybindings and layout are documented in [organize.md](organize.md). Requires a TTY; if `stdin` or `stdout` is not a terminal, the command exits with an error pointing you at `$EDITOR`.
+
+```shell
+uv run dc organize review ~/plan.json
+```
+
+### `dc organize apply <plan.json> [--commit] [--split-cohesive-units] [--runs-dir DIR]`
+
+Move files according to the plan. Dry-run by default.
+
+Options:
+
+- `--commit` — actually create folders and move files. Without this flag the command prints the planned moves and exits.
+- `--split-cohesive-units` — allow the plan to route members of a cohesion group to different destinations. Without this flag, any cohesion violation aborts the run before the first move.
+- `--runs-dir DIR` — where to write the undo manifest. Default `~/.local/share/duplicate_cleaner/runs/`.
+
+Examples:
+
+```shell
+uv run dc organize apply ~/plan.json                        # dry-run
+uv run dc organize apply ~/plan.json --commit
+uv run dc organize apply ~/plan.json --commit --split-cohesive-units
+```
+
+### `dc organize undo <manifest.json>`
+
+Reverse every move recorded in the manifest. Same-volume moves are reversed with `os.rename`; cross-volume moves are reversed by recovering the source from Trash and then removing the destination copy after verifying its hash matches. Per-file drift skips that entry with a logged error; the rest of the manifest still restores.
+
+```shell
+uv run dc organize undo ~/.local/share/duplicate_cleaner/runs/<ts>/manifest.json
+```
+
 ## `dc weights`
 
 Print or reset scoring weights.

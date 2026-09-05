@@ -188,30 +188,182 @@ def test_move_to_trash_raises_when_read_only() -> None:
         src.move_to_trash(rec)
 
 
-def test_move_to_trash_not_implemented_when_writable() -> None:
+def test_move_to_trash_calls_update_with_trashed_true() -> None:
     page = {"files": [_drive_item("x")]}
+    service = _mk_service([page])
+    update_request = MagicMock()
+    update_request.execute.return_value = {"id": "x", "trashed": True}
+    service.files.return_value.update.return_value = update_request
     src = GoogleDriveSource(
         "gdrive:x",
         credentials=None,
         is_read_only_scan=False,
-        service_factory=lambda _c: _mk_service([page]),
+        service_factory=lambda _c: service,
     )
     rec = next(iter(src.list_files()))
-    with pytest.raises(NotImplementedError):
-        src.move_to_trash(rec)
+    loc = src.move_to_trash(rec)
+    call = service.files.return_value.update.call_args
+    assert call.kwargs["fileId"] == "x"
+    assert call.kwargs["body"] == {"trashed": True}
+    assert isinstance(loc, TrashedLocation)
+    assert loc.source_id == "gdrive:x"
+    assert loc.cloud_file_id == "x"
+    assert loc.cloud_trash_id == "x"  # Drive keeps the same id after trashing
 
 
-def test_restore_from_trash_not_implemented() -> None:
+def test_restore_from_trash_calls_update_with_trashed_false() -> None:
+    service = _mk_service([{"files": []}])
+    update_request = MagicMock()
+    update_request.execute.return_value = {"id": "abc", "trashed": False}
+    service.files.return_value.update.return_value = update_request
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        is_read_only_scan=False,
+        service_factory=lambda _c: service,
+    )
+    loc = TrashedLocation(
+        source_id="gdrive:x",
+        original_path="gdrive:x://foo",
+        cloud_file_id="abc",
+        cloud_trash_id="abc",
+    )
+    src.restore_from_trash(loc)
+    call = service.files.return_value.update.call_args
+    assert call.kwargs["fileId"] == "abc"
+    assert call.kwargs["body"] == {"trashed": False}
+
+
+def test_restore_from_trash_rejects_wrong_source_id() -> None:
     src = GoogleDriveSource(
         "gdrive:x",
         credentials=None,
         service_factory=lambda _c: _mk_service([{"files": []}]),
     )
     loc = TrashedLocation(
-        source_id="gdrive:x", original_path="gdrive:x://foo", cloud_file_id="id"
+        source_id="gdrive:other",
+        original_path="gdrive:other://foo",
+        cloud_file_id="id",
     )
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(SourceError):
         src.restore_from_trash(loc)
+
+
+def test_restore_from_trash_raises_not_found_on_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    HttpError = _install_fake_httperror(monkeypatch)
+    service = MagicMock()
+    update_request = MagicMock()
+    update_request.execute.side_effect = HttpError(status=404)
+    service.files.return_value.update.return_value = update_request
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        is_read_only_scan=False,
+        service_factory=lambda _c: service,
+    )
+    loc = TrashedLocation(
+        source_id="gdrive:x",
+        original_path="gdrive:x://foo",
+        cloud_file_id="gone",
+    )
+    from duplicate_cleaner.sources.base import SourceNotFoundError
+
+    with pytest.raises(SourceNotFoundError):
+        src.restore_from_trash(loc)
+
+
+def test_move_to_trash_retries_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    HttpError = _install_fake_httperror(monkeypatch)
+    import tenacity  # type: ignore[import-untyped]
+
+    monkeypatch.setattr(tenacity.nap, "sleep", lambda _s: None)
+
+    service = MagicMock()
+    update_request = MagicMock()
+    calls: list[int] = []
+
+    def _execute() -> dict[str, Any]:
+        calls.append(1)
+        if len(calls) < 2:
+            raise HttpError(status=429)
+        return {"id": "y", "trashed": True}
+
+    update_request.execute.side_effect = _execute
+    service.files.return_value.update.return_value = update_request
+    # list_files uses a separate request; supply a stub page result too.
+    list_request = MagicMock()
+    list_request.execute.return_value = {"files": [_drive_item("y")]}
+    service.files.return_value.list.return_value = list_request
+
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        is_read_only_scan=False,
+        service_factory=lambda _c: service,
+    )
+    rec = next(iter(src.list_files()))
+    loc = src.move_to_trash(rec)
+    assert loc.cloud_file_id == "y"
+    assert len(calls) == 2  # one 429 then success
+
+
+def test_move_to_trash_raises_after_max_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    HttpError = _install_fake_httperror(monkeypatch)
+    import tenacity  # type: ignore[import-untyped]
+
+    monkeypatch.setattr(tenacity.nap, "sleep", lambda _s: None)
+
+    service = MagicMock()
+    update_request = MagicMock()
+    update_request.execute.side_effect = HttpError(status=429)
+    service.files.return_value.update.return_value = update_request
+    list_request = MagicMock()
+    list_request.execute.return_value = {"files": [_drive_item("z")]}
+    service.files.return_value.list.return_value = list_request
+
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        is_read_only_scan=False,
+        service_factory=lambda _c: service,
+    )
+    rec = next(iter(src.list_files()))
+    from duplicate_cleaner.sources.base import SourceRateLimitError
+
+    with pytest.raises(SourceRateLimitError):
+        src.move_to_trash(rec)
+
+
+def test_owner_missing_me_field_marks_shared() -> None:
+    """B2: when Drive omits ``owners[0].me`` we must treat the file as shared."""
+    page = {
+        "files": [
+            {
+                "id": "no-me-field",
+                "name": "shared.pdf",
+                "modifiedTime": "2026-09-05T00:00:00.000Z",
+                "mimeType": "application/pdf",
+                "shared": False,
+                "trashed": False,
+                "size": "10",
+                "owners": [{"emailAddress": "someone@else.com"}],
+            }
+        ]
+    }
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        service_factory=lambda _c: _mk_service([page]),
+    )
+    rec = next(iter(src.list_files()))
+    assert rec.is_shared is True
+    assert rec.owner == "someone@else.com"
 
 
 def test_read_bytes_streams(monkeypatch: pytest.MonkeyPatch) -> None:

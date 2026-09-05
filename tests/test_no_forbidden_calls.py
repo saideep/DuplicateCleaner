@@ -27,9 +27,12 @@ _FORBIDDEN: list[re.Pattern[str]] = [
 
 # ``shutil.move`` is the legitimate restore primitive in ``apply/undo.py``.
 # Anywhere else, treat it as forbidden — a general ``.move()`` call is easy
-# to reach for and a copy-then-delete is not what we want.
+# to reach for and a copy-then-delete is not what we want.  Match on the
+# path relative to ``src/duplicate_cleaner/`` so a future ``undo.py`` under
+# a different module (``src/duplicate_cleaner/other/undo.py``) would still
+# trip the guard.
 _SHUTIL_MOVE_PAT = re.compile(r"\bshutil\.move\(")
-_SHUTIL_MOVE_ALLOWED_FILES: frozenset[str] = frozenset({"undo.py"})
+_SHUTIL_MOVE_ALLOWED_RELPATHS: frozenset[str] = frozenset({"apply/undo.py"})
 
 # subprocess.run + a bare 'rm' string literal in the same file is a red
 # flag — shelling out to /bin/rm would bypass Trash entirely. Applied per
@@ -44,22 +47,35 @@ def test_source_has_no_forbidden_destructive_calls() -> None:
     offenders: list[str] = []
     for py in src.rglob("*.py"):
         text = py.read_text()
+        rel = py.relative_to(src).as_posix()
         for pat in _FORBIDDEN:
             for m in pat.finditer(text):
-                offenders.append(f"{py.name}: {m.group(0)}")
+                offenders.append(f"{rel}: {m.group(0)}")
 
         # shutil.move: forbidden everywhere except the whitelisted undo path.
-        if py.name not in _SHUTIL_MOVE_ALLOWED_FILES:
+        if rel not in _SHUTIL_MOVE_ALLOWED_RELPATHS:
             for m in _SHUTIL_MOVE_PAT.finditer(text):
-                offenders.append(f"{py.name}: {m.group(0)}")
+                offenders.append(f"{rel}: {m.group(0)}")
 
         # subprocess + 'rm' string literal in the same file.
         if _SUBPROCESS_PAT.search(text) and _RM_LITERAL_PAT.search(text):
             offenders.append(
-                f"{py.name}: subprocess call with a bare 'rm' string literal"
+                f"{rel}: subprocess call with a bare 'rm' string literal"
             )
 
     assert not offenders, (
         "Forbidden destructive calls in library code — use send2trash instead: "
         + ", ".join(offenders)
     )
+
+
+def test_shutil_move_allowlist_uses_path_relative_match() -> None:
+    """B10: a hypothetical ``other/undo.py`` must not satisfy the allowlist."""
+    # The allowlist is populated with full relpaths (``apply/undo.py``), never
+    # basenames (``undo.py``).  If someone regresses to a bare basename, a
+    # future undo.py placed elsewhere would silently gain shutil.move rights.
+    for rel in _SHUTIL_MOVE_ALLOWED_RELPATHS:
+        assert "/" in rel, (
+            f"allowlist entry {rel!r} is a bare basename; use "
+            "'module/undo.py' form so the check is path-relative."
+        )

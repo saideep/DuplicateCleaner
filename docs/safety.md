@@ -161,6 +161,58 @@ Two additions to the safety model, tracked in [AUDIT_LOG.md](AUDIT_LOG.md#invari
 - **Shared cloud files informational-only.** Any file the provider reports as owned by someone else is never proposed for deletion.
 - **Cloud discards go to cloud trash; undo restores via API.** No code path hard-deletes a cloud file. Undo dispatches per-entry by `source_id` and reverses the same API call.
 
+### Organize safety (v0.3)
+
+`dc organize` inherits the whole safety envelope from `dc apply` and adds a small set of rules specific to moving files into a proposed folder tree. Behaviour is documented in [docs/organize.md](organize.md).
+
+#### Dry-run default and `--commit` gate
+
+`dc organize apply <plan.json>` prints the planned moves and exits. You must pass `--commit` explicitly for any file to move. This is the same reversed default as `dc apply`: the safe path is what you get when you type nothing extra.
+
+#### Undo manifest is written before any move
+
+Every commit writes a manifest to `~/.local/share/duplicate_cleaner/runs/<timestamp>/manifest.json` before the first move. The manifest records the source path, the destination path, the pre-move hash, and — for cross-volume moves — the Trash-relative source path. The manifest uses the same tempfile + `fsync` + `os.replace` + parent-dir fsync pattern as `dc apply`. A crash mid-run leaves the manifest with every planned move intact; `dc organize undo` replays what the filesystem or Trash still holds.
+
+#### Cohesive units move atomically
+
+Music albums, book series, git projects, and photo or video event clusters move as one unit. Every plan entry inside a cohesive unit carries a `cohesion_group` field in the JSON. `dc organize apply`:
+
+1. Groups plan entries by `cohesion_group`.
+2. Verifies every member of a group targets the same destination folder.
+3. Aborts the run before the first move if any member differs and `--split-cohesive-units` was not passed. The error message lists the violating entries.
+
+This is the same shape of guard the mover uses for whole-archive proposals: the invariant lives in one place and cannot be silently sidestepped. Splitting a cohesive unit is possible — you just have to say so with `--split-cohesive-units`.
+
+#### Directory permissions default to 0o755
+
+`os.makedirs(dest, mode=0o755, exist_ok=True)` matches the macOS umask and keeps shared-drive workflows unbroken. A folder under `/Volumes/Family/Photos/` needs to be readable by other admin-group members; a 0o700 default would break those workflows silently. The `organize_dir_mode` config knob is available for users whose target tree lives entirely under their home and who want owner-only access.
+
+#### Path collision on move
+
+If `<dest>/<filename>` already exists at move time:
+
+1. If the existing file hashes identical to the source (BLAKE3, streamed), the tool skips the move, logs `already-present-at-dest` in the manifest, and does not delete the source. This is `organize`, not `dedup` — dedup happens separately upstream in the workflow.
+2. Otherwise the tool appends `_<hash8>` to the stem, where `<hash8>` is the first eight hex characters of the source's BLAKE3 hash. `receipt.pdf` becomes `receipt_a3f1b2c9.pdf`. The collision is logged under `collisions[]` in the manifest.
+
+The rename policy for user-supplied filenames is a separate concern and is user-locked to `preserve` by default. See below.
+
+#### PDF classification is a hint, not a guarantee
+
+The PDF classifier scores each first-page against a keyword lexicon and emits a `pdf.class.<label>` signal above threshold `0.6`. That signal feeds one classifier rule out of many; a file whose classifier score is low but whose filename or Info dict strongly suggests a class still gets classified. And a file whose classifier is uncertain drops below the confidence threshold and goes to Unsorted rather than to a specific domain. Every signal that fired is written to the plan JSON so you can audit exactly what the classifier saw.
+
+#### Files never moved by organize
+
+The following files are outside the domain of `dc organize` and are never proposed for movement:
+
+- **Hardlinked-informational files.** Any member of a hardlink family flagged as informational by the walker is not proposed for a move, for the same reason it is not proposed for deletion — the on-disk extents are already shared, and moving one link changes where the shared inode is reachable from.
+- **Archive members.** `dc organize` operates on filesystem objects. An entry inside a `.zip` or tarball is never proposed for movement — only whole archives are.
+- **Singletons.** A file with only one copy across the discovered set is not a discard candidate, and if it is not classified into a domain above the confidence threshold it stays in Unsorted rather than getting moved to a maybe-wrong domain.
+- **Cohesive-unit peers when one peer opts out.** If any member of a cohesion group is marked "leave in place" or targets a different destination, apply refuses to move the group without `--split-cohesive-units`.
+
+#### Rename policy is user-locked
+
+The default `rename_policy` is `preserve`. In this mode the tool never mutates filename bytes. The `date_prefix` and `date_event_prefix` modes exist for users who explicitly want the classification's date to be visible in the filename; they only ever run when the user has opted in via the config. Filename bytes are user territory.
+
 ### Symlinks not followed by default
 
 Symbolic links are recorded but not traversed. Their targets are not scanned. This is configurable via `follow_symlinks` in the config file.

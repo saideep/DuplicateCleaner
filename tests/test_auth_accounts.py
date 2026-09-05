@@ -73,3 +73,16 @@ def test_file_is_written_with_0o600(tmp_path: Path) -> None:
 
 def test_load_returns_empty_when_absent(tmp_path: Path) -> None:
     assert _registry(tmp_path).load() == []
+
+
+def test_load_rejects_loose_mode(tmp_path: Path) -> None:
+    """B7: an accounts.toml with mode 0o644 must be rejected on load."""
+    import os
+
+    from duplicate_cleaner.auth.accounts import AccountsRegistryPermissionError
+
+    r = _registry(tmp_path)
+    r.add(AccountEntry("gdrive:x", "gdrive", "x", "x@x", "ts"))
+    os.chmod(tmp_path / "accounts.toml", 0o644)
+    with pytest.raises(AccountsRegistryPermissionError):
+        r.load()
