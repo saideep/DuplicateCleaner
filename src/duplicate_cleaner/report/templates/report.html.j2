@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DuplicateCleaner Report — {{ report.generated_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         margin: 2em; color: #222; }
+  header { border-bottom: 2px solid #444; padding-bottom: 1em; margin-bottom: 2em; }
+  header h1 { margin: 0 0 0.3em; }
+  .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1em; margin: 1em 0; }
+  .summary .card { background: #f7f7f9; padding: 1em; border-radius: 6px; }
+  .summary .card .n { font-size: 1.8em; font-weight: 600; }
+  .group { border: 1px solid #ddd; border-radius: 6px; margin-bottom: 1.5em; padding: 1em; }
+  .group h3 { margin: 0 0 0.5em 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              font-size: 1em; color: #444; }
+  .group .meta { color: #666; font-size: 0.9em; margin-bottom: 0.75em; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 0.4em 0.6em; text-align: left; border-bottom: 1px solid #eee;
+           vertical-align: top; }
+  th { background: #fafafa; font-weight: 600; font-size: 0.8em;
+       text-transform: uppercase; color: #666; letter-spacing: 0.03em; }
+  tr.keeper { background: #eaffea; }
+  tr.info-only { background: #fff8e1; }
+  td.discard { color: #a33; }
+  td.discard .path-text { text-decoration: line-through; }
+  .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 0.85em; word-break: break-all; }
+  .score { font-weight: 600; text-align: right;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .signals { font-size: 0.8em; color: #555; }
+  .signals ul { margin: 0; padding-left: 1.1em; }
+  .signals li { margin: 0.1em 0; }
+  .badge { display: inline-block; padding: 0.1em 0.55em; border-radius: 3px;
+           font-size: 0.72em; font-weight: 700; letter-spacing: 0.04em; color: white; }
+  .badge.keep    { background: #2e7d32; }
+  .badge.discard { background: #c62828; }
+  .badge.info    { background: #ef6c00; }
+  footer { margin-top: 3em; font-size: 0.85em; color: #888; }
+  code { background: #f2f2f4; padding: 0.05em 0.35em; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>DuplicateCleaner Report</h1>
+  <p>Generated {{ report.generated_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC.
+     Scanned {{ report.total_files_scanned }} files under
+     {% for r in report.roots %}<code>{{ r }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</p>
+</header>
+
+<section class="summary">
+  <div class="card">
+    <div class="n">{{ report.total_groups }}</div>
+    <div>duplicate group{% if report.total_groups != 1 %}s{% endif %}</div>
+  </div>
+  <div class="card">
+    <div class="n">{{ report.total_reclaim_bytes | human_bytes }}</div>
+    <div>reclaimable if all discards moved to Trash</div>
+  </div>
+  <div class="card">
+    <div class="n">{{ report.total_files_scanned }}</div>
+    <div>files scanned</div>
+  </div>
+</section>
+
+<h2>Exact duplicates</h2>
+
+{% for g in report.groups %}
+<div class="group">
+  <h3>Group {{ g.id }} — {{ g.hash[:16] }}…</h3>
+  <div class="meta">
+    {{ g.size | human_bytes }} per file · {{ g.members | length }} members
+    · reclaim {{ g.reclaim_bytes | human_bytes }}
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:64px;"></th>
+        <th>Path</th>
+        <th style="width:70px;">Score</th>
+        <th>Signals</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for m in g.members %}
+      <tr class="{% if m.is_informational %}info-only{% elif m.is_proposed_keeper %}keeper{% endif %}">
+        <td>
+          {% if m.is_informational %}
+            <span class="badge info">INFO</span>
+          {% elif m.is_proposed_keeper %}
+            <span class="badge keep">KEEP</span>
+          {% else %}
+            <span class="badge discard">TRASH</span>
+          {% endif %}
+        </td>
+        <td class="path {% if not m.is_proposed_keeper and not m.is_informational %}discard{% endif %}">
+          <span class="path-text">{{ m.path }}</span>
+        </td>
+        <td class="score">{{ m.score | signed }}</td>
+        <td class="signals">
+          <ul>
+            {% for s in m.signals %}
+              <li>{{ s.name }}: {{ s.contribution | signed }}</li>
+            {% endfor %}
+            {% if m.is_informational %}
+              <li><em>Hard-linked or APFS clone — informational only, never proposed for deletion.</em></li>
+            {% endif %}
+          </ul>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p>No duplicates found. Nothing to do.</p>
+{% endfor %}
+
+<footer>
+  DuplicateCleaner {{ report.version }} · edit <code>report.json</code>
+  to change any proposed keeper, then <code>dc apply report.json --commit</code>.
+</footer>
+
+</body>
+</html>

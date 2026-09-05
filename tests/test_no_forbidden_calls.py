@@ -1,0 +1,65 @@
+"""Enforces the safety guarantee: no destructive filesystem calls in library code."""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+# Patterns that would delete without going through the Trash.
+_FORBIDDEN: list[re.Pattern[str]] = [
+    re.compile(r"\bos\.remove\("),
+    re.compile(r"\bos\.unlink\("),
+    re.compile(r"\bos\.rmdir\("),
+    re.compile(r"\.unlink\("),
+    re.compile(r"\.rmdir\("),
+    re.compile(r"\bshutil\.rmtree\("),
+    re.compile(r"\bos\.system\("),
+    re.compile(r"\bos\.execvp\("),
+    re.compile(r"\bos\.execve\("),
+    re.compile(r"\bos\.execv\("),
+    # Explicit re-import forms that would bypass a naive grep for `os.remove`.
+    re.compile(r"\bfrom\s+os\s+import\s+remove\b"),
+    re.compile(r"\bfrom\s+os\s+import\s+unlink\b"),
+    re.compile(r"\bfrom\s+os\s+import\s+rmdir\b"),
+    re.compile(r"\bfrom\s+shutil\s+import\s+rmtree\b"),
+    re.compile(r"\bimport\s+os\s+as\s+"),
+    re.compile(r"\bimport\s+shutil\s+as\s+"),
+]
+
+# ``shutil.move`` is the legitimate restore primitive in ``apply/undo.py``.
+# Anywhere else, treat it as forbidden — a general ``.move()`` call is easy
+# to reach for and a copy-then-delete is not what we want.
+_SHUTIL_MOVE_PAT = re.compile(r"\bshutil\.move\(")
+_SHUTIL_MOVE_ALLOWED_FILES: frozenset[str] = frozenset({"undo.py"})
+
+# subprocess.run + a bare 'rm' string literal in the same file is a red
+# flag — shelling out to /bin/rm would bypass Trash entirely. Applied per
+# file (not per line) so the check is hard to weaken by splitting across
+# variables.
+_SUBPROCESS_PAT = re.compile(r"\bsubprocess\.\w+\(")
+_RM_LITERAL_PAT = re.compile(r"""(?:["']rm["']|["']rm\s|/rm["'])""")
+
+
+def test_source_has_no_forbidden_destructive_calls() -> None:
+    src = Path(__file__).parent.parent / "src" / "duplicate_cleaner"
+    offenders: list[str] = []
+    for py in src.rglob("*.py"):
+        text = py.read_text()
+        for pat in _FORBIDDEN:
+            for m in pat.finditer(text):
+                offenders.append(f"{py.name}: {m.group(0)}")
+
+        # shutil.move: forbidden everywhere except the whitelisted undo path.
+        if py.name not in _SHUTIL_MOVE_ALLOWED_FILES:
+            for m in _SHUTIL_MOVE_PAT.finditer(text):
+                offenders.append(f"{py.name}: {m.group(0)}")
+
+        # subprocess + 'rm' string literal in the same file.
+        if _SUBPROCESS_PAT.search(text) and _RM_LITERAL_PAT.search(text):
+            offenders.append(
+                f"{py.name}: subprocess call with a bare 'rm' string literal"
+            )
+
+    assert not offenders, (
+        "Forbidden destructive calls in library code — use send2trash instead: "
+        + ", ".join(offenders)
+    )
