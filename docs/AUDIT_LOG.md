@@ -23,6 +23,9 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **`--discover` mode**: `proposed_keeper=None` on every group; `reclaim_bytes=0`; `apply_report` raises `ApplyError` on discover-mode input.
 - **Singleton files never a discard candidate**: enforced in scorer AND mover.
 - **Shared cloud files informational-only**: (v0.2) — never proposed for deletion.
+- **Cloud discards go to cloud trash; undo restores via API** (v0.2): tool cannot hard-delete cloud files. OAuth scopes are trash-only (`drive.file`, `Files.ReadWrite`). Undo dispatches by `source_id` to the correct `Source.restore_from_trash`.
+- **Cloud drift check via etag** (v0.2): immediately before `move_to_trash` on any cloud member, the source re-reads the file's current etag and verifies it matches the scan-time etag. Etag mismatch aborts the run (same semantics as size+mtime drift for local).
+- **Manifest atomic-write applies to cloud entries too**: the tmpfile + fsync + os.replace + parent-dir-fsync pattern is unchanged; cloud manifest rows record `source_id`, `cloud_file_id`, `cloud_trash_id`, and pre-move `etag`.
 
 ## Rejected alternatives (do not reopen without new info)
 
@@ -72,6 +75,20 @@ Deferred to v0.1.2: bundle Unicode NFC/NFD normalization, singleton hash marker 
 Category counts: 1 safety (PLAUSIBLE), 2 simplification (CONFIRMED). Zero DATA-LOSS, zero invariant-weakening.
 
 **Fourth audit (Code Review pass 4, fork+scaffold, 2026-09-05)** — verified H1–H9 all correctly fixed under the new AUDIT_SCAFFOLD contract. No DATA-LOSS. No invariants weakened. 5 findings, all deferrable: 2 `simplification` (H7's `singleton-by-partial:...` marker leaks path — same class as v0.1.2-deferred `singleton-by-size` marker; undo.py's `_src_is_in_trash` duplicates `paths.is_inside_any_trash`), 2 `test-coverage` (no test proves nested-skip attributes to outer-archive path in `skipped_outer_archives`; no end-to-end test that H7 partial-unique singleton reaches `Report.singletons`), 1 `simplification` (H4 nested-archive double-hashes bytes; single-pass optimisation possible). **Verdict: Ready with post-release notes.** v0.1.1 clears ship.
+
+### v0.2 — cloud sources (sub-milestone 1: LocalFileSystemSource refactor)
+
+**Sub-milestone 1 Dev delivered** (2026-09-05): 10 new tests (158 total). Ruff clean; mypy `--strict` clean on new files. Zero-behavior-change refactor: `iter_files` still exported and used unchanged by 10+ tests. `FileRecord` gained 6 trailing defaulted fields (`source_id`, `foreign_hash`, `etag`, `cloud_file_id`, `owner`, `is_shared`) — no existing construction site edited. SQLite schema migrated to v2 with `schema_meta` version marker; `cloud_hash_cache` table created eagerly. `LocalFileSystemSource` wraps `iter_files` / `send2trash` / `apply.undo.local_restore`; `is_read_only_scan=True` default tripwire prevents accidental trash from scan paths.
+
+**Fifth audit (Code Review pass 5, fork+scaffold, 2026-09-05)** — verdict: **Ready with post-release notes.** Zero DATA-LOSS, zero invariants weakened. 6 findings, all deferrable:
+- safety/PLAUSIBLE: `LocalFileSystemSource.restore_from_trash` bypasses the H2/F12/H5 poisoned-manifest guards that `restore_from_manifest` enforces. Must fix BEFORE sub-phase 5 wires the mover to call `Source.restore_from_trash` directly.
+- safety/PLAUSIBLE: `test_no_forbidden_calls.py::_SHUTIL_MOVE_ALLOWED_FILES` matches on basename (`"undo.py"`) — any future `undo.py` under any directory would silently be allowed `shutil.move`. Switch to path-relative match (`"apply/undo.py"`).
+- simplification/CONFIRMED: `_default_local_trash_fn` duplicates `apply/mover.py::_default_trash_fn`. Extract shared helper before sub-phase 5.
+- test-coverage/CONFIRMED: no test for schema migration idempotency after partial-crash re-open.
+- simplification/PLAUSIBLE: `ForeignHash = str` alias adds no enforcement — either `NewType` it or drop it.
+- simplification/PLAUSIBLE: `LocalFileSystemSource.__init__` eight-param surface will churn as walker gains options; consider `WalkConfig` dataclass.
+
+Category counts: 2 safety (PLAUSIBLE), 3 simplification (1 CONFIRMED / 2 PLAUSIBLE), 1 test-coverage (CONFIRMED). Zero DATA-LOSS, zero invariant-weakening.
 
 ## Deferred to v0.1.2
 

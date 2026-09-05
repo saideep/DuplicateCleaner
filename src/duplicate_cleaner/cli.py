@@ -39,8 +39,9 @@ from duplicate_cleaner.report.schema import (
     ReportSignal,
     SingletonEntry,
 )
-from duplicate_cleaner.scan.walk import FileRecord, WalkStats, iter_files
+from duplicate_cleaner.scan.walk import FileRecord, WalkStats
 from duplicate_cleaner.score.rules import score_groups
+from duplicate_cleaner.sources import LocalFileSystemSource
 from duplicate_cleaner.store import CACHE_DIR, Store
 from duplicate_cleaner.sys.apfs import get_clone_id
 from duplicate_cleaner.sys.monitor import (
@@ -309,16 +310,18 @@ def scan(
     ) as progress:
         walk_task = progress.add_task("Walking & hashing…", total=None)
 
+        local_source = LocalFileSystemSource(
+            roots=list(roots),
+            follow_symlinks=cfg.follow_symlinks,
+            exclude_globs=cfg.exclude_globs,
+            min_size_bytes=cfg.min_size_bytes,
+            bundle_extensions=cfg.bundle_extensions,
+            stats=walk_stats,
+        )
+
         def _walk_iter() -> Iterator[FileRecord]:
             nonlocal file_count
-            for rec in iter_files(
-                roots,
-                follow_symlinks=cfg.follow_symlinks,
-                exclude_globs=cfg.exclude_globs,
-                min_size_bytes=cfg.min_size_bytes,
-                bundle_extensions=cfg.bundle_extensions,
-                stats=walk_stats,
-            ):
+            for rec in local_source.list_files():
                 file_count += 1
                 if file_count % 500 == 0:
                     snap = sample_resources(

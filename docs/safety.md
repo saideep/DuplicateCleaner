@@ -87,6 +87,80 @@ Overrides:
 
 Rationale: a duplicate cleaner is a background hygiene task, not a foreground compute job. Defaults keep the machine responsive; overrides are available for the small number of users who want to hand the whole machine to a scan.
 
+### Cloud safety (v0.2)
+
+Cloud sources — Google Drive and OneDrive Personal — are held to the same safety invariants as local scans, with a small set of additional rules specific to remote APIs.
+
+#### Cloud discards go to cloud trash, never hard-delete
+
+`dc apply --commit` moves cloud entries to the provider's own trash / recycle bin:
+
+- Google Drive: `files.update(fileId=..., body={"trashed": True})`. The file lands in the Drive trash where you can restore it from the web UI at [drive.google.com/drive/trash](https://drive.google.com/drive/trash) for 30 days by default (Google's own retention).
+- OneDrive Personal: `DELETE /me/drive/items/{id}` which Microsoft documents as "moves to the recycle bin." You can restore it from the OneDrive web UI at [onedrive.live.com](https://onedrive.live.com/) recycle bin.
+
+DuplicateCleaner never issues a hard-delete API call. There is no code path that permanently deletes a cloud file. The OAuth scopes it requests are read-and-trash only:
+
+- Google: `https://www.googleapis.com/auth/drive.file` — grants access to files the tool created or the user explicitly picked. Includes trash and untrash. Does not include the broader `drive` scope required for permanent deletion.
+- Microsoft Graph: `Files.ReadWrite` + `offline_access` — grants read, write, and move-to-recycle-bin. Not `Sites.FullControl.All` or the delegated variants needed for hard-delete.
+
+The scopes are chosen so hard-delete is not physically possible from the tool. This is a load-bearing invariant, verified at CI-time and repeated in the audit log.
+
+#### Undo restores via API
+
+`dc undo` dispatches per-entry by `source_id`. For a cloud entry it calls the source's `restore_from_trash`:
+
+- Google Drive: `files.update(fileId=..., body={"trashed": False})`. The file returns to its original path in Drive.
+- OneDrive Personal: `POST /me/drive/items/{id}/restore`. If Personal does not support that endpoint on your account, DuplicateCleaner falls back to enumerating the recycle bin and restoring from there. If neither path works, `dc undo` prints a clear message pointing you at the OneDrive web UI to restore manually. The failure is recorded per-entry; other entries still restore.
+
+The undo manifest records the cloud file ID and the source ID for every entry, so a re-run after a crash still knows which API call to make.
+
+#### Shared cloud files are informational-only
+
+Any file the provider reports as owned by someone else (Google `owners` field does not include the account's own address, or Microsoft `createdBy.user.id` differs from `/me`) is treated as **informational only**. The scanner never proposes it for deletion, regardless of scoring signals. This is enforced upstream of the scorer — no weight can override it.
+
+Rationale: touching a shared file affects other people. A dedupe tool that trashes another user's file is a failure mode we categorically rule out. Even if the file is byte-identical to a local copy you own, the shared copy remains and you delete your local copy (or nothing).
+
+Behaviour:
+
+- In the HTML report, shared cloud files appear in the informational band alongside hardlink and APFS clone entries.
+- If the entire group consists of shared cloud files (no non-informational member), no keeper is proposed and reclaim is 0.
+- The `--skip-shared` flag on `dc scan` skips shared files entirely — they do not appear in the report at all.
+
+#### Local wins any cross-source tie
+
+For a group that contains both a local member (under an `active_home`) and a cloud member, the local member is always the proposed keeper. The `cloud_when_local_exists` scoring signal contributes -3 to every cloud member in such a group; the `+4` active-home bonus on the local member ensures the local wins.
+
+This means the typical outcome of enabling a cloud source is:
+
+- Cloud files that already have a local copy get proposed for cloud-trash.
+- Cloud files that are unique to the cloud remain unchanged (singletons across sources are never a discard candidate).
+- Shared cloud files never move regardless of local peers.
+
+#### Cloud tokens are as sensitive as SSH keys
+
+OAuth refresh tokens grant ongoing access to your Drive or OneDrive. Protect the token files at `~/.config/duplicate_cleaner/tokens/<id>.json`:
+
+- The tokens directory is created with mode `0700` (owner-only). Each token file is written with mode `0600`.
+- DuplicateCleaner re-checks permissions on every read and refuses to use a token that is group- or world-readable, printing a `chmod 600` fix.
+- Do not commit token files. Do not paste them into logs, bug reports, or support threads.
+- If a token leaks, revoke at the provider's connected-apps page ([Google](https://myaccount.google.com/permissions), [Microsoft](https://account.live.com/consent/Manage)) and run `dc auth add` again.
+
+#### Data-safety invariants that apply to cloud entries
+
+The same invariants that apply to local moves apply to cloud entries:
+
+- **Manifest is written before the first move.** The mover writes the manifest with tempfile + fsync + `os.replace` + parent-dir fsync before issuing any `move_to_trash` API call. A crash mid-run leaves the manifest with every planned move intact; `dc undo` replays whatever the cloud trash still holds.
+- **Per-entry re-verify.** Before trashing a cloud file, the mover fetches current metadata and compares etag against what the report recorded. If the etag has changed (someone else edited the file since the scan), the run aborts on drift — it does not skip-and-continue.
+- **Singletons never discarded.** A file that appears exactly once across every configured source is never a discard candidate. Enforced in the scorer and re-checked in the mover.
+- **Per-entry failures do not abort the run.** A single `NotFoundError` (someone else emptied the trash), `RateLimitError` (429 with no `Retry-After` left), or `AuthExpiredError` (token could not refresh) is recorded per-entry and the mover continues with the rest.
+
+#### Summary invariants (v0.2)
+
+Two additions to the safety model, tracked in [AUDIT_LOG.md](AUDIT_LOG.md#invariants-do-not-weaken):
+
+- **Shared cloud files informational-only.** Any file the provider reports as owned by someone else is never proposed for deletion.
+- **Cloud discards go to cloud trash; undo restores via API.** No code path hard-deletes a cloud file. Undo dispatches per-entry by `source_id` and reverses the same API call.
+
 ### Symlinks not followed by default
 
 Symbolic links are recorded but not traversed. Their targets are not scanned. This is configurable via `follow_symlinks` in the config file.

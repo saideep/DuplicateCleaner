@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file. Format: Kee
 
 ## [Unreleased]
 
+### In progress (v0.2 — cloud sources)
+
+- **Sub-phase 1 — source abstraction refactor.** Introduces `src/duplicate_cleaner/sources/` with the `Source` protocol, shared dataclasses, and exception hierarchy in `sources/base.py`. `LocalFileSystemSource` in `sources/local.py` wraps the existing walker and mover code with zero behaviour change. `FileRecord` gains six optional cloud-related fields (all defaulted so existing constructions work unchanged). Mover and undo dispatch by `source_id`; local-only reports remain byte-identical to v0.1.1. Exit gate: all existing tests pass unchanged; no new tests required. **In progress.**
+- Sub-phase 2 — `GoogleDriveSource` (read-only) — pending.
+- Sub-phase 3 — Google Drive trash + restore — pending.
+- Sub-phase 4 — `OneDriveSource` (read + trash) — pending.
+- Sub-phase 5 — cross-source scoring, report, apply integration — pending.
+
+Design contract: [docs/design/v0.2-cloud-sources.md](docs/design/v0.2-cloud-sources.md). User-facing docs: [docs/cloud-oauth-setup.md](docs/cloud-oauth-setup.md), [docs/cli.md](docs/cli.md).
+
 ### Fixed (v0.1.1 ship blockers)
 
 - **DATA-LOSS**: whole-archive delete no longer proposes archives with any encrypted, corrupt, or too-large-to-recurse members. Skips are now indexed by outer archive path and any hit vetoes the proposal (H1).

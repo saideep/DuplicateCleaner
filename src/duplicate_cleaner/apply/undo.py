@@ -35,6 +35,19 @@ class UndoError(RuntimeError):
 TrashResolver = Callable[[Path], Path]
 
 
+def local_restore(src: Path, dst: Path) -> None:
+    """Move ``src`` back to ``dst`` — keeps ``shutil.move`` centralised here.
+
+    ``LocalFileSystemSource.restore_from_trash`` calls this so the
+    forbidden-calls whitelist can continue to name exactly one file
+    (``apply/undo.py``) as the legitimate holder of ``shutil.move``.
+    The caller is responsible for validating that ``src`` lives inside a
+    known Trash directory and that ``dst`` is not under an excluded root.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+
+
 def _hash_file(path: Path) -> str:
     """BLAKE3 hex digest of the file — used to disambiguate trash candidates."""
     h = blake3.blake3()

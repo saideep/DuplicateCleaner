@@ -74,7 +74,52 @@ CREATE TABLE IF NOT EXISTS decisions (
     user_overrode INTEGER NOT NULL DEFAULT 0,
     ts REAL NOT NULL
 );
+
+-- v0.2 additions.  ``schema_meta`` records the on-disk schema version so
+-- ``_migrate_to_v2`` (below) is idempotent.  ``cloud_hash_cache`` will be
+-- populated by ``sources/gdrive.py`` and ``sources/onedrive.py`` in later
+-- sub-phases; the table is created eagerly so the migration is a single
+-- one-shot event.
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cloud_hash_cache (
+    source_id     TEXT NOT NULL,
+    cloud_file_id TEXT NOT NULL,
+    etag          TEXT NOT NULL,
+    blake3_hash   TEXT NOT NULL,
+    computed_ts   REAL NOT NULL,
+    size          INTEGER NOT NULL,
+    PRIMARY KEY (source_id, cloud_file_id, etag)
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_hash_cache_hash
+    ON cloud_hash_cache(blake3_hash);
 """
+
+# v0.2 schema version — bumped whenever ``files`` picks up new columns or
+# a new table is added that the migration must guarantee.
+_SCHEMA_VERSION = 2
+
+# ALTER statements applied to the v0.1 ``files`` table on first v0.2 open.
+# Each is idempotent (ADD COLUMN of an already-present column raises a
+# specific OperationalError which the migration catches).
+_V2_FILES_ALTERS: tuple[str, ...] = (
+    "ALTER TABLE files ADD COLUMN source_id TEXT NOT NULL DEFAULT 'local'",
+    "ALTER TABLE files ADD COLUMN foreign_hash TEXT",
+    "ALTER TABLE files ADD COLUMN etag TEXT",
+    "ALTER TABLE files ADD COLUMN cloud_file_id TEXT",
+    "ALTER TABLE files ADD COLUMN owner TEXT",
+    "ALTER TABLE files ADD COLUMN is_shared INTEGER NOT NULL DEFAULT 0",
+)
+
+_V2_FILES_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_files_source_hash "
+    "ON files(source_id, full_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_files_source_foreign "
+    "ON files(source_id, foreign_hash)",
+)
 
 # Tolerate float rounding on filesystem mtimes: fs precision may differ from
 # what we read back through SQLite REAL.
@@ -98,6 +143,8 @@ class Store:
         self._migrate_scan_stage()
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # v0.2 — extend the v0.1 ``files`` table with cloud columns.
+        self._migrate_to_v2()
 
     def _migrate_scan_stage(self) -> None:
         """Drop legacy ``scan_stage`` schema (no ``scan_id`` column)."""
@@ -113,6 +160,36 @@ class Store:
         if cols and "scan_id" not in cols:
             self._conn.execute("DROP TABLE IF EXISTS scan_stage")
             self._conn.commit()
+
+    def _migrate_to_v2(self) -> None:
+        """Add cloud-source columns to ``files``; idempotent via schema_meta.
+
+        Reads ``schema_meta.version`` (missing = "1"); if < 2 applies the
+        ALTER TABLE statements and marks the DB as v2.  Each ADD COLUMN is
+        wrapped so a partial prior run (crash between ALTERs) reconverges on
+        re-open — SQLite raises a specific ``OperationalError`` for
+        duplicate columns, which we swallow and continue.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'version'"
+        ).fetchone()
+        version = int(row["value"]) if row is not None else 1
+        if version >= _SCHEMA_VERSION:
+            return
+        for stmt in _V2_FILES_ALTERS:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+        for stmt in _V2_FILES_INDEXES:
+            self._conn.execute(stmt)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES "
+            "('version', ?)",
+            (str(_SCHEMA_VERSION),),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -407,6 +484,6 @@ class Store:
         """Truncate all cache tables."""
         self._conn.executescript(
             "DELETE FROM files; DELETE FROM groups; DELETE FROM group_members; "
-            "DELETE FROM scan_stage;"
+            "DELETE FROM scan_stage; DELETE FROM cloud_hash_cache;"
         )
         self._conn.commit()

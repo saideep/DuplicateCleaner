@@ -25,12 +25,22 @@ Shipping in v0.1.1 (current release):
 - Singleton "Unique files" section in every report — files with no duplicates are enumerated so a scan doubles as a directory census.
 - `--discover` mode. `dc scan --discover` produces an enumeration-only report and proposes zero deletions. Useful for surveying an unfamiliar drive before running a real scan.
 
+In development for v0.2:
+
+- Cloud sources. Google Drive and OneDrive Personal accounts are scanned alongside local trees. Duplicates that span local and cloud propose the cloud copy for deletion (local wins any cross-source tie).
+- OAuth 2.0 authentication with bundled clients. `dc auth add gdrive` and `dc auth add onedrive` handle the browser-based login flow end to end with zero setup. `--client-secret path.json` lets you bring your own OAuth client.
+- Multi-account support with user-chosen labels. `gdrive:personal`, `gdrive:family`, `gdrive:work`, `onedrive:main` — each account is a separate source ID you can include in a scan.
+- Cloud deletions go to the provider's trash (Google Drive trash, OneDrive recycle bin), never hard-delete. OAuth scopes are trash-only — the tool literally cannot hard-delete a cloud file.
+- Shared cloud files are informational-only. If the provider reports the file was authored by someone else, the scanner never proposes it for deletion.
+- Undo works across sources. A single manifest can carry mixed local + cloud entries; `dc undo` restores each entry via the right API.
+- New `--sources` flag on `dc scan` selects which backends to enumerate. Existing local-only invocations behave identically.
+
 Later milestones:
 
-- Cloud sources — Google Drive, Dropbox, OneDrive listings compared against local trees *(coming in v0.2)*.
 - Perceptual image near-duplicate detection *(coming in v0.3)*.
 - Project directory tree aggregation — collapse two copies of the same repo to one tree-diff line *(coming in v0.4)*.
 - Semantic PDF and text matching via normalized-text hash plus fuzzy fallback *(coming in v0.5)*.
+- Google Photos and iCloud Photos sources *(coming in v0.6)*.
 - Audio and video near-duplicate detection using Chromaprint fingerprints and keyframe pHash *(coming in v0.6)*.
 - Adaptive weights that learn from your overrides and gate auto-apply behind a confidence threshold *(coming in v0.7)*.
 
@@ -40,6 +50,7 @@ Later milestones:
 - Mac mini with Apple Silicon (M1, M2, or M4 all supported; M4 is the reference platform).
 - Python 3.12.x (Apple Silicon native).
 - Homebrew.
+- Internet connectivity when scanning cloud sources (v0.2). A Google account for `dc auth add gdrive` and/or a personal Microsoft account for `dc auth add onedrive`. Local-only scans require no network.
 
 ### System behavior
 
@@ -91,13 +102,22 @@ Full detail in [docs/safety.md](docs/safety.md).
 |---|---|---|
 | `dc init` | Write the default config to `~/.config/duplicate_cleaner/config.toml`. | `dc init` |
 | `dc scan <dir>...` | Scan one or more directories. Writes `report.html` + `report.json`. Includes a "Unique files" section for singletons. Recurses into archives; treats macOS bundles as atomic. | `dc scan ~/Documents --report ~/dc-report` |
+| `dc scan --sources ...` | Scan across local + cloud sources. Local + at least one cloud account. (v0.2) | `dc scan ~/Documents --sources local,gdrive:personal --report ~/dc-report` |
 | `dc scan --discover <dir>...` | Enumeration-only scan. No deletions proposed — the report is a directory census. | `dc scan --discover /Volumes/OldDrive --report ~/dc-survey` |
-| `dc apply <report.json>` | Move proposed discards to Trash. Dry-run by default. | `dc apply ~/dc-report/report.json --commit` |
-| `dc undo <manifest.json>` | Restore every file moved in a prior run. | `dc undo ~/.local/share/duplicate_cleaner/runs/2026-09-05T10-00/manifest.json` |
+| `dc apply <report.json>` | Move proposed discards to Trash. Dry-run by default. Cloud entries go to their provider trash / recycle bin. | `dc apply ~/dc-report/report.json --commit` |
+| `dc undo <manifest.json>` | Restore every file moved in a prior run. Cross-source aware. | `dc undo ~/.local/share/duplicate_cleaner/runs/2026-09-05T10-00/manifest.json` |
+| `dc auth add gdrive` | Connect a Google Drive account via OAuth. (v0.2) | `dc auth add gdrive --label family` |
+| `dc auth add onedrive` | Connect a OneDrive Personal account via OAuth. (v0.2) | `dc auth add onedrive --label main` |
+| `dc auth list` | List every configured account. (v0.2) | `dc auth list` |
+| `dc auth test <id>` | Verify an account's token still works. (v0.2) | `dc auth test gdrive:personal` |
+| `dc auth remove <id>` | Remove an account and revoke its tokens. (v0.2) | `dc auth remove gdrive:family` |
+| `dc sources list` | List sources plus per-source file counts. (v0.2) | `dc sources list` |
 | `dc weights show` | Print current scoring weights. | `dc weights show` |
 | `dc weights reset` | Restore weights to the shipped defaults. | `dc weights reset` |
 | `dc cache stats` | Print cache size and hit rate. | `dc cache stats` |
-| `dc cache clear` | Delete the SQLite cache. | `dc cache clear` |
+| `dc cache clear` | Delete the SQLite cache (including the cloud hash cache). | `dc cache clear` |
+
+Full command reference in [docs/cli.md](docs/cli.md). Cloud OAuth setup in [docs/cloud-oauth-setup.md](docs/cloud-oauth-setup.md).
 
 ## Config file
 
@@ -133,11 +153,11 @@ MIT.
 
 ## Roadmap
 
-- [x] **v0.1 — Exact-only.** Walk, size bucket, BLAKE3 pipeline, SQLite cache, rule-based scorer, HTML report, `apply` to Trash, `undo`. Previous release.
-- [x] **v0.1.1 — Archives, bundles, monitoring, clones.** Archive recursion, macOS bundle handling, `psutil`-based system monitoring, APFS clone detection, singleton report, `--discover` mode. Current release.
-- [ ] **v0.2 — Cloud sources.** Google Drive, Dropbox, and OneDrive listings compared against local trees.
-- [ ] **v0.3 — Image near-duplicate.** Perceptual hash comparator plus thumbnails in the report.
-- [ ] **v0.4 — Project-tree aggregation.** Directory rollup for backup-folder collapse.
+- [x] **v0.1 — Exact-only.** Walk, size bucket, BLAKE3 pipeline, SQLite cache, rule-based scorer, HTML report, `apply` to Trash, `undo`. Shipped.
+- [x] **v0.1.1 — Archives, bundles, monitoring, clones.** Archive recursion, macOS bundle handling, `psutil`-based system monitoring, APFS clone detection, singleton report, `--discover` mode. Shipped.
+- [ ] **v0.2 — Cloud sources.** Google Drive and OneDrive Personal listings compared against local trees; OAuth 2.0 with bundled clients; multi-account support; trash-only cloud deletion with cross-source undo. **In progress.**
+- [ ] **v0.3 — Organizer.** Project-tree aggregation and directory rollup for backup-folder collapse.
+- [ ] **v0.4 — Image near-duplicate.** Perceptual hash comparator plus thumbnails in the report.
 - [ ] **v0.5 — PDF and text semantic.** Normalized-text hashing plus fuzzy fallback.
-- [ ] **v0.6 — Audio and video near-duplicate.** Chromaprint fingerprints and keyframe pHash.
+- [ ] **v0.6 — Google Photos, iCloud Photos, audio + video near-duplicate.** Chromaprint fingerprints and keyframe pHash.
 - [ ] **v0.7 — Adaptive weights.** Decisions log wired into weight updates plus `--auto-high-confidence`.

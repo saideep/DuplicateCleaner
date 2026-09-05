@@ -27,7 +27,9 @@ class FileRecord:
     their ``path`` is a virtual ``outer.zip::inner`` string, they have no
     real inode/dev, and the mover refuses to trash them individually.
     ``is_bundle`` marks the tree-hash of a macOS bundle rolled up to a
-    single record.
+    single record.  The trailing cloud fields (``source_id`` and below) are
+    populated only by cloud sources in v0.2 sub-phase 2+; local records
+    inherit the defaults and existing construction sites need no edits.
     """
 
     path: Path
@@ -39,6 +41,15 @@ class FileRecord:
     is_archive_member: bool = False
     is_bundle: bool = False
     precomputed_full_hash: str | None = None
+
+    # v0.2 additions — all default to local semantics so existing callers
+    # keep working with no positional changes.
+    source_id: str = "local"
+    foreign_hash: str | None = None
+    etag: str | None = None
+    cloud_file_id: str | None = None
+    owner: str | None = None
+    is_shared: bool = False
 
 
 @dataclass

@@ -6,6 +6,8 @@ DuplicateCleaner reads its runtime configuration from a single TOML file. Scorin
 
 - Runtime config: `~/.config/duplicate_cleaner/config.toml`
 - Scoring weights: `~/.config/duplicate_cleaner/weights.json`
+- Cloud accounts (v0.2): `~/.config/duplicate_cleaner/accounts.toml`
+- OAuth tokens (v0.2): `~/.config/duplicate_cleaner/tokens/<account_id>.json` (mode `0600`)
 - SQLite cache: `~/.cache/duplicate_cleaner/cache.db`
 - Undo manifests: `~/.local/share/duplicate_cleaner/runs/<timestamp>/manifest.json`
 
@@ -226,3 +228,101 @@ exclude_globs = [
 ```
 
 All globs match against the absolute path of the file being considered. If any pattern matches, the file is skipped.
+
+## Cloud accounts (v0.2)
+
+Cloud accounts are registered by `dc auth add` and stored in a separate file, `~/.config/duplicate_cleaner/accounts.toml`. You never edit this file by hand — the `dc auth` subcommands manage it — but the schema is documented here so you know what is on disk.
+
+### `accounts.toml` schema
+
+```toml
+schema_version = 1
+
+[[accounts]]
+id = "gdrive:personal"
+type = "gdrive"
+user_email = "me@gmail.com"
+added_at = 2026-09-05T00:00:00Z
+
+[[accounts]]
+id = "gdrive:family"
+type = "gdrive"
+user_email = "partner@gmail.com"
+added_at = 2026-09-05T00:00:00Z
+
+[[accounts]]
+id = "onedrive:main"
+type = "onedrive"
+user_email = "me@outlook.com"
+added_at = 2026-09-05T00:00:00Z
+```
+
+Fields:
+
+- `id` — the source ID used in `dc scan --sources local,<id>,...`. Format: `<type>:<label>`. `type` is one of `gdrive`, `onedrive`. `label` is the string you passed to `--label` on `dc auth add`; defaults to `personal`.
+- `type` — `gdrive` or `onedrive`. `gphotos` and `icloud` are reserved for v0.6.
+- `user_email` — pulled from the provider on first authorization. Informational only; matching is by account ID.
+- `added_at` — timestamp of the `dc auth add` call. Informational only.
+
+The tokens live in `~/.config/duplicate_cleaner/tokens/<id>.json` (mode `0600`, directory `0700`). See [cloud-oauth-setup.md](cloud-oauth-setup.md) for the full walk-through and the token file schema.
+
+Add and remove accounts with:
+
+```shell
+dc auth add gdrive --label family
+dc auth remove gdrive:family
+```
+
+## Cross-source preference (v0.2)
+
+When a duplicate group spans local and cloud sources — or two cloud sources — DuplicateCleaner needs an order-of-preference for who wins the "keeper" role.
+
+The default is unambiguous: **local wins any cross-source tie.** Any file under an `active_home` beats any cloud copy. This is a load-bearing invariant, not a tunable — a group that mixes local and cloud always has the local member as keeper and the cloud member(s) as discard proposals. See [safety.md](safety.md#cloud-safety) for the invariant statement.
+
+For the multi-cloud case (two Google accounts, or Google plus OneDrive, with no local peer) the config exposes a preference list:
+
+```toml
+[cross_source_preference]
+retained_cloud_order = [
+    "gdrive:personal",
+    "gdrive:family",
+    "onedrive:main",
+]
+```
+
+Semantics:
+
+- The list is consulted only when a group contains no local member and at least two cloud members.
+- The earliest-listed source that has a member in the group wins the keeper role.
+- Cloud sources not in the list are considered lower-priority than every listed source. Ordering among unlisted sources is stable but undefined; add them to the list if you care.
+- The list has no effect on any group that contains a local member. Local always wins that comparison.
+
+If the section is omitted, all cloud sources are considered peers and the scoring rules break the tie (path hints, mtime, filename patterns). Set the list explicitly if you want a deterministic outcome across scans.
+
+### Worked example
+
+`report.json` shows a group with two members:
+
+- `gdrive:personal://My Drive/photos/beach.jpg`
+- `onedrive:main://Pictures/beach.jpg`
+
+With the config above (`gdrive:personal` first), the Google Drive copy is proposed as keeper and the OneDrive copy is proposed for the recycle bin.
+
+Reverse the order and the OneDrive copy wins.
+
+If you add a local member `/Users/vaannada/Pictures/beach.jpg` under an active home, that member becomes the keeper regardless of `retained_cloud_order` — the local-wins rule takes precedence.
+
+## Tokens directory (v0.2)
+
+```
+~/.config/duplicate_cleaner/tokens/    (mode 0700)
+├── gdrive:personal.json               (mode 0600)
+├── gdrive:family.json                 (mode 0600)
+└── onedrive:main.json                 (mode 0600)
+```
+
+Each token file contains the access token, refresh token, expiry, scopes, and client ID for one account. The directory is created with mode `0700` (owner-only) and each file with mode `0600`. DuplicateCleaner re-checks permissions on every read and refuses to use a token file that is group- or world-readable.
+
+Do not commit these files. Do not paste them into bug reports or logs. Treat them like SSH private keys — a leaked refresh token grants ongoing access to your Drive or OneDrive until you revoke it at the provider's connected-apps page.
+
+Full details, revocation URLs, and the JSON schema are in [cloud-oauth-setup.md](cloud-oauth-setup.md#token-storage).
