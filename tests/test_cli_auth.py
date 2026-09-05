@@ -38,11 +38,21 @@ def test_auth_add_gdrive_refuses_when_bundled_client_id_is_placeholder(
     assert "bundled" in result.stdout.lower() or "client" in result.stdout.lower()
 
 
-def test_scan_refuses_non_local_sources_until_sub_phase_5(
+def test_scan_refuses_unregistered_cloud_sources(
     tmp_path: Path,
     with_active_home_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """B3: ``--sources gdrive:x`` must exit 2 with an explanatory message."""
+    """v0.2 sub-milestone 5e: cross-source scan is enabled — but the
+    source id must be registered in ``accounts.toml``.  An unknown id
+    exits 2 with an actionable message pointing at ``dc auth add``."""
+    from duplicate_cleaner.auth.accounts import AccountsRegistry
+
+    accounts_path = tmp_path / "accounts.toml"
+    monkeypatch.setattr(
+        "duplicate_cleaner.cli.AccountsRegistry",
+        lambda: AccountsRegistry(path=accounts_path),
+    )
     report_dir = tmp_path / "report"
     runner = CliRunner()
     result = runner.invoke(
@@ -57,7 +67,8 @@ def test_scan_refuses_non_local_sources_until_sub_phase_5(
         ],
     )
     assert result.exit_code == 2, result.stdout
-    assert "sub-phase 5" in result.stdout
+    assert "not registered" in result.stdout
+    assert "dc auth" in result.stdout
 
 
 def test_scan_accepts_bare_local_sources_flag(
@@ -130,11 +141,24 @@ def test_auth_add_rejects_unknown_type(
     )
 
 
-def test_scan_refuses_onedrive_source_until_sub_phase_5(
+def test_scan_refuses_unregistered_onedrive_source(
     tmp_path: Path,
     with_active_home_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """B3 mirror: ``--sources onedrive:main`` also blocked until sub-phase 5."""
+    """v0.2 sub-milestone 5e mirror: unregistered onedrive account is refused.
+
+    Same shape as the gdrive test above — the guard is symmetric across
+    providers and driven by the AccountsRegistry rather than a
+    per-provider allow-list.
+    """
+    from duplicate_cleaner.auth.accounts import AccountsRegistry
+
+    accounts_path = tmp_path / "accounts.toml"
+    monkeypatch.setattr(
+        "duplicate_cleaner.cli.AccountsRegistry",
+        lambda: AccountsRegistry(path=accounts_path),
+    )
     report_dir = tmp_path / "report"
     runner = CliRunner()
     result = runner.invoke(
@@ -149,7 +173,7 @@ def test_scan_refuses_onedrive_source_until_sub_phase_5(
         ],
     )
     assert result.exit_code == 2, result.stdout
-    assert "sub-phase 5" in result.stdout
+    assert "not registered" in result.stdout
 
 
 def test_auth_add_gdrive_refuses_existing_account_in_non_interactive_mode(

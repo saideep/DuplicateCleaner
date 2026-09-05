@@ -28,6 +28,7 @@ from duplicate_cleaner.auth.accounts import AccountEntry
 from duplicate_cleaner.sources.base import (
     SourceAuthError,
     SourceNotFoundError,
+    SourcePermissionError,
     TrashedLocation,
 )
 
@@ -273,6 +274,56 @@ def test_undo_cloud_source_not_found_logs_and_continues(tmp_path: Path) -> None:
     assert result["skipped_cloud"] == 1
     assert len(result["errors"]) == 1
     assert "gone" in result["errors"][0] or "recycle" in result["errors"][0].lower()
+
+
+def test_undo_cloud_source_permission_error_increments_skipped(
+    tmp_path: Path,
+) -> None:
+    """Audit pass 11: SourcePermissionError is a per-entry SKIP, not abort.
+
+    Symmetrises with SourceNotFoundError above.  A single ACL change on
+    one cloud file must not torpedo the rest of the manifest.
+    ``skipped_cloud`` counts BOTH kinds of "log-and-continue" outcomes.
+    """
+    manifest = _write_manifest(
+        tmp_path,
+        entries=[
+            _mk_cloud_entry(
+                cloud_file_id=_GDRIVE_REAL_ID,
+                cloud_trash_id=_GDRIVE_REAL_ID,
+                original_path="gdrive:personal://noacl.bin",
+            ),
+            _mk_cloud_entry(
+                cloud_file_id=_GDRIVE_REAL_ID_2,
+                cloud_trash_id=_GDRIVE_REAL_ID_2,
+                original_path="gdrive:personal://ok.bin",
+            ),
+        ],
+    )
+    call_index = {"n": 0}
+
+    def _restore(loc: TrashedLocation) -> None:
+        n = call_index["n"]
+        call_index["n"] = n + 1
+        if n == 0:
+            raise SourcePermissionError("caller lacks the role to restore")
+        return None
+
+    src = MagicMock()
+    src.id = "gdrive:personal"
+    src.restore_from_trash.side_effect = _restore
+    result = restore_from_manifest(
+        manifest,
+        allowed_trash_dirs=[tmp_path],
+        registry=_FakeRegistry(["gdrive:personal"]),  # type: ignore[arg-type]
+        sources={"gdrive:personal": src},
+    )
+    # One restored (entry 2), one skipped (entry 1).
+    assert result["restored_cloud"] == 1
+    assert result["skipped_cloud"] == 1
+    assert len(result["errors"]) == 1
+    err_msg = result["errors"][0].lower()
+    assert "permission" in err_msg or "acl" in err_msg or "denied" in err_msg
 
 
 def test_undo_cloud_source_auth_error_aborts(tmp_path: Path) -> None:

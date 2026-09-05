@@ -53,7 +53,15 @@ HOMEISH_DIR_NAMES: frozenset[str] = frozenset(
 
 @dataclass
 class ScoredMember:
-    """One member of an exact-duplicate group with its score breakdown."""
+    """One member of an exact-duplicate group with its score breakdown.
+
+    v0.2 sub-milestone 5e — carries the source-side fields the scorer
+    needs for cross-source signals.  ``source_id`` defaults to ``"local"``
+    so every v0.1.1 construction site keeps working; cloud sources stamp
+    their own id.  ``is_shared`` and ``is_singleton_across_sources`` are
+    monotone informational-only markers — once True, no scoring rule can
+    make the member a discard candidate.
+    """
 
     path: Path
     size: int
@@ -68,6 +76,11 @@ class ScoredMember:
     is_informational: bool = False
     is_archive_member: bool = False
     is_bundle: bool = False
+    # v0.2 sub-milestone 5e additions — all defaulted so v0.1.1 tests and
+    # construction sites keep passing untouched.
+    source_id: str = "local"
+    is_shared: bool = False
+    is_singleton_across_sources: bool = False
 
 
 @dataclass
@@ -167,6 +180,9 @@ def score_group(
             hash=h.full_hash,
             is_archive_member=h.is_archive_member,
             is_bundle=h.is_bundle,
+            source_id=h.source_id,
+            is_shared=h.is_shared,
+            is_singleton_across_sources=h.is_singleton_across_sources,
         )
         for h in group.members
     ]
@@ -176,6 +192,21 @@ def score_group(
     # actually reclaims space when every member is a duplicate elsewhere.
     for m in members:
         if m.is_archive_member:
+            m.is_informational = True
+
+    # v0.2 sub-milestone 5e — cross-source informational-only markers.
+    # ``is_shared`` (cloud shared-with-me files) and
+    # ``is_singleton_across_sources`` (files whose hash appears exactly
+    # once across every configured source) are monotone informational
+    # flags — once set, no other signal can un-set them.  Applied at the
+    # same layer as archive/hardlink/APFS marking so the scorer never
+    # proposes deleting either kind.  Enforced here for defense-in-depth
+    # even though upstream code paths (mover, hash pipeline) also honor
+    # the invariants.
+    for m in members:
+        if m.is_shared:
+            m.is_informational = True
+        if m.is_singleton_across_sources:
             m.is_informational = True
 
     # Hard-link detection: two-pass so every member of an inode family is
@@ -225,6 +256,12 @@ def score_group(
     largest_size = max(m.size for m in non_info)
     size_varies = any(m.size < largest_size for m in non_info)
     any_internal = any(not _is_external_drive(m.path) for m in non_info)
+    # v0.2 sub-milestone 5e: whether any non-informational member is
+    # local drives the ``cloud_when_local_exists`` penalty.  Filtering on
+    # ``non_info`` avoids the pathological case where a shared-informational
+    # local member would count as "the local peer" and stamp a -3 on every
+    # cloud sibling.
+    group_has_local = any(m.source_id == "local" for m in non_info)
 
     cache = git_clean_cache if git_clean_cache is not None else {}
     for m in non_info:
@@ -239,6 +276,7 @@ def score_group(
             size_varies=size_varies,
             any_internal=any_internal,
             git_clean_cache=cache,
+            group_has_local=group_has_local,
         )
 
     keeper = max(non_info, key=lambda m: (m.score, -len(m.path.parts), str(m.path)))
@@ -258,7 +296,40 @@ def _score_one(
     size_varies: bool,
     any_internal: bool,
     git_clean_cache: dict[Path, bool],
+    group_has_local: bool = False,
 ) -> None:
+    # v0.2 sub-milestone 5e: cross-source signals.  Applied FIRST so the
+    # cloud/local dispatch key is stamped even for members whose path-based
+    # signals (marker/copy/depth) are the same across sources.
+    if m.source_id != "local" and group_has_local:
+        w = weights.get("cloud_when_local_exists", -3.0)
+        m.signals.append(("cloud entry when local copy exists", w))
+        m.score += w
+
+    if m.source_id != "local":
+        order = config.retained_cloud_order
+        if order:
+            try:
+                idx = order.index(m.source_id)
+                # Prefer sources earlier in the list.  Weight is
+                # ``len(order) - idx - 1``: first source scores +N-1, last
+                # listed source scores 0, and unlisted sources are dropped
+                # below every listed source by a small negative penalty.
+                w = float(max(0, len(order) - idx - 1))
+                m.signals.append(
+                    (f"retained_cloud_order[{m.source_id}]", w)
+                )
+                m.score += w
+            except ValueError:
+                # Not in the list — deprioritise below every listed source.
+                # A tiny negative constant is enough to break the tie without
+                # swamping the path-based scorer signals.
+                w = -0.01
+                m.signals.append(
+                    ("retained_cloud_order[unlisted]", w)
+                )
+                m.score += w
+
     if _has_path_marker(m.path):
         w = weights["path_marker_backup"]
         m.signals.append(("path marker (backup/old/copy/archive)", w))

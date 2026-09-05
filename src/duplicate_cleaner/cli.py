@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -309,28 +309,27 @@ def scan(
     ] = 90.0,
 ) -> None:
     """Walk, hash, group, score, and write a report."""
-    # B3: refuse non-local source ids until sub-phase 5 wires cloud sources
-    # into the scan pipeline.  Accepting them silently produced reports
-    # missing entire sources — surface the gap loudly instead.  Sub-phase 4
-    # (OneDrive) registers accounts and exercises the source in tests but
-    # still routes end-users through the same "not until sub-phase 5"
-    # message so cross-source behaviour lands in one place.
+    # v0.2 sub-milestone 5e: cross-source scan is enabled.  The 5b refusal
+    # guard is gone; any registered cloud source id in ``--sources`` is
+    # constructed at scan time and its ``list_files()`` stream is chained
+    # into the local walk.  Same-algo cloud pairs (two Google accounts,
+    # two OneDrive accounts) group directly via ``foreign_hash``.  A full
+    # BLAKE3 reconcile across mixed algos (gdrive vs local, gdrive vs
+    # onedrive) is deferred to 5f — until then those buckets surface as
+    # separate per-source groups and the scorer's cross-source signals
+    # gate any cross-source discard proposal.
     requested_sources = [s.strip() for s in sources.split(",") if s.strip()]
+    registry_for_scan = AccountsRegistry()
+    known_ids = {"local"} | {e.id for e in registry_for_scan.load()}
     for s in requested_sources:
-        if s != "local":
+        if s not in known_ids:
             console.print(
-                f"[red]Refusing to scan[/red]: source {s!r} is not enabled. "
-                "Cross-source scan is not enabled until v0.2 sub-phase 5. "
-                "Currently only 'local' is supported."
+                f"[red]Refusing to scan[/red]: source {s!r} is not "
+                "registered.  Run `dc auth list` to see registered "
+                "accounts; add one with `dc auth add <provider>`."
             )
             raise typer.Exit(2)
-    if max_cloud_download_mb != 1000.0:
-        log = logging.getLogger(__name__)
-        log.warning(
-            "--max-cloud-download-mb accepted (value=%s) but has no effect "
-            "until v0.2 sub-phase 5 wires cloud sources into scan.",
-            max_cloud_download_mb,
-        )
+    cloud_source_ids = [s for s in requested_sources if s != "local"]
     cfg = load_config()
     if not cfg.active_homes:
         console.print(
@@ -405,6 +404,32 @@ def scan(
             stats=walk_stats,
         )
 
+        # v0.2 sub-milestone 5e: build cloud sources for every requested
+        # non-local id.  Read-only scan (``is_read_only_scan=True``) is
+        # correct here — the scanner never trashes; ``apply`` builds its
+        # own sources with the flag off.  The full reconcile-with-BLAKE3
+        # step is deferred to 5f, so cloud records with a ``foreign_hash``
+        # are surfaced with their algo-prefixed digest as their grouping
+        # key.  Same-algo cloud pairs group; cross-algo pairs surface as
+        # separate groups and the scorer's cross-source signals apply.
+        cloud_sources = _build_scan_sources(cloud_source_ids)
+
+        # Audit pass 12 finding #2: cross-algo scans (local BLAKE3 +
+        # gdrive MD5 or onedrive SHA-256) currently miss cross-source
+        # duplicates because ``hash/reconciliation.reconcile_bucket`` isn't
+        # wired into the scan pipeline yet — it lands in v0.2.1 alongside
+        # LocalFileSystemSource.restore_from_trash lock-in.  Warn loudly
+        # so users understand the current limitation and don't trust the
+        # reclaim total for cross-cloud groups.
+        if cloud_sources:
+            console.print(
+                "[yellow]Cross-algo hash reconciliation is deferred to "
+                "v0.2.1[/yellow] — local (BLAKE3) and cloud (MD5/SHA-256) "
+                "duplicates will surface as separate groups. Same-algo "
+                "cloud pairs (e.g. two Google Drive accounts) group "
+                "correctly. Full cross-algo dedup lands in v0.2.1."
+            )
+
         def _walk_iter() -> Iterator[FileRecord]:
             nonlocal file_count
             for rec in local_source.list_files():
@@ -444,6 +469,42 @@ def scan(
                         archive_skips,
                         skipped_outer_archives,
                     )
+            # Chain every cloud source's ``list_files()`` after the local
+            # walk.  Cloud records already carry ``foreign_hash`` +
+            # ``source_id`` + ``is_shared``; the ``foreign_hash`` is
+            # stamped as ``precomputed_full_hash`` so ``hash_records``
+            # yields the record verbatim without a partial/full-hash pass.
+            for cs in cloud_sources:
+                for rec in cs.list_files():
+                    file_count += 1
+                    if rec.foreign_hash:
+                        yield FileRecord(
+                            path=rec.path,
+                            size=rec.size,
+                            mtime=rec.mtime,
+                            inode=rec.inode,
+                            dev=rec.dev,
+                            nlink=rec.nlink,
+                            is_archive_member=rec.is_archive_member,
+                            is_bundle=rec.is_bundle,
+                            precomputed_full_hash=rec.foreign_hash,
+                            source_id=rec.source_id,
+                            foreign_hash=rec.foreign_hash,
+                            etag=rec.etag,
+                            cloud_file_id=rec.cloud_file_id,
+                            owner=rec.owner,
+                            is_shared=rec.is_shared,
+                        )
+                    else:
+                        # A cloud record without a foreign_hash cannot
+                        # participate in exact-duplicate grouping without
+                        # a reconcile download.  Deferred to 5f — for
+                        # now, log and skip so the scan completes.
+                        logging.getLogger(__name__).debug(
+                            "Skipping cloud record %s from %s: no foreign_hash",
+                            rec.path,
+                            rec.source_id,
+                        )
 
         hashed_iter = hash_records(
             _walk_iter(), store, include_singletons=True
@@ -743,6 +804,75 @@ def _build_sources_for_apply(
     return out
 
 
+def _build_scan_sources(source_ids: list[str]) -> list[Any]:
+    """Construct read-only cloud sources for ``dc scan --sources``.
+
+    v0.2 sub-milestone 5e: symmetric to :func:`_build_sources_for_apply`
+    but at scan time.  Every source is built with
+    ``is_read_only_scan=True`` — the runtime tripwire so a bug in the
+    scan path cannot trash a cloud file even accidentally.
+
+    A missing token file is a hard error at scan time — silently omitting
+    the source would produce a report with an incomplete picture and the
+    scorer's cross-source signals depend on seeing every member.
+    """
+    if not source_ids:
+        return []
+    tokens = TokenStore()
+    registry = AccountsRegistry()
+    by_id: dict[str, AccountEntry] = {e.id: e for e in registry.load()}
+    out: list[Any] = []
+    for sid in source_ids:
+        entry = by_id.get(sid)
+        if entry is None:
+            raise typer.BadParameter(
+                f"source {sid!r} not registered — run "
+                f"`dc auth add {sid.split(':', 1)[0]} <label>`"
+            )
+        data = tokens.load(sid)
+        if data is None:
+            raise typer.BadParameter(
+                f"source {sid!r} has no stored token — re-run "
+                "`dc auth add --force` for the account"
+            )
+        kind = str(data.get("type", entry.type))
+        if kind == "gdrive":
+            from duplicate_cleaner.sources.gdrive import GoogleDriveSource
+
+            creds = _google_credentials_from_token(data)
+            out.append(
+                GoogleDriveSource(
+                    account_id=sid,
+                    credentials=creds,
+                    is_read_only_scan=True,
+                )
+            )
+        elif kind == "onedrive":
+            from duplicate_cleaner.sources.onedrive import OneDriveSource
+
+            access_token = str(data.get("access_token") or "")
+            if not access_token:
+                access_token = _refresh_onedrive_token(
+                    sid, tokens=tokens, initial_data=data
+                )
+            def _make_token_provider(t: str) -> Callable[[], str]:
+                def _tp() -> str:
+                    return t
+
+                return _tp
+
+            out.append(
+                OneDriveSource(
+                    account_id=sid,
+                    token_provider=_make_token_provider(access_token),
+                    is_read_only_scan=True,
+                )
+            )
+        else:
+            raise typer.BadParameter(f"Unknown source type: {kind!r}")
+    return out
+
+
 def _build_gdrive_source(
     account_id: str, data: dict[str, object], *, force_refresh: bool
 ) -> object:
@@ -871,29 +1001,41 @@ def _refresh_onedrive_token(
     # successful response almost always carries a fresh refresh_token —
     # but tolerate the (rare) case where it does not by leaving the old
     # value in place.
+    #
+    # Audit pass 11: only touch TokenStore when the refresh_token actually
+    # rotated.  Re-writing the file on every apply run (a) generates disk
+    # churn on the encrypted token blob and (b) makes it harder to spot
+    # real rotations in ``mtime`` / audit tools.  A response that omits
+    # the field or repeats the current value → no write.
     new_refresh = result.get("refresh_token")
-    updated = dict(data)
-    updated["access_token"] = access_token
-    if isinstance(new_refresh, str) and new_refresh and new_refresh != refresh_token:
+    should_persist = (
+        isinstance(new_refresh, str)
+        and bool(new_refresh)
+        and new_refresh != refresh_token
+    )
+    if should_persist:
+        updated = dict(data)
+        updated["access_token"] = access_token
         updated["refresh_token"] = new_refresh
         log = logging.getLogger(__name__)
         log.debug(
             "Persisted rotated refresh_token for %s (MSAL rotation).",
             account_id,
         )
-    try:
-        store.save(account_id, updated)
-    except Exception as save_exc:
-        # A save failure MUST NOT abort the current apply — the returned
-        # access_token is still valid for this run.  Surface as a warning
-        # so the user knows to re-auth before the token rotates again.
-        log = logging.getLogger(__name__)
-        log.warning(
-            "Failed to persist rotated OneDrive token for %s: %s.  Next "
-            "apply may require `dc auth add onedrive --force`.",
-            account_id,
-            save_exc,
-        )
+        try:
+            store.save(account_id, updated)
+        except Exception as save_exc:
+            # A save failure MUST NOT abort the current apply — the returned
+            # access_token is still valid for this run.  Surface as a
+            # warning so the user knows to re-auth before the token
+            # rotates again.
+            log = logging.getLogger(__name__)
+            log.warning(
+                "Failed to persist rotated OneDrive token for %s: %s.  Next "
+                "apply may require `dc auth add onedrive --force`.",
+                account_id,
+                save_exc,
+            )
     return access_token
 
 

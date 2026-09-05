@@ -24,7 +24,14 @@ _STAGE_FLUSH_INTERVAL = 5000
 
 @dataclass(frozen=True)
 class HashedRecord:
-    """A FileRecord plus its full BLAKE3 hash."""
+    """A FileRecord plus its full BLAKE3 hash.
+
+    v0.2 sub-milestone 5e — carries the cloud-side fields the scorer
+    consults for cross-source signals.  ``source_id`` defaults to
+    ``"local"`` so every v0.1.1 construction site keeps working; cloud
+    sources stamp their own id.  ``is_shared`` marks shared-with-me cloud
+    files (informational-only invariant, enforced in the scorer).
+    """
 
     path: Path
     size: int
@@ -35,6 +42,10 @@ class HashedRecord:
     full_hash: str
     is_archive_member: bool = False
     is_bundle: bool = False
+    # v0.2 additions — all defaulted so v0.1.1 constructions keep working.
+    source_id: str = "local"
+    is_shared: bool = False
+    is_singleton_across_sources: bool = False
 
 
 def _hash_partial(path: Path, size: int) -> str:
@@ -100,6 +111,8 @@ def hash_records(
                     full_hash=rec.precomputed_full_hash,
                     is_archive_member=rec.is_archive_member,
                     is_bundle=rec.is_bundle,
+                    source_id=rec.source_id,
+                    is_shared=rec.is_shared,
                 )
             )
             continue

@@ -18,7 +18,7 @@ from duplicate_cleaner.paths import (
     known_trash_dirs,
     resolve_for_check,
     trash_dir_for,
-    validate_cloud_manifest_entry,
+    validate_cloud_manifest_entry_with_authorized,
     validate_not_excluded,
     validate_scan_root_candidate,
 )
@@ -26,6 +26,7 @@ from duplicate_cleaner.sources.base import (
     SourceAuthError,
     SourceError,
     SourceNotFoundError,
+    SourcePermissionError,
     SourceRateLimitError,
     TrashedLocation,
 )
@@ -305,7 +306,12 @@ def restore_from_manifest(
     # A registry read is required for cloud dispatch.  Construction is cheap
     # (no disk I/O until .load()) so we build it lazily — every v0.1.1 local
     # manifest continues to restore without a real accounts.toml present.
+    #
+    # Audit pass 11: extract the authorised set ONCE at the top of the
+    # batch loop so a big mixed-source manifest doesn't re-read
+    # accounts.toml per entry.
     reg: AccountsRegistry = registry if registry is not None else AccountsRegistry()
+    authorized: set[str] = {"local"} | {e.id for e in reg.load()}
 
     restored_local = 0
     restored_cloud = 0
@@ -319,7 +325,7 @@ def restore_from_manifest(
         sid = entry.get("source_id", "local")
         if sid != "local":
             try:
-                validate_cloud_manifest_entry(entry, reg)
+                validate_cloud_manifest_entry_with_authorized(entry, authorized)
             except ValueError as e:
                 errors.append(
                     f"Refuse to restore cloud entry "
@@ -397,13 +403,39 @@ def restore_from_manifest(
                 )
                 skipped_cloud += 1
                 continue
+            except SourcePermissionError as e:
+                # Audit pass 11: symmetrise with the mover — a permission
+                # error on a single entry is a per-entry skip, not an
+                # abort.  Same shape as SourceNotFoundError above so
+                # ``skipped_cloud`` reflects both "gone" and "no access"
+                # outcomes.  Continuing lets the remaining manifest rows
+                # restore even when one file's ACL changed since apply time.
+                log.warning(
+                    "Cloud restore skipped for %s (permission): %s",
+                    original_path_str,
+                    e,
+                )
+                errors.append(
+                    f"{original_path_str}: permission denied restoring "
+                    "from cloud trash — check provider-side sharing / role."
+                )
+                skipped_cloud += 1
+                continue
             except (SourceAuthError, SourceRateLimitError) as e:
                 # Abort — a bad token / hard rate-limit would silently miss
                 # every following entry.  Surface loudly with one action item.
+                #
+                # Audit pass 11 mirror of the mover pattern: include the
+                # in-flight restored counter so the operator knows how
+                # many entries succeeded before the abort.  Manifest is
+                # not modified by undo, so ``dc undo`` is safe to re-run
+                # once the underlying issue is fixed.
+                restored_so_far = restored_local + restored_cloud
                 raise UndoError(
-                    f"Aborted mid-undo: {type(e).__name__} restoring "
-                    f"{original_path_str}: {e}.  Fix the underlying issue "
-                    "(run `dc auth add --force` for auth) and retry."
+                    f"Aborted after restoring {restored_so_far} file(s) — "
+                    f"{type(e).__name__} restoring {original_path_str}: {e}. "
+                    "Fix the underlying issue (run `dc auth add --force` "
+                    "for auth) and retry."
                 ) from e
             except SourceError as e:
                 # Provider-side failure — surface but keep restoring.

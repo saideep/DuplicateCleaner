@@ -18,7 +18,7 @@ from duplicate_cleaner.compare.archive import (
 from duplicate_cleaner.paths import (
     is_within,
     resolve_for_check,
-    validate_cloud_entry,
+    validate_cloud_entry_with_authorized,
     validate_not_excluded,
     validate_scan_root_candidate,
 )
@@ -110,7 +110,12 @@ def _validate_report_paths(
     # (no disk I/O until .load()) so we build it here rather than making the
     # parameter mandatory — a local-only call site (every v0.1.1 test) does
     # not need to know about the registry.
+    #
+    # Audit pass 11: extract the authorised set ONCE at the top of the
+    # validation loop so a big cloud-heavy report doesn't re-read
+    # accounts.toml per member.
     reg: AccountsRegistry = registry if registry is not None else AccountsRegistry()
+    authorized: set[str] = {"local"} | {e.id for e in reg.load()}
     for g in report.groups:
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
@@ -151,7 +156,7 @@ def _validate_report_paths(
                 # sub-phase 5c; until then _apply_report refuses the actual
                 # move for any non-local source with a clear message.
                 try:
-                    validate_cloud_entry(m, reg)
+                    validate_cloud_entry_with_authorized(m, authorized)
                 except ValueError as e:
                     raise ApplyError(
                         f"Refusing cloud discard {m.path!r}: {e}"

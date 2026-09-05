@@ -269,13 +269,30 @@ def validate_cloud_entry(
     caller wraps it into ``ApplyError`` / ``UndoError`` per site.  Cloud
     ``Path`` is NEVER ``.resolve()``d here or elsewhere — dispatch is by
     ``source_id`` only.
+
+    Prefer :func:`validate_cloud_entry_with_authorized` inside batch
+    loops — it accepts a pre-computed authorised set so a big report
+    doesn't re-read ``accounts.toml`` once per member.
+    """
+    authorized = {"local"} | {e.id for e in registry.load()}
+    validate_cloud_entry_with_authorized(member, authorized)
+
+
+def validate_cloud_entry_with_authorized(
+    member: ReportMember,
+    authorized: set[str],
+) -> None:
+    """ReportMember cloud-entry validation given a pre-computed authorised set.
+
+    Audit pass 11: batch caller (``_validate_report_paths``) can now pass
+    the authorised set through once per report instead of triggering an
+    ``accounts.toml`` read per cloud member.
     """
     sid = member.source_id
     if sid == "local":
         raise ValueError(
             f"validate_cloud_entry called on local member (path={member.path!r})"
         )
-    authorized = {"local"} | {e.id for e in registry.load()}
     if sid not in authorized:
         raise ValueError(
             f"unknown source_id {sid!r}: not registered in AccountsRegistry "
@@ -320,6 +337,30 @@ def validate_cloud_manifest_entry(
     ``etag`` but has no ``is_shared`` field (shared files never reach the
     manifest because the mover refuses them).  Raises ``ValueError`` on any
     violation; callers wrap in ``UndoError``.
+
+    Prefer :func:`validate_cloud_manifest_entry_with_authorized` inside
+    batch loops (mover / undo) — it accepts a pre-computed authorised set
+    so a big manifest doesn't re-read ``accounts.toml`` once per entry.
+    """
+    authorized = {"local"} | {e.id for e in registry.load()}
+    validate_cloud_manifest_entry_with_authorized(entry, authorized)
+
+
+def validate_cloud_manifest_entry_with_authorized(
+    entry: dict[str, object],
+    authorized: set[str],
+) -> None:
+    """Cloud-manifest-entry validation given a pre-computed authorised set.
+
+    Audit pass 11: batch callers (``restore_from_manifest``,
+    ``_validate_report_paths``) used to call
+    :func:`validate_cloud_manifest_entry` inside their per-entry loop,
+    triggering a fresh ``accounts.toml`` read PER ENTRY.  A 5,000-row
+    mixed manifest hit disk 5,000 times.  Extract the registry read to
+    the loop-header and pass the authorised set through instead.
+
+    Identical safety rails to :func:`validate_cloud_manifest_entry`: the
+    only difference is where the authorised source-id set comes from.
     """
     sid_raw = entry.get("source_id", "local")
     if not isinstance(sid_raw, str):
@@ -329,7 +370,6 @@ def validate_cloud_manifest_entry(
             "validate_cloud_manifest_entry called on local entry "
             f"(original_path={entry.get('original_path')!r})"
         )
-    authorized = {"local"} | {e.id for e in registry.load()}
     if sid_raw not in authorized:
         raise ValueError(
             f"unknown source_id {sid_raw!r} in manifest entry: not registered "

@@ -61,6 +61,18 @@ class Config(BaseModel):
     throttle_on_cpu_pct: float = 85.0
     min_free_disk_gb: float = 5.0
 
+    # v0.2 sub-milestone 5e — cross-source keeper preference.
+    #
+    # ``retained_cloud_order`` is a list of full ``source_id`` values (e.g.
+    # ``"gdrive:personal"``, ``"onedrive:main"``) consulted only when a
+    # duplicate group has NO local member and multiple cloud members.  The
+    # earliest-listed source in the group wins the keeper role.  Cloud
+    # sources not in the list sort last (order among them is unstable but
+    # deterministic within one run).  Local always wins any cross-source tie
+    # — this list has no effect on groups containing a local member.  See
+    # ``docs/config.md`` for worked examples.
+    retained_cloud_order: list[str] = Field(default_factory=list)
+
     @field_validator("max_workers")
     @classmethod
     def _validate_max_workers(cls, v: int) -> int:
@@ -160,17 +172,37 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "clean_git_repo": 2.0,
     "external_drive_penalty": -2.0,
     "larger_size": 2.0,
+    # v0.2 sub-milestone 5e — cross-source signals.  The two marker-only
+    # weights (``is_shared_file``, ``is_singleton_across_sources``) do NOT
+    # additively affect the score — they force ``is_informational=True``
+    # at the same layer as hardlinks and APFS clones.  Kept in the weight
+    # map so config-round-trip stays stable and so future revisions can
+    # experiment without touching every construction site.
+    "cloud_when_local_exists": -3.0,
+    "is_shared_file": 0.0,
+    "is_singleton_across_sources": 0.0,
 }
 
 
 def load_config(path: Path = CONFIG_PATH) -> Config:
-    """Load configuration; raises if it does not exist yet."""
+    """Load configuration; raises if it does not exist yet.
+
+    v0.2 sub-milestone 5e: cross-source preference lives in the
+    ``[cross_source_preference]`` TOML section.  ``retained_cloud_order``
+    is spliced into the top-level config dict here so users can keep the
+    file grouped without polluting the flat model with a sub-model type.
+    """
     if not path.exists():
         raise FileNotFoundError(
             f"No config at {path}. Run `dc init` to create one."
         )
     with path.open("rb") as f:
         data: dict[str, Any] = tomllib.load(f)
+    pref = data.pop("cross_source_preference", None)
+    if isinstance(pref, dict):
+        order = pref.get("retained_cloud_order")
+        if order is not None:
+            data.setdefault("retained_cloud_order", order)
     return Config.model_validate(data)
 
 
