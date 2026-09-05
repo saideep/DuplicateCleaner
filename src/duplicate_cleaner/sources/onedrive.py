@@ -37,6 +37,7 @@ from duplicate_cleaner.auth.clients import GRAPH_ROOT
 from duplicate_cleaner.scan.walk import FileRecord
 from duplicate_cleaner.sources.base import (
     SourceAuthError,
+    SourceDriftError,
     SourceError,
     SourceMetadata,
     SourceNotFoundError,
@@ -652,6 +653,65 @@ class OneDriveSource:
             cloud_file_id=record.cloud_file_id,
             owner=record.owner,
             is_shared=record.is_shared,
+        )
+
+    def check_drift(self, record: FileRecord) -> None:
+        """Re-fetch ``lastModifiedDateTime`` + ``eTag`` and verify no drift.
+
+        v0.2 sub-phase 5c: called by the mover immediately before
+        :meth:`move_to_trash`.  Issues
+        ``GET /me/drive/items/{id}?$select=id,eTag,lastModifiedDateTime``.
+        The primary check is against the composite
+        ``f"{cloud_file_id}:{lastModifiedDateTime}"`` (the same shape
+        :meth:`list_files` stamps into ``FileRecord.etag``).  ``eTag`` is only
+        used as a secondary confirmation because Graph does not always echo
+        it on ``$select``.  A mismatch raises :class:`SourceDriftError` —
+        the mover aborts the entire apply run.
+        """
+        if not record.cloud_file_id:
+            raise SourceError(
+                f"{record.path}: cannot check drift without cloud_file_id"
+            )
+        if record.source_id != self.id:
+            raise SourceError(
+                f"FileRecord.source_id {record.source_id!r} does not match "
+                f"this OneDriveSource id {self.id!r}."
+            )
+        _validate_cloud_file_id(record.cloud_file_id)
+        quoted_id = _quote_cloud_file_id(record.cloud_file_id)
+        url = (
+            f"{GRAPH_ROOT}/me/drive/items/{quoted_id}"
+            "?$select=id,eTag,lastModifiedDateTime"
+        )
+        try:
+            resp = _graph_call(lambda: self._get(url))
+        except Exception as exc:
+            _raise_mapped(exc)
+            raise
+        try:
+            body = resp.json()
+        except Exception as exc:
+            raise SourceError(
+                f"{record.path}: check_drift got non-JSON response ({exc})"
+            ) from exc
+        if not isinstance(body, dict):
+            raise SourceError(
+                f"{record.path}: check_drift response is not a JSON object"
+            )
+        modified = body.get("lastModifiedDateTime")
+        current_composite = f"{record.cloud_file_id}:{modified or ''}"
+        if current_composite == record.etag:
+            return
+        # Fall back to the provider-supplied ``eTag`` for a defense-in-depth
+        # second chance: if the record.etag happens to be the raw Graph eTag
+        # (older scans or a future scheme change), accept an eTag match too.
+        graph_etag = body.get("eTag")
+        if isinstance(graph_etag, str) and graph_etag and graph_etag == record.etag:
+            return
+        raise SourceDriftError(
+            f"Cloud etag drift for {record.path}: scan={record.etag!r} "
+            f"now={current_composite!r} (graph eTag={graph_etag!r}) — the "
+            "file changed on the provider since scan.  Rescan and retry."
         )
 
 

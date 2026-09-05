@@ -850,6 +850,88 @@ def test_bearer_token_stripped_on_cross_origin_redirect(
     assert "auth" in captured[1]  # sentinel — see comment above
 
 
+# ---------------------------------------------------------------------------
+# v0.2 sub-phase 5c — check_drift.
+# ---------------------------------------------------------------------------
+
+
+def test_check_drift_no_change_returns_none() -> None:
+    """Same lastModifiedDateTime → no exception."""
+    scan_modified = "2026-09-05T12:34:56.000Z"
+    client = MagicMock()
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "id": "cf001",
+        "eTag": '"etag-abc"',
+        "lastModifiedDateTime": scan_modified,
+    }
+    client.get.return_value = resp
+    src = OneDriveSource(
+        "onedrive:x",
+        token_provider=lambda: "t",
+        account_user_id="me-oid",
+        is_read_only_scan=False,
+        client_factory=lambda _tp: client,
+    )
+    rec = FileRecord(
+        path=Path("onedrive:x://foo"),
+        size=1,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="onedrive:x",
+        cloud_file_id="cf001",
+        etag=f"cf001:{scan_modified}",
+    )
+    # Should NOT raise.
+    src.check_drift(rec)
+    # Verified the ``$select`` query trims payload.
+    args, _kwargs = client.get.call_args
+    assert "$select=id,eTag,lastModifiedDateTime" in args[0]
+    assert "/me/drive/items/cf001" in args[0]
+
+
+def test_check_drift_mismatch_raises_source_drift_error() -> None:
+    """Different lastModifiedDateTime and eTag → SourceDriftError."""
+    from duplicate_cleaner.sources.base import SourceDriftError
+
+    scan_modified = "2026-09-05T12:34:56.000Z"
+    new_modified = "2026-09-06T10:00:00.000Z"
+    client = MagicMock()
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "id": "cf001",
+        "eTag": '"etag-new"',
+        "lastModifiedDateTime": new_modified,
+    }
+    client.get.return_value = resp
+    src = OneDriveSource(
+        "onedrive:x",
+        token_provider=lambda: "t",
+        account_user_id="me-oid",
+        is_read_only_scan=False,
+        client_factory=lambda _tp: client,
+    )
+    rec = FileRecord(
+        path=Path("onedrive:x://foo"),
+        size=1,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="onedrive:x",
+        cloud_file_id="cf001",
+        etag=f"cf001:{scan_modified}",
+    )
+    with pytest.raises(SourceDriftError) as exc:
+        src.check_drift(rec)
+    msg = str(exc.value)
+    assert scan_modified in msg or "drift" in msg.lower()
+
+
 def test_nextlink_refused_when_not_graph_origin() -> None:
     """A poisoned ``@odata.nextLink`` outside graph.microsoft.com aborts."""
     evil_page = {

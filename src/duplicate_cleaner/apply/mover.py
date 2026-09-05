@@ -22,7 +22,20 @@ from duplicate_cleaner.paths import (
     validate_not_excluded,
     validate_scan_root_candidate,
 )
-from duplicate_cleaner.report.schema import Manifest, ManifestEntry, Report
+from duplicate_cleaner.report.schema import (
+    Manifest,
+    ManifestEntry,
+    Report,
+    ReportMember,
+)
+from duplicate_cleaner.scan.walk import FileRecord
+from duplicate_cleaner.sources.base import (
+    Source,
+    SourceAuthError,
+    SourceDriftError,
+    SourceError,
+    SourceRateLimitError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -170,8 +183,9 @@ def _count_cloud_discards(report: Report) -> int:
     """Count discards whose ``source_id`` is not ``"local"``.
 
     v0.2 sub-phase 5b: cloud discards flow through ``validate_cloud_entry``
-    but not through ``Source.move_to_trash`` yet.  Used to surface a
-    deferred-count in the apply result summary.
+    but not through ``Source.move_to_trash`` yet.  Kept for the existing
+    5b test / result-dict shape.  Sub-phase 5c actually wires the dispatch
+    so ``cloud_deferred`` is 0 whenever a ``sources`` map is provided.
     """
     n = 0
     for g in report.groups:
@@ -181,6 +195,49 @@ def _count_cloud_discards(report: Report) -> int:
             if m.source_id != "local":
                 n += 1
     return n
+
+
+def plan_cloud_moves(report: Report) -> list[ReportMember]:
+    """Return every proposed-discard ``ReportMember`` with ``source_id != "local"``.
+
+    v0.2 sub-phase 5c: symmetric to :func:`plan_moves`, but for the cloud
+    dispatch loop.  Cloud paths are never resolved — the ``ReportMember`` is
+    passed through so the mover can hand ``cloud_file_id`` / ``etag`` to
+    :meth:`Source.check_drift` and :meth:`Source.move_to_trash` without
+    round-tripping through ``Path`` semantics.
+    """
+    out: list[ReportMember] = []
+    for g in report.groups:
+        for m in g.members:
+            if m.is_proposed_keeper or m.is_informational:
+                continue
+            if m.source_id == "local":
+                continue
+            out.append(m)
+    return out
+
+
+def _member_to_cloud_record(m: ReportMember) -> FileRecord:
+    """Build a minimal ``FileRecord`` from a cloud ``ReportMember`` for source dispatch.
+
+    Only the fields consumed by :meth:`Source.check_drift` / :meth:`Source.move_to_trash`
+    are populated — ``inode`` / ``dev`` / ``nlink`` stay at 0 (unused for
+    cloud dispatch).  The ``Path`` is passed through UNCHANGED — it is
+    opaque display text on cloud records and MUST NOT be ``.resolve()``d.
+    """
+    return FileRecord(
+        path=Path(m.path),
+        size=m.size,
+        mtime=m.mtime,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id=m.source_id,
+        etag=m.etag,
+        cloud_file_id=m.cloud_file_id,
+        owner=m.owner,
+        is_shared=m.is_shared,
+    )
 
 
 def _verify_unchanged(path: Path, size: int, mtime: float) -> None:
@@ -239,8 +296,28 @@ def apply_report(
     runs_dir: Path = RUNS_DIR,
     trash_fn: TrashFn | None = None,
     registry: AccountsRegistry | None = None,
+    sources: dict[str, Source] | None = None,
 ) -> dict[str, Any]:
-    """Verify then move discarded files to Trash. Dry-run unless commit=True."""
+    """Verify then move discarded files to Trash. Dry-run unless commit=True.
+
+    v0.2 sub-phase 5c: cloud discards are now dispatched to
+    :meth:`Source.move_to_trash` via ``sources``.  ``sources`` maps
+    ``source_id`` (e.g. ``"gdrive:personal"``, ``"onedrive:main"``) to a
+    concrete :class:`Source` whose ``is_read_only_scan`` MUST be ``False``.
+    ``None`` means local-only mode — a report carrying any cloud entry is
+    refused with a clear ``ApplyError``.
+
+    Semantics on cloud failures (per design doc §5.4):
+
+    * :class:`SourceDriftError` (etag drift) — abort mid-apply. Manifest
+      flushed so entries 1..(n-1) that already trashed are recoverable via
+      ``dc undo``.  Same semantics as local size+mtime drift.
+    * :class:`SourceAuthError` / :class:`SourceRateLimitError` — abort
+      mid-apply.  Continuing under a bad token silently produces a manifest
+      with many missed entries; better to fail loud with one action item.
+    * Other :class:`SourceError` (not-found, permission) — logged per-entry,
+      apply continues.  Same as ``OSError`` on local ``send2trash``.
+    """
     report = load_report(json_path)
     # Enforce exclusions and root containment against paths from the report
     # BEFORE anything else — a poisoned report must not cause side effects.
@@ -248,18 +325,45 @@ def apply_report(
     # dispatch on ``source_id``); local entries flow through the v0.1.1 rails.
     _validate_report_paths(report, registry=registry)
 
-    # v0.2 sub-phase 5b: cloud discards are validated but NOT yet dispatched
-    # to Source.move_to_trash — that lands in sub-phase 5c.  The count is
-    # surfaced in the result dict so the CLI can print an accurate "deferred"
-    # message rather than silently dropping them.
-    cloud_deferred = _count_cloud_discards(report)
-    # TODO(sub-phase 5c): wire Source.move_to_trash here.  Iterate cloud
-    # discards, look up the ``Source`` for ``member.source_id`` in the
-    # ``sources_by_id`` map, run ``_pre_trash_drift_check`` (etag re-fetch),
-    # then call ``src.move_to_trash(record)`` and merge the returned
-    # ``TrashedLocation`` into the manifest row.  See design doc §5.
-
     moves = plan_moves(report)
+    cloud_moves = plan_cloud_moves(report)
+
+    # v0.2 sub-phase 5c: local-only mode is signalled by ``sources=None``.
+    # A cloud entry in the report is a hard refusal — the mover cannot
+    # dispatch without an authorized sources map.
+    if cloud_moves and sources is None:
+        raise ApplyError(
+            f"Refusing to apply: report contains {len(cloud_moves)} cloud "
+            "discard(s) but no sources map was provided. Construct the "
+            "sources dict from AccountsRegistry + TokenStore (see "
+            "cli.py::apply) and pass it via sources=... — local-only mode "
+            "cannot dispatch cloud discards."
+        )
+
+    # Pre-flight cloud checks — fail fast BEFORE any I/O so a mis-constructed
+    # source (missing entry, is_read_only_scan=True) trips the tripwire
+    # BEFORE any HTTP call.  Re-checked inside the move loop as defense in
+    # depth in case a caller mutated the map mid-run.
+    if cloud_moves:
+        assert sources is not None  # narrowed above
+        for m in cloud_moves:
+            src = sources.get(m.source_id)
+            if src is None:
+                raise ApplyError(
+                    f"Refusing to apply: cloud entry {m.path} has source_id "
+                    f"{m.source_id!r} which is not in the sources map "
+                    f"({sorted(sources.keys())}). Register the account "
+                    "with `dc auth add` and rescan, or supply the source at "
+                    "apply time."
+                )
+            if getattr(src, "is_read_only_scan", False):
+                raise ApplyError(
+                    f"Refusing to apply: source {m.source_id!r} was "
+                    "constructed with is_read_only_scan=True.  This "
+                    "tripwire fires BEFORE any HTTP call — the source "
+                    "must be built with is_read_only_scan=False for the "
+                    "trash dispatch."
+                )
 
     verified: list[tuple[Path, int, float, str]] = []
     errors: list[str] = []
@@ -272,14 +376,23 @@ def apply_report(
             verified.append((path, size, mtime, h))
 
     result: dict[str, Any] = {
-        "planned": len(moves),
-        "verified": len(verified),
+        "planned": len(moves) + len(cloud_moves),
+        "planned_local": len(moves),
+        "planned_cloud": len(cloud_moves),
+        "verified": len(verified) + len(cloud_moves),
+        "verified_local": len(verified),
+        "verified_cloud": len(cloud_moves),
         "changed_or_missing": errors,
         "committed": False,
         "manifest_path": None,
         "moved": 0,
-        # v0.2 sub-phase 5b: cloud discards were validated but not moved.
-        "cloud_deferred": cloud_deferred,
+        "moved_local": 0,
+        "moved_cloud": 0,
+        # v0.2 sub-phase 5c: cloud dispatch is wired.  When ``sources`` is
+        # provided every cloud entry is dispatched (or logged as an error);
+        # ``cloud_deferred`` stays for backcompat with the 5b result-dict
+        # shape but is always 0 in 5c.
+        "cloud_deferred": 0,
     }
 
     if not commit:
@@ -310,6 +423,26 @@ def apply_report(
         ).model_dump()
         for p, s, mt, h in verified
     ]
+    # v0.2 sub-phase 5c: cloud entries land in the same manifest, appended
+    # after every local row so the ``entries`` list order matches the
+    # dispatch order below.  ``trashed_at_path`` stays None (cloud discards
+    # have no local Trash placement); ``cloud_trash_id`` gets stamped after
+    # a successful move_to_trash returns its ``TrashedLocation``.
+    cloud_entries_start = len(entries)
+    for m in cloud_moves:
+        entries.append(
+            ManifestEntry(
+                original_path=str(m.path),
+                size=m.size,
+                mtime=m.mtime,
+                hash=m.hash,
+                trashed_at_path=None,
+                source_id=m.source_id,
+                cloud_file_id=m.cloud_file_id,
+                cloud_trash_id=None,
+                etag=m.etag,
+            ).model_dump()
+        )
 
     def _flush_manifest() -> None:
         manifest = Manifest(
@@ -323,7 +456,8 @@ def apply_report(
     _flush_manifest()
 
     tf = trash_fn or _default_trash_fn
-    moved = 0
+    moved_local = 0
+    moved_cloud = 0
     for i, (p, s, mt, _) in enumerate(verified):
         # Re-verify immediately before the mutation — the disk may have
         # changed between the batch verify and now.
@@ -334,7 +468,7 @@ def apply_report(
             raise ApplyError(
                 f"Aborted mid-apply: {p} changed between verify and move ({e}). "
                 f"Manifest at {manifest_path} reflects reality "
-                f"({moved} file(s) moved so far)."
+                f"({moved_local + moved_cloud} file(s) moved so far)."
             ) from e
         try:
             dest = tf(p)
@@ -346,15 +480,101 @@ def apply_report(
         # basename+hash fallback rather than trusting a wrong path.
         if dest is not None:
             entries[i]["trashed_at_path"] = str(dest)
-        moved += 1
+        moved_local += 1
         # G6: flush after every successful move. Without this, a kernel
         # panic mid-loop leaves every entry with trashed_at_path=None on
         # disk and undo must rely entirely on the basename+hash fallback.
         _flush_manifest()
 
+    # v0.2 sub-phase 5c: cloud dispatch loop.  Each iteration re-verifies
+    # the source tripwire (defense in depth), calls ``check_drift`` (raises
+    # SourceDriftError on etag mismatch → abort), then ``move_to_trash``.
+    # ``SourceRateLimitError`` / ``SourceAuthError`` abort the run; other
+    # SourceErrors (not-found, permission) are logged and skipped so a
+    # single dead file doesn't torpedo the whole batch.
+    for j, m in enumerate(cloud_moves):
+        i = cloud_entries_start + j
+        # sources is guaranteed non-None here (checked before commit block).
+        assert sources is not None
+        src = sources.get(m.source_id)
+        if src is None:  # pragma: no cover - checked above too
+            _flush_manifest()
+            raise ApplyError(
+                f"Aborted mid-apply: source {m.source_id!r} disappeared "
+                "from the sources map between pre-flight and dispatch."
+            )
+        if getattr(src, "is_read_only_scan", False):
+            _flush_manifest()
+            raise ApplyError(
+                f"Aborted mid-apply: source {m.source_id!r} became "
+                "read-only.  Manifest at "
+                f"{manifest_path} reflects reality "
+                f"({moved_local + moved_cloud} file(s) moved so far)."
+            )
+        record = _member_to_cloud_record(m)
+        # Drift check — raises SourceDriftError on etag mismatch, which we
+        # promote to an ApplyError abort so semantics match local drift.
+        try:
+            src.check_drift(record)
+        except SourceDriftError as e:
+            _flush_manifest()
+            raise ApplyError(
+                f"Aborted mid-apply: cloud etag drift for {m.path} ({e}). "
+                f"Manifest at {manifest_path} reflects reality "
+                f"({moved_local + moved_cloud} file(s) moved so far)."
+            ) from e
+        except SourceError as e:
+            # A non-drift error surfacing from check_drift itself is a
+            # provider-side problem — auth / rate / not-found.  Treat auth /
+            # rate as abort, everything else as per-entry skip.
+            if isinstance(e, SourceAuthError | SourceRateLimitError):
+                _flush_manifest()
+                raise ApplyError(
+                    f"Aborted mid-apply: {type(e).__name__} during drift "
+                    f"check for {m.path}: {e}. "
+                    f"Manifest at {manifest_path} reflects reality "
+                    f"({moved_local + moved_cloud} file(s) moved so far)."
+                ) from e
+            log.error("Drift-check failed for %s: %s", m.path, e)
+            continue
+        # Move to cloud trash.  tenacity retry is already inside the source
+        # implementation; a SourceRateLimitError here is post-retry.
+        try:
+            loc = src.move_to_trash(record)
+        except SourceDriftError as e:
+            # Extremely unlikely but not impossible if the source implements
+            # its own drift check inside move_to_trash.  Treat as abort.
+            _flush_manifest()
+            raise ApplyError(
+                f"Aborted mid-apply: cloud etag drift for {m.path} "
+                f"during move_to_trash ({e}). "
+                f"Manifest at {manifest_path} reflects reality "
+                f"({moved_local + moved_cloud} file(s) moved so far)."
+            ) from e
+        except (SourceAuthError, SourceRateLimitError) as e:
+            _flush_manifest()
+            raise ApplyError(
+                f"Aborted mid-apply: {type(e).__name__} for {m.path}: {e}. "
+                f"Manifest at {manifest_path} reflects reality "
+                f"({moved_local + moved_cloud} file(s) moved so far)."
+            ) from e
+        except SourceError as e:
+            log.error("Cloud trash failed for %s: %s", m.path, e)
+            continue
+        # TrashedLocation might carry an updated cloud_trash_id (Drive keeps
+        # the same id; OneDrive Personal too).  Record both.
+        entries[i]["cloud_trash_id"] = loc.cloud_trash_id
+        if loc.cloud_file_id:
+            entries[i]["cloud_file_id"] = loc.cloud_file_id
+        moved_cloud += 1
+        # G6 (cloud mirror): flush after every successful move.
+        _flush_manifest()
+
     _flush_manifest()
 
     result["manifest_path"] = str(manifest_path)
-    result["moved"] = moved
+    result["moved"] = moved_local + moved_cloud
+    result["moved_local"] = moved_local
+    result["moved_cloud"] = moved_cloud
     result["committed"] = True
     return result

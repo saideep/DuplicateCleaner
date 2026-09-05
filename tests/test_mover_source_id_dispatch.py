@@ -266,7 +266,15 @@ def test_cloud_path_never_resolved(tmp_path: Path) -> None:
     ``Path`` may reach it.  The local keeper's real path still routes through
     the local rails (which DO resolve), so the patch record must contain
     only local filesystem paths.
+
+    v0.2 sub-phase 5c: the mover now requires a ``sources`` map to dispatch
+    cloud discards.  We supply a MagicMock source with
+    ``is_read_only_scan=False`` — the dry-run (commit=False) path does NOT
+    call ``check_drift`` or ``move_to_trash`` on it, but the pre-flight
+    tripwire is exercised.
     """
+    from unittest.mock import MagicMock
+
     report_path = _mkreport(
         tmp_path,
         cloud_member_kwargs={
@@ -287,12 +295,17 @@ def test_cloud_path_never_resolved(tmp_path: Path) -> None:
         resolve_calls.append(p)
         return original(p)
 
+    # Stub source — dry-run does not call check_drift / move_to_trash.
+    stub_src = MagicMock()
+    stub_src.is_read_only_scan = False
+
     with patch.object(mover_mod, "resolve_for_check", side_effect=_spy):
         result = apply_report(
             report_path,
             commit=False,
             runs_dir=tmp_path / "runs",
             registry=reg,  # type: ignore[arg-type]
+            sources={"gdrive:personal": stub_src},
         )
 
     # No call recorded a cloud path (identified by the "gdrive:" prefix).
@@ -300,7 +313,13 @@ def test_cloud_path_never_resolved(tmp_path: Path) -> None:
         assert "gdrive:" not in str(p), (
             f"resolve_for_check called on cloud path {p!r} — Alt-C violated"
         )
-    # Cloud discard was validated (not dispatched to trash yet — 5c).
-    assert result["cloud_deferred"] == 1
+    # Sub-phase 5c: cloud dispatch is wired; the cloud discard is planned.
+    assert result["cloud_deferred"] == 0
+    assert result["planned_cloud"] == 1
     # The local keeper was NOT a discard, so plan_moves emits nothing local.
-    assert result["planned"] == 0
+    assert result["planned_local"] == 0
+    # ``planned`` is now the sum of local + cloud.
+    assert result["planned"] == 1
+    # Dry-run: nothing actually moved.
+    assert stub_src.check_drift.call_count == 0
+    assert stub_src.move_to_trash.call_count == 0

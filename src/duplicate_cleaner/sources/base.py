@@ -35,6 +35,19 @@ class SourceAuthError(SourceError):
     """The stored token was rejected (401) — interactive re-auth required."""
 
 
+class SourceDriftError(SourceError):
+    """Raised when the file's current cloud-side etag/modifiedTime differs
+    from the ``record.etag`` captured at scan time.
+
+    v0.2 sub-phase 5c: the mover calls :meth:`Source.check_drift` immediately
+    before :meth:`Source.move_to_trash`.  A drift aborts the entire apply run
+    — same semantics as local (size, mtime) drift.  Local sources typically
+    raise :class:`duplicate_cleaner.apply.mover.PathChangedError` from the
+    verify path; cloud sources raise ``SourceDriftError`` from their
+    ``check_drift`` implementation.
+    """
+
+
 @dataclass(frozen=True)
 class SourceMetadata:
     """Snapshot of cloud-side metadata pulled during list_files()."""
@@ -85,3 +98,18 @@ class Source(Protocol):
 
     def get_metadata(self, record: FileRecord) -> SourceMetadata:
         ...
+
+    def check_drift(self, record: FileRecord) -> None:
+        """Verify ``record`` still matches provider-side state.
+
+        v0.2 sub-phase 5c: called by the mover immediately BEFORE
+        :meth:`move_to_trash` so a stale scan cannot silently trash the wrong
+        file.  For cloud sources compare the re-fetched
+        etag/modifiedTime against ``record.etag``; for local sources compare
+        size + mtime.  Raises :class:`SourceDriftError` (cloud) or
+        ``PathChangedError`` (local) on mismatch — the mover aborts the whole
+        run on either.  Return ``None`` when the record is still current.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement check_drift"
+        )

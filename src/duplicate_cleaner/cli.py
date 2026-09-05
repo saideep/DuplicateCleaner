@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -608,10 +608,41 @@ def apply(
             help="Actually move files to Trash. Dry-run without this flag.",
         ),
     ] = False,
+    force_refresh: Annotated[
+        bool,
+        typer.Option(
+            "--force-refresh",
+            help=(
+                "Force a token refresh for every registered cloud account "
+                "before dispatch.  Useful for long-idle credentials or "
+                "immediately after `dc auth add --force`."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Move discarded duplicates to the Trash. Dry-run by default."""
+    # v0.2 sub-phase 5c: build the sources map at apply time so
+    # ``apply_report`` can dispatch cloud discards to their Source
+    # implementations.  A pure-local report never needs the map — we still
+    # build it (cheap) so a stale account_id in the report surfaces here
+    # rather than during the move loop.
+    registry = AccountsRegistry()
+    sources_map: dict[str, Any] = {}
     try:
-        result = apply_report(report_json, commit=commit)
+        sources_map = _build_sources_for_apply(
+            registry, force_refresh=force_refresh
+        )
+    except ApplyError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+    try:
+        result = apply_report(
+            report_json,
+            commit=commit,
+            registry=registry,
+            sources=sources_map or None,
+        )
     except ApplyError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1) from e
@@ -630,21 +661,197 @@ def apply(
             for msg in result["changed_or_missing"][:10]:
                 console.print(f"  • {msg}")
     else:
+        # v0.2 sub-phase 5c: apply_report now dispatches cloud discards
+        # through Source.move_to_trash, so the summary carries a per-family
+        # count.  ``moved_local`` / ``moved_cloud`` fall back to zero on a
+        # v0.1.1-shaped result dict (no cloud entries).
+        moved_local = int(result.get("moved_local", result.get("moved", 0)))
+        moved_cloud = int(result.get("moved_cloud", 0))
         console.print(
-            f"[green]Moved {result['moved']} file(s) to Trash.[/green]"
+            f"[green]Moved {moved_local} local file(s), {moved_cloud} cloud "
+            "file(s) to Trash.[/green]"
         )
         console.print(f"Manifest: {result['manifest_path']}")
-        # CR#1 (pass 9): surface cloud discards that were validated but not
-        # trashed yet — until sub-phase 5c wires Source.move_to_trash, cloud
-        # entries flow through _validate_report_paths and land in the report
-        # but are NEVER sent to any cloud provider.  Silent-drop would erode
-        # user trust.
-        cloud_deferred = result.get("cloud_deferred", 0)
-        if cloud_deferred:
-            console.print(
-                f"[yellow]{cloud_deferred} cloud discard(s) deferred — "
-                "cloud apply lands in v0.2 sub-phase 5c.[/yellow]"
+
+
+def _build_sources_for_apply(
+    registry: AccountsRegistry,
+    *,
+    force_refresh: bool,
+) -> dict[str, Any]:
+    """Construct the ``source_id -> Source`` map for ``apply_report``.
+
+    Walks :class:`AccountsRegistry` and instantiates one
+    :class:`GoogleDriveSource` / :class:`OneDriveSource` per registered
+    account, with ``is_read_only_scan=False`` so the source's trash
+    dispatch is enabled.  ``force_refresh`` bypasses the cached access
+    token and issues a proactive refresh on the OneDrive side; Google's
+    ``google.oauth2.credentials.Credentials`` refreshes automatically when
+    the API layer sees an expired token so no separate call is needed.
+
+    Missing tokens (account registered but ``dc auth add`` was interrupted
+    before write) are logged and skipped — a cloud discard against that
+    source will surface later as an ApplyError in ``apply_report``.
+    """
+    tokens = TokenStore()
+    out: dict[str, Any] = {}
+    for entry in registry.load():
+        try:
+            data = tokens.load(entry.id)
+        except TokenPermissionError as e:
+            raise ApplyError(
+                f"Token for {entry.id!r} rejected: {e}. Fix file mode and retry."
+            ) from e
+        if data is None:
+            log = logging.getLogger(__name__)
+            log.warning(
+                "No token for account %s (registered in accounts.toml but no "
+                "token file); cloud discards for this source will fail.",
+                entry.id,
             )
+            continue
+        kind = str(data.get("type", entry.type))
+        if kind == "gdrive":
+            out[entry.id] = _build_gdrive_source(
+                entry.id, data, force_refresh=force_refresh
+            )
+        elif kind == "onedrive":
+            out[entry.id] = _build_onedrive_source(
+                entry.id, data, force_refresh=force_refresh
+            )
+        else:
+            # Silently ignore unknown provider types — future providers can
+            # be wired here without changing every apply-time call site.
+            log = logging.getLogger(__name__)
+            log.warning(
+                "Unknown auth type %r for account %s — skipping in "
+                "apply-time sources map.",
+                kind,
+                entry.id,
+            )
+    return out
+
+
+def _build_gdrive_source(
+    account_id: str, data: dict[str, object], *, force_refresh: bool
+) -> object:
+    """Instantiate a GoogleDriveSource with trash dispatch enabled.
+
+    ``google.oauth2.credentials.Credentials`` auto-refreshes on the next
+    API call whenever ``refresh_token`` is set — no explicit refresh is
+    required.  ``force_refresh=True`` calls ``creds.refresh`` proactively
+    to surface a bad refresh token BEFORE the apply loop.
+    """
+    from duplicate_cleaner.sources.gdrive import GoogleDriveSource
+
+    creds = _google_credentials_from_token(data)
+    if force_refresh:
+        try:
+            from google.auth.transport.requests import (  # type: ignore[import-not-found]
+                Request,
+            )
+
+            creds.refresh(Request())  # type: ignore[attr-defined]
+        except Exception as e:
+            raise ApplyError(
+                f"--force-refresh: failed to refresh Google token for "
+                f"{account_id!r}: {e}. Run `dc auth add gdrive --force`."
+            ) from e
+    return GoogleDriveSource(
+        account_id=account_id,
+        credentials=creds,
+        is_read_only_scan=False,
+    )
+
+
+def _build_onedrive_source(
+    account_id: str, data: dict[str, object], *, force_refresh: bool
+) -> object:
+    """Instantiate an OneDriveSource with trash dispatch enabled.
+
+    Microsoft Graph does not auto-refresh the way google-auth does — we
+    plumb ``msal`` here to refresh the access token from the stored
+    refresh_token whenever it expires (or unconditionally when
+    ``force_refresh`` is set).  The source consumes the token via a
+    zero-arg callable so a refresh landing after construction is picked up
+    on the very next request.
+    """
+    from duplicate_cleaner.sources.onedrive import OneDriveSource
+
+    refresh_token = str(data.get("refresh_token") or "")
+    client_id = str(data.get("client_id") or BUNDLED_ONEDRIVE_CLIENT_ID)
+    scopes_raw = data.get("scopes")
+    scopes: list[str] = (
+        [str(s) for s in scopes_raw]
+        if isinstance(scopes_raw, list)
+        else list(ONEDRIVE_DEFAULT_SCOPES)
+    )
+    # ``offline_access`` is a synthetic scope Microsoft strips from the
+    # access-token response; MSAL rejects it as a duplicate when passed
+    # explicitly.  Filter it out for the refresh call.
+    scopes = [s for s in scopes if s != "offline_access"]
+
+    # Cache the last known access_token so a source constructed without a
+    # network hop still works for offline unit tests.  The provider
+    # callable refreshes when the cache is stale (or unconditionally on
+    # ``force_refresh``).
+    cached_token: dict[str, str] = {
+        "access_token": str(data.get("access_token") or ""),
+    }
+
+    def _refresh_now() -> str:
+        try:
+            import msal  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ApplyError(
+                "msal is required to refresh OneDrive tokens but is not "
+                "installed.  Install with `pip install msal>=1.31`."
+            ) from e
+        app_client = msal.PublicClientApplication(
+            client_id,
+            authority="https://login.microsoftonline.com/consumers",
+        )
+        if not refresh_token:
+            raise ApplyError(
+                f"OneDrive account {account_id!r} has no refresh_token; "
+                "run `dc auth add onedrive --force` to re-authorize."
+            )
+        result = app_client.acquire_token_by_refresh_token(
+            refresh_token, scopes=scopes
+        )
+        if not isinstance(result, dict) or "access_token" not in result:
+            err = (
+                result.get("error_description")
+                if isinstance(result, dict)
+                else "unknown"
+            )
+            raise ApplyError(
+                f"OneDrive token refresh for {account_id!r} failed: {err}. "
+                "Run `dc auth add onedrive --force` to re-authorize."
+            )
+        cached_token["access_token"] = str(result["access_token"])
+        return cached_token["access_token"]
+
+    if force_refresh or not cached_token["access_token"]:
+        # Proactively refresh on --force-refresh, or when we never had one
+        # (import-time bug — safer to fail fast).
+        _refresh_now()
+
+    def _token_provider() -> str:
+        # If the cached token is empty (e.g. someone reset the dict), fall
+        # back to a fresh refresh.  Real 401s surface as SourceAuthError
+        # from the source's HTTP layer and are handled by the mover's abort
+        # path — retrying inside the provider would loop.
+        tok = cached_token.get("access_token") or ""
+        if not tok:
+            tok = _refresh_now()
+        return tok
+
+    return OneDriveSource(
+        account_id=account_id,
+        token_provider=_token_provider,
+        is_read_only_scan=False,
+    )
 
 
 @app.command()

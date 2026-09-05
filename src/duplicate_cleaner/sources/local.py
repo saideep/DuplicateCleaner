@@ -126,3 +126,28 @@ class LocalFileSystemSource:
     def get_metadata(self, record: FileRecord) -> SourceMetadata:
         """Return an empty SourceMetadata — local files carry no cloud fields."""
         return SourceMetadata()
+
+    def check_drift(self, record: FileRecord) -> None:
+        """Verify the file on disk still matches ``record.size`` and ``record.mtime``.
+
+        v0.2 sub-phase 5c: added for parity with the cloud sources so the
+        mover can dispatch drift-check through the Source protocol without
+        special-casing local records.  The mover's existing
+        ``_verify_unchanged`` pathway is what actually runs for local
+        discards in :func:`apply.mover.apply_report`; this method is here so
+        a caller that wants a uniform :meth:`Source.check_drift` interface
+        can use it too.  Raises :class:`FileNotFoundError` when the file is
+        gone, ``ValueError`` on any (size, mtime) mismatch.
+        """
+        p = record.path
+        if not p.exists():
+            raise FileNotFoundError(f"missing on disk: {p}")
+        st = p.stat()
+        if st.st_size != record.size:
+            raise ValueError(
+                f"size changed: {p} (was {record.size}, now {st.st_size})"
+            )
+        if abs(st.st_mtime - record.mtime) > 1e-3:
+            raise ValueError(
+                f"mtime changed: {p} (was {record.mtime}, now {st.st_mtime})"
+            )

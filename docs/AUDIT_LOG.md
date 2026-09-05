@@ -78,6 +78,68 @@ Category counts: 1 safety (PLAUSIBLE), 2 simplification (CONFIRMED). Zero DATA-L
 
 **Fourth audit (Code Review pass 4, fork+scaffold, 2026-09-05)** — verified H1–H9 all correctly fixed under the new AUDIT_SCAFFOLD contract. No DATA-LOSS. No invariants weakened. 5 findings, all deferrable: 2 `simplification` (H7's `singleton-by-partial:...` marker leaks path — same class as v0.1.2-deferred `singleton-by-size` marker; undo.py's `_src_is_in_trash` duplicates `paths.is_inside_any_trash`), 2 `test-coverage` (no test proves nested-skip attributes to outer-archive path in `skipped_outer_archives`; no end-to-end test that H7 partial-unique singleton reaches `Report.singletons`), 1 `simplification` (H4 nested-archive double-hashes bytes; single-pass optimisation possible). **Verdict: Ready with post-release notes.** v0.1.1 clears ship.
 
+**Tenth audit (Code Review pass 10 + Security pass 10, coordinator-direct review, 2026-09-05)** — verdict: **Ready with post-release notes.** Zero DATA-LOSS in 5c, zero invariants weakened. Verified: drift check runs BEFORE move_to_trash on every cloud dispatch; SourceDriftError aborts the whole run and flushes the manifest first; is_read_only_scan tripwire fires before drift-check + any HTTP call; cloud Path never .resolve()d; manifest atomic-write applies to cloud rows; token in memory only (msal default is in-memory TokenCache, no disk writes); gdrive/onedrive check_drift etag composites match list_files stamping shape; ordering local→cloud in the dispatch loop preserved.
+
+Category counts: 1 safety (PLAUSIBLE, latent for 5d), 2 correctness (1 PLAUSIBLE + 1 CONFIRMED), 2 test-coverage (CONFIRMED), 2 simplification (CONFIRMED). Zero DATA-LOSS in 5c. Zero invariant-weakening.
+
+Must-address in 5d (or same release):
+- safety/PLAUSIBLE (latent DATA-LOSS for 5d): mover skips cloud entries on SourceNotFoundError from check_drift/move_to_trash by log-and-continue but leaves the manifest row with cloud_trash_id=None. 5d undo dispatch MUST check `cloud_trash_id is not None` before calling Source.restore_from_trash — else a file another client trashed (which caused our 404) gets silently un-trashed on `dc undo`, reversing user intent.
+- correctness/PLAUSIBLE: `cli._build_onedrive_source._refresh_now` drops the rotated refresh_token in MSAL's response and only stashes access_token in an in-memory cache; the on-disk refresh_token becomes stale as soon as Microsoft rotates. Persist the new refresh_token back via TokenStore.save when the response carries one.
+- test-coverage/CONFIRMED: no test proves a multi-entry mid-batch abort flushes the manifest with entries 1..(n-1) stamped as trashed. Add a 3-cloud-entries test where entry 3 raises SourceDriftError and assert on-disk manifest.
+- test-coverage/CONFIRMED: `test_apply_cloud_entry_calls_source_move_to_trash` does not assert check_drift → move_to_trash ORDER via `src.method_calls[0..1]`; a swap regression would pass.
+- correctness/CONFIRMED: CLI apply summary hides skipped cloud entries (no `skipped_cloud` counter surfaced from the mover result dict).
+- simplification/CONFIRMED: `msal.PublicClientApplication` reconstructed on every `_refresh_now` call; cache once per account.
+- simplification/CONFIRMED: OneDrive `check_drift` fall-through to raw Graph eTag is unreachable dead code under 5c's composite-etag emission.
+
+### v0.2 — cloud sources (sub-milestone 5c: Source.move_to_trash wired from mover + pre-trash drift check)
+
+**Sub-milestone 5c Dev delivered** (2026-09-05): 12 new tests (276 → 288 total).  Ruff clean on every changed source and test file.  Zero-behavior-change for local scans; the v0.1.1 rails still run for every `source_id == "local"` entry.
+
+Shipped:
+- `sources/base.py` — new `SourceDriftError(SourceError)` subclass. `Source` protocol gains `check_drift(record) -> None`, default raises `NotImplementedError` for backwards compat with any future source that hasn't wired it yet.  Exported from `sources/__init__.py`.
+- `sources/gdrive.py::GoogleDriveSource.check_drift` — issues `files.get(fileId=..., fields="id,modifiedTime")`, rebuilds the composite `f"{cloud_file_id}:{modifiedTime}"`, compares against `record.etag`. Mismatch → `SourceDriftError`. Source-id + cloud_file_id shape guards fire BEFORE the URL is built (Security pass 7 mirror).
+- `sources/onedrive.py::OneDriveSource.check_drift` — issues `GET /me/drive/items/{id}?$select=id,eTag,lastModifiedDateTime`. Primary check is the composite `f"{cloud_file_id}:{lastModifiedDateTime}"`; the raw Graph `eTag` is checked as a defense-in-depth secondary because Graph does not always echo it on `$select`. Same shape guards + URL encoding as `move_to_trash` / `restore_from_trash`.
+- `sources/local.py::LocalFileSystemSource.check_drift` — mirrors `_verify_unchanged` (size + mtime) via a `Source`-compatible signature. The mover's existing `_verify_unchanged` pathway is what actually runs for local dispatch; this method exists so a caller that wants a uniform `Source.check_drift` interface can use it too.
+- `apply/mover.py::apply_report` — new keyword arg `sources: dict[str, Source] | None = None`. `None` refuses any cloud discard with a clear `ApplyError` up-front (local-only mode). When cloud entries exist the mover looks up each `source_id` in the map, tripwires `is_read_only_scan == False`, runs `check_drift(record)` (aborts on `SourceDriftError`), then `move_to_trash(record)`. Retry logic already lives inside each source's implementation via `tenacity`. Manifest entry stamps `source_id`, `cloud_file_id`, `cloud_trash_id`, `etag`, `original_path` (opaque cloud display string); the tempfile + fsync + `os.replace` + parent-fsync atomic-write pattern applies to cloud entries too. Per-move flush after every successful move preserved (G6 mirror for cloud).
+- `apply/mover.py` — new `plan_cloud_moves(report)` and `_member_to_cloud_record(m)` helpers.  Result dict now reports `planned_local` / `planned_cloud` / `moved_local` / `moved_cloud` alongside legacy `planned` / `moved`.  `cloud_deferred` stays for backcompat but is always 0 in 5c.
+- `apply/mover.py` — batch failure handling per design doc §5.4:
+  - `PathChangedError` (local drift), `SourceDriftError`, `SourceAuthError`, `SourceRateLimitError` — abort mid-apply. Manifest flushed first so entries 1..(n-1) are recoverable via `dc undo`.
+  - `SourceNotFoundError`, `SourcePermissionError`, `OSError` (local `send2trash`) — logged per-entry, apply continues.
+- `cli.py::apply` — builds the `sources` map at apply time by walking `AccountsRegistry.load()` and instantiating `GoogleDriveSource` / `OneDriveSource` per registered account with `is_read_only_scan=False`. Prints the operation summary: `"Moved N local file(s), N cloud file(s) to Trash."` New `--force-refresh` flag proactively refreshes tokens before dispatch. `msal.PublicClientApplication.acquire_token_by_refresh_token` now wires OneDrive token refresh (Security pass 8 finding: `msal` was declared but unused; this is where it lands). Google's `google.oauth2.credentials.Credentials` handles refresh automatically on API calls; `--force-refresh` calls `creds.refresh(Request())` proactively.
+
+Tests shipped:
+- `tests/test_apply_cloud_dispatch.py` (new file, 8 tests):
+  - `test_apply_cloud_entry_calls_source_move_to_trash` — cloud discard invokes check_drift + move_to_trash with the right FileRecord (source_id, cloud_file_id, etag).
+  - `test_apply_cloud_entry_refused_when_source_not_in_map` — mismatched sources map → `ApplyError`, no source method called.
+  - `test_apply_cloud_entry_drift_check_fires` — `SourceDriftError` from check_drift aborts the run; move_to_trash never fires.
+  - `test_apply_cloud_manifest_records_source_metadata` — manifest entry carries source_id, cloud_file_id, cloud_trash_id, etag; trashed_at_path stays null for cloud.
+  - `test_apply_mixed_local_and_cloud` — 2 local + 3 cloud entries; local goes through the trash_fn, cloud through the sources map; manifest has both shapes.
+  - `test_apply_cloud_shared_file_refused` — is_shared=True → refused at validate time before any dispatch.
+  - `test_apply_read_only_source_refused` — is_read_only_scan=True trips BEFORE check_drift fires.
+  - `test_apply_cloud_entry_local_only_mode_refuses` — sources=None with any cloud entry → `ApplyError`.
+- `tests/test_sources_gdrive.py` — 2 new tests:
+  - `test_check_drift_no_change_returns_none` — matching modifiedTime returns None; `fields="id,modifiedTime"` verified.
+  - `test_check_drift_mismatch_raises_source_drift_error` — different modifiedTime → `SourceDriftError`.
+- `tests/test_sources_onedrive.py` — 2 new tests:
+  - `test_check_drift_no_change_returns_none` — matching lastModifiedDateTime returns None; `$select=id,eTag,lastModifiedDateTime` verified.
+  - `test_check_drift_mismatch_raises_source_drift_error` — different lastModifiedDateTime → `SourceDriftError`.
+- `tests/test_mover_source_id_dispatch.py::test_cloud_path_never_resolved` — updated for 5c: injects a MagicMock source; asserts `check_drift`/`move_to_trash` aren't called under dry-run; `cloud_deferred == 0`, `planned_cloud == 1`.
+
+Invariants preserved (all AUDIT_LOG items above):
+- All 276 pre-existing tests still pass unchanged; 12 new tests added (288 total).
+- `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py`.
+- Cloud `Path` NEVER `.resolve()`d in the new dispatch code (regression test locks it via `test_cloud_path_never_resolved`).
+- `is_read_only_scan` tripwire fires BEFORE any HTTP call — asserted by `test_apply_read_only_source_refused`.
+- Drift check happens BEFORE `move_to_trash`; etag mismatch aborts the entire run (not skip-and-continue) — matches design doc §5.4 and AUDIT_LOG invariants.
+- Manifest tempfile + fsync + `os.replace` + parent-fsync pattern preserved for cloud entries; per-move flush after every successful cloud move.
+- `sources/base.py` `check_drift` default raises `NotImplementedError` — existing structurally-typed source implementations without `check_drift` would surface loudly rather than silently skip the drift check.
+- Ruff clean on every changed source and test file. Mypy `--strict` clean on all changed files (pre-existing `unused-ignore` warnings on 3rd-party import stubs are unchanged — documented in sub-milestone 2 notes).
+
+Explicitly deferred to sub-milestone 5d/5e:
+- Wiring `Source.restore_from_trash` from `restore_from_manifest` for cloud manifest rows (undo dispatch).
+- Cross-source scoring (`cloud_when_local_exists`, `is_singleton_across_sources`, `retained_cloud_order`).
+- `FakeCloudSource` end-to-end integration test.
+
 ### v0.2 — cloud sources (sub-milestone 5b: mover source_id dispatch + Part B DATA-LOSS closers)
 
 **Sub-milestone 5b Dev delivered** (2026-09-05): 24 new tests (252 → 276 total). Ruff clean on every changed source file. Alt-C dispatch pattern from design doc §4.2 landed; three latent DATA-LOSS findings from Security pass 7 closed cleanly. `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py`.

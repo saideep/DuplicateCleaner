@@ -23,6 +23,7 @@ from typing import Any
 from duplicate_cleaner.scan.walk import FileRecord
 from duplicate_cleaner.sources.base import (
     SourceAuthError,
+    SourceDriftError,
     SourceError,
     SourceMetadata,
     SourceNotFoundError,
@@ -426,6 +427,47 @@ class GoogleDriveSource:
             owner=record.owner,
             is_shared=record.is_shared,
         )
+
+    def check_drift(self, record: FileRecord) -> None:
+        """Re-fetch ``modifiedTime`` and verify the composite etag matches.
+
+        v0.2 sub-phase 5c: called by the mover immediately before
+        :meth:`move_to_trash`.  Issues a lightweight
+        ``files.get(fileId=..., fields="id,modifiedTime")`` and rebuilds the
+        same ``f"{cloud_file_id}:{modifiedTime}"`` composite that
+        :meth:`list_files` stamps into ``FileRecord.etag`` at scan time.  A
+        mismatch raises :class:`SourceDriftError` — the mover aborts the
+        entire apply run so a stale scan cannot silently trash the wrong file.
+        """
+        if not record.cloud_file_id:
+            raise SourceError(
+                f"{record.path}: cannot check drift without cloud_file_id"
+            )
+        if record.source_id != self.id:
+            raise SourceError(
+                f"FileRecord.source_id {record.source_id!r} does not match "
+                f"this GoogleDriveSource id {self.id!r}."
+            )
+        # Security pass 7 mirror: refuse a suspicious id BEFORE URL build.
+        _validate_cloud_file_id(record.cloud_file_id)
+        try:
+            resp = _drive_call(
+                self.service.files().get(
+                    fileId=record.cloud_file_id,
+                    fields="id,modifiedTime",
+                ).execute
+            )
+        except Exception as exc:
+            _raise_mapped(exc)
+            raise
+        modified = resp.get("modifiedTime") if isinstance(resp, dict) else None
+        current_etag = f"{record.cloud_file_id}:{modified or ''}"
+        if current_etag != record.etag:
+            raise SourceDriftError(
+                f"Cloud etag drift for {record.path}: scan={record.etag!r} "
+                f"now={current_etag!r} — the file changed on the provider "
+                "since scan.  Rescan and retry."
+            )
 
 
 def _parse_rfc3339(value: str) -> float:

@@ -626,3 +626,77 @@ def test_restore_from_trash_refuses_bad_cloud_file_id_shape() -> None:
     with pytest.raises(SourceError) as exc:
         src.restore_from_trash(loc)
     assert "shape" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# v0.2 sub-phase 5c — check_drift.
+# ---------------------------------------------------------------------------
+
+
+def test_check_drift_no_change_returns_none() -> None:
+    """When files.get returns the same modifiedTime, no exception fires."""
+    scan_modified = "2026-09-05T12:34:56.000Z"
+    service = MagicMock()
+    get_request = MagicMock()
+    get_request.execute.return_value = {"id": _REAL_ID, "modifiedTime": scan_modified}
+    service.files.return_value.get.return_value = get_request
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        is_read_only_scan=False,
+        service_factory=lambda _c: service,
+    )
+    from duplicate_cleaner.scan.walk import FileRecord
+
+    rec = FileRecord(
+        path=Path("gdrive:x://foo"),
+        size=1,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="gdrive:x",
+        cloud_file_id=_REAL_ID,
+        etag=f"{_REAL_ID}:{scan_modified}",
+    )
+    # Should NOT raise.
+    src.check_drift(rec)
+    # Verified the ``fields`` query is minimal.
+    call = service.files.return_value.get.call_args
+    assert call.kwargs["fileId"] == _REAL_ID
+    assert call.kwargs["fields"] == "id,modifiedTime"
+
+
+def test_check_drift_mismatch_raises_source_drift_error() -> None:
+    """Different modifiedTime → SourceDriftError."""
+    from duplicate_cleaner.sources.base import SourceDriftError
+
+    scan_modified = "2026-09-05T12:34:56.000Z"
+    new_modified = "2026-09-06T10:00:00.000Z"
+    service = MagicMock()
+    get_request = MagicMock()
+    get_request.execute.return_value = {"id": _REAL_ID, "modifiedTime": new_modified}
+    service.files.return_value.get.return_value = get_request
+    src = GoogleDriveSource(
+        "gdrive:x",
+        credentials=None,
+        is_read_only_scan=False,
+        service_factory=lambda _c: service,
+    )
+    from duplicate_cleaner.scan.walk import FileRecord
+
+    rec = FileRecord(
+        path=Path("gdrive:x://foo"),
+        size=1,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="gdrive:x",
+        cloud_file_id=_REAL_ID,
+        etag=f"{_REAL_ID}:{scan_modified}",
+    )
+    with pytest.raises(SourceDriftError) as exc:
+        src.check_drift(rec)
+    msg = str(exc.value)
+    assert scan_modified in msg or "drift" in msg.lower()
