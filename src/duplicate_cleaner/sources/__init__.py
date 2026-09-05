@@ -8,10 +8,12 @@ from duplicate_cleaner.sources.base import (
     SourceMetadata,
     TrashedLocation,
 )
+from duplicate_cleaner.sources.gdrive import GoogleDriveSource
 from duplicate_cleaner.sources.local import LocalFileSystemSource
 
 __all__ = [
     "ForeignHash",
+    "GoogleDriveSource",
     "LocalFileSystemSource",
     "Source",
     "SourceError",

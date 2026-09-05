@@ -15,6 +15,25 @@ from rich.table import Table
 from duplicate_cleaner import __version__
 from duplicate_cleaner.apply.mover import ApplyError, apply_report
 from duplicate_cleaner.apply.undo import restore_from_manifest
+from duplicate_cleaner.auth import (
+    ACCOUNTS_PATH,
+    BUNDLED_GDRIVE_CLIENT_ID,
+    BUNDLED_GDRIVE_CLIENT_SECRET,
+    GDRIVE_AUTH_URL,
+    GDRIVE_DEFAULT_SCOPES,
+    GDRIVE_FULL_SCOPES,
+    GDRIVE_REVOKE_URL,
+    GDRIVE_TOKEN_URL,
+    AccountEntry,
+    AccountsRegistry,
+    DuplicateAccountError,
+    OAuthFlowError,
+    TokenPermissionError,
+    TokenStore,
+    load_client_secret_json,
+    run_localhost_flow,
+)
+from duplicate_cleaner.auth.oauth_flow import revoke_token
 from duplicate_cleaner.compare.archive import (
     is_archive_path,
     scan_archive,
@@ -55,8 +74,12 @@ from duplicate_cleaner.sys.monitor import (
 app = typer.Typer(help="Intelligent duplicate detection and cleanup.")
 weights_app = typer.Typer(help="Inspect or reset scoring weights.")
 cache_app = typer.Typer(help="Inspect or clear the local hash cache.")
+auth_app = typer.Typer(help="Manage cloud-account OAuth credentials.")
+sources_app = typer.Typer(help="Inspect configured sources.")
 app.add_typer(weights_app, name="weights")
 app.add_typer(cache_app, name="cache")
+app.add_typer(auth_app, name="auth")
+app.add_typer(sources_app, name="sources")
 
 console = Console()
 
@@ -248,8 +271,31 @@ def scan(
             ),
         ),
     ] = False,
+    sources: Annotated[
+        str,
+        typer.Option(
+            "--sources",
+            help=(
+                "Comma-separated source ids (e.g. 'local,gdrive:personal'). "
+                "Default: 'local' only."
+            ),
+        ),
+    ] = "local",
+    max_cloud_download_mb: Annotated[
+        float,
+        typer.Option(
+            "--max-cloud-download-mb",
+            help=(
+                "Cap total cloud bytes downloaded this scan. Buckets whose "
+                "reconciliation would exceed the cap are marked "
+                "not-yet-hashed. Default 1000 MB."
+            ),
+        ),
+    ] = 1000.0,
 ) -> None:
     """Walk, hash, group, score, and write a report."""
+    _ = sources  # sub-phase 2 records the flag; wire-up lands in sub-phase 5.
+    _ = max_cloud_download_mb
     cfg = load_config()
     if not cfg.active_homes:
         console.print(
@@ -607,3 +653,245 @@ def cache_clear() -> None:
     store.clear_cache()
     store.close()
     console.print("[green]Cache cleared.[/green]")
+
+
+def _resolve_client_credentials(
+    type_: str, client_secret: Path | None
+) -> tuple[str, str]:
+    """Return ``(client_id, client_secret)`` — BYO override wins over bundled."""
+    if client_secret is not None:
+        return load_client_secret_json(client_secret)
+    if type_ == "gdrive":
+        return BUNDLED_GDRIVE_CLIENT_ID, BUNDLED_GDRIVE_CLIENT_SECRET
+    raise typer.BadParameter(f"Unknown auth type: {type_}")
+
+
+def _default_account_id(type_: str, label: str | None, existing_ids: list[str]) -> str:
+    """Return a fresh ``id`` following the ``<type>:<label>`` convention."""
+    if label:
+        return f"{type_}:{label}"
+    base = f"{type_}:personal"
+    if base not in existing_ids:
+        return base
+    i = 2
+    while f"{base}-{i}" in existing_ids:
+        i += 1
+    return f"{base}-{i}"
+
+
+@auth_app.command("add")
+def auth_add(
+    type_: Annotated[
+        str,
+        typer.Argument(
+            metavar="TYPE",
+            help="Cloud provider type — currently 'gdrive'.",
+        ),
+    ],
+    label: Annotated[
+        str | None,
+        typer.Option("--label", help="Custom label; becomes the account_id suffix."),
+    ] = None,
+    client_secret: Annotated[
+        Path | None,
+        typer.Option(
+            "--client-secret",
+            help="Optional path to a downloaded Cloud Console client_secret JSON.",
+        ),
+    ] = None,
+    full: Annotated[
+        bool,
+        typer.Option(
+            "--full",
+            help=(
+                "Google only. Request 'drive' scope instead of 'drive.file'. "
+                "Requires additional consent."
+            ),
+        ),
+    ] = False,
+    port_hint: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            help="OAuth callback port hint (0 = random). For testing only.",
+        ),
+    ] = 0,
+) -> None:
+    """Register a cloud account by running the OAuth localhost flow."""
+    if type_ != "gdrive":
+        console.print(f"[red]Unsupported auth type[/red]: {type_}. Only 'gdrive' in sub-phase 2.")
+        raise typer.Exit(2)
+    registry = AccountsRegistry()
+    tokens = TokenStore()
+    account_id = _default_account_id(
+        type_, label, [e.id for e in registry.load()]
+    )
+    try:
+        client_id, secret = _resolve_client_credentials(type_, client_secret)
+    except (ValueError, FileNotFoundError) as e:
+        console.print(f"[red]Failed to load client secret[/red]: {e}")
+        raise typer.Exit(2) from e
+
+    scopes = list(GDRIVE_FULL_SCOPES if full else GDRIVE_DEFAULT_SCOPES)
+    console.print(f"Starting OAuth flow for [cyan]{account_id}[/cyan]…")
+    try:
+        token_data = run_localhost_flow(
+            auth_url_base=GDRIVE_AUTH_URL,
+            client_id=client_id,
+            client_secret=secret or None,
+            scopes=scopes,
+            token_url=GDRIVE_TOKEN_URL,
+            port_hint=port_hint,
+            extra_auth_params={
+                "access_type": "offline",
+                "prompt": "consent",
+                "include_granted_scopes": "true",
+            },
+        )
+    except OAuthFlowError as e:
+        console.print(f"[red]OAuth flow failed[/red]: {e}")
+        raise typer.Exit(1) from e
+
+    token_data.update(
+        {
+            "account_id": account_id,
+            "type": type_,
+            "client_id": client_id,
+            "client_secret": secret,
+        }
+    )
+    tokens.save(account_id, token_data)
+    user_email = str(token_data.get("user_email") or token_data.get("email") or "")
+    try:
+        registry.add(
+            AccountEntry(
+                id=account_id,
+                type=type_,
+                label=label or account_id.split(":", 1)[-1],
+                user=user_email,
+                added_ts=AccountsRegistry.now_ts(),
+            )
+        )
+    except DuplicateAccountError as e:
+        console.print(f"[yellow]Warning[/yellow]: {e}")
+    console.print(
+        f"[green]Authorized[/green] {account_id}"
+        + (f" as {user_email}" if user_email else "")
+    )
+
+
+@auth_app.command("list")
+def auth_list() -> None:
+    """Print all configured accounts (no token values)."""
+    registry = AccountsRegistry()
+    accounts = registry.load()
+    if not accounts:
+        console.print(f"No accounts registered at {ACCOUNTS_PATH}.")
+        return
+    tbl = Table(title="Configured accounts")
+    tbl.add_column("id")
+    tbl.add_column("type")
+    tbl.add_column("user")
+    tbl.add_column("added")
+    for e in accounts:
+        tbl.add_row(e.id, e.type, e.user or "-", e.added_ts or "-")
+    console.print(tbl)
+
+
+@auth_app.command("test")
+def auth_test(
+    account_id: Annotated[str, typer.Argument(help="Account id from `dc auth list`.")],
+) -> None:
+    """Verify a token still works by reading a single file from the provider."""
+    tokens = TokenStore()
+    try:
+        data = tokens.load(account_id)
+    except TokenPermissionError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+    if data is None:
+        console.print(f"[red]No token for[/red] {account_id}. Run `dc auth add`.")
+        raise typer.Exit(1)
+    kind = str(data.get("type", ""))
+    if kind != "gdrive":
+        console.print(f"[yellow]auth test not implemented for type[/yellow]: {kind}")
+        raise typer.Exit(0)
+    try:
+        creds = _google_credentials_from_token(data)
+        # Lazy import so unit tests + no-deps environments can import cli.py.
+        from duplicate_cleaner.sources.gdrive import GoogleDriveSource
+
+        src = GoogleDriveSource(account_id=account_id, credentials=creds)
+        # A trivial 1-item listing exercises token refresh + API round-trip.
+        it = src.list_files()
+        first = next(iter(it), None)
+        console.print(
+            f"[green]OK[/green]: {account_id} — "
+            + (f"first file: {first.path}" if first is not None else "empty drive")
+        )
+    except Exception as e:
+        console.print(f"[red]{account_id} check failed[/red]: {e}")
+        raise typer.Exit(1) from e
+
+
+@auth_app.command("remove")
+def auth_remove(
+    account_id: Annotated[str, typer.Argument(help="Account id to remove.")],
+) -> None:
+    """Best-effort revoke at the provider, delete the token, drop from accounts.toml."""
+    tokens = TokenStore()
+    registry = AccountsRegistry()
+    data = None
+    try:
+        data = tokens.load(account_id)
+    except TokenPermissionError as e:
+        console.print(f"[yellow]Warning[/yellow]: {e}")
+    if data is not None:
+        refresh = str(data.get("refresh_token") or data.get("access_token") or "")
+        kind = str(data.get("type", ""))
+        if refresh and kind == "gdrive":
+            ok = revoke_token(GDRIVE_REVOKE_URL, refresh)
+            if not ok:
+                console.print(
+                    "[yellow]Warning[/yellow]: provider revoke call failed — "
+                    "local token will still be removed."
+                )
+    tokens.delete(account_id)
+    removed = registry.remove(account_id)
+    console.print(
+        f"[green]Removed[/green] {account_id}"
+        + ("" if removed else " (no accounts.toml entry to drop)")
+    )
+
+
+@sources_app.command("list")
+def sources_list() -> None:
+    """List every source id available: 'local' plus each registered cloud account."""
+    tbl = Table(title="Sources")
+    tbl.add_column("id")
+    tbl.add_column("type")
+    tbl.add_column("user")
+    tbl.add_row("local", "local", "-")
+    for e in AccountsRegistry().load():
+        tbl.add_row(e.id, e.type, e.user or "-")
+    console.print(tbl)
+
+
+def _google_credentials_from_token(data: dict[str, object]) -> object:
+    """Build a google.oauth2 Credentials object from a stored token blob."""
+    from google.oauth2.credentials import Credentials  # type: ignore[import-not-found]
+
+    raw_scopes = data.get("scopes")
+    scopes: list[str] = (
+        [str(s) for s in raw_scopes]
+        if isinstance(raw_scopes, list)
+        else list(GDRIVE_DEFAULT_SCOPES)
+    )
+    return Credentials(
+        token=str(data.get("access_token") or ""),
+        refresh_token=str(data.get("refresh_token") or "") or None,
+        token_uri=GDRIVE_TOKEN_URL,
+        client_id=str(data.get("client_id") or ""),
+        client_secret=str(data.get("client_secret") or ""),
+        scopes=scopes,
+    )

@@ -16,6 +16,10 @@ dependencies = [
     "tomli-w>=1.0.0,<2",
     "rich>=13.7.1,<14",
     "psutil>=6.0.0,<7",
+    "google-api-python-client>=2.144.0,<3",
+    "google-auth>=2.35.0,<3",
+    "google-auth-oauthlib>=1.2,<2",
+    "tenacity>=9.0,<10",
 ]
 
 [project.optional-dependencies]

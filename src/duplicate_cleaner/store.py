@@ -487,3 +487,54 @@ class Store:
             "DELETE FROM scan_stage; DELETE FROM cloud_hash_cache;"
         )
         self._conn.commit()
+
+    def get_cloud_hash(
+        self, source_id: str, cloud_file_id: str, etag: str
+    ) -> str | None:
+        """Return a cached BLAKE3 for a cloud file, keyed by (source, id, etag).
+
+        A hit skips a byte-for-byte re-download during reconcile.  Misses are
+        expected whenever etag changes — the row for the old etag remains on
+        disk but is never read again.
+        """
+        cur = self._conn.execute(
+            "SELECT blake3_hash FROM cloud_hash_cache "
+            "WHERE source_id = ? AND cloud_file_id = ? AND etag = ?",
+            (source_id, cloud_file_id, etag),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        h = row["blake3_hash"]
+        return h if isinstance(h, str) else None
+
+    def put_cloud_hash(
+        self,
+        source_id: str,
+        cloud_file_id: str,
+        etag: str,
+        blake3_hash: str,
+        size: int,
+    ) -> None:
+        """Persist a computed BLAKE3 for a cloud file.  Idempotent."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO cloud_hash_cache "
+            "(source_id, cloud_file_id, etag, blake3_hash, computed_ts, size) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (source_id, cloud_file_id, etag, blake3_hash, time.time(), size),
+        )
+        self._conn.commit()
+
+    def purge_stale_cloud_hashes(self, max_age_days: float = 90.0) -> int:
+        """Drop cloud_hash_cache rows older than ``max_age_days``.
+
+        Cheap disk-hygiene sweep — called at scan start so a long-running
+        cache DB never grows without bound.  Cache rows for still-live files
+        are re-populated on the next scan.
+        """
+        cutoff = time.time() - (max_age_days * 86400.0)
+        cur = self._conn.execute(
+            "DELETE FROM cloud_hash_cache WHERE computed_ts < ?", (cutoff,)
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
