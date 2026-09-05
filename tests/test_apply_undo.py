@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from duplicate_cleaner.apply.mover import ApplyError, apply_report
-from duplicate_cleaner.apply.undo import restore_from_manifest
+from duplicate_cleaner.apply.undo import UndoError, restore_from_manifest
 from duplicate_cleaner.paths import trash_dir_for
 from duplicate_cleaner.report.schema import Report, ReportGroup, ReportMember
 
@@ -80,7 +80,10 @@ def test_apply_then_undo_restores_files(tmp_path: Path) -> None:
     manifest = Path(result["manifest_path"])
     assert manifest.exists()
 
-    undo_result = restore_from_manifest(manifest)
+    # H2: allow the tmp-dir Trash as a whitelisted Trash root.
+    undo_result = restore_from_manifest(
+        manifest, allowed_trash_dirs=[fake_trash]
+    )
     assert undo_result["restored"] == 1
     assert undo_result["errors"] == []
     assert (tmp_path / "discard.txt").exists()
@@ -133,7 +136,9 @@ def test_undo_recovers_by_basename_when_trashed_at_path_missing(
     )
 
     result = restore_from_manifest(
-        manifest, trash_dir_resolver=lambda _p: fake_trash
+        manifest,
+        trash_dir_resolver=lambda _p: fake_trash,
+        allowed_trash_dirs=[fake_trash],
     )
     assert result["restored"] == 1
     assert result["errors"] == []
@@ -168,7 +173,9 @@ def test_undo_refuses_to_restore_into_excluded_location(tmp_path: Path) -> None:
     )
 
     result = restore_from_manifest(
-        manifest, trash_dir_resolver=lambda _p: fake_trash
+        manifest,
+        trash_dir_resolver=lambda _p: fake_trash,
+        allowed_trash_dirs=[fake_trash],
     )
     assert result["restored"] == 0
     assert len(result["errors"]) == 1
@@ -225,6 +232,134 @@ def test_apply_refuses_report_with_excluded_or_out_of_root_path(
 
     with pytest.raises(ApplyError):
         apply_report(report_path, commit=False, runs_dir=tmp_path / "runs")
+
+
+def test_undo_refuses_trashed_at_path_outside_trash(tmp_path: Path) -> None:
+    """H2: a poisoned manifest naming ``trashed_at_path`` outside every
+    known Trash directory must be rejected. Without this check, a manifest
+    pointing at ``~/.ssh/id_rsa`` would cause undo to ``shutil.move``
+    that file into a scan root.
+    """
+    # Simulate: an attacker crafts a manifest whose ``trashed_at_path``
+    # points at a sensitive file OUTSIDE any Trash directory.
+    sensitive = tmp_path / "not_a_trash" / "id_rsa_lookalike"
+    sensitive.parent.mkdir()
+    sensitive.write_bytes(b"secret")
+    fake_trash = tmp_path / "fake_trash"
+    fake_trash.mkdir()
+
+    original = tmp_path / "restored_target.txt"
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "created_at": "20260905T000000Z",
+                "entries": [
+                    {
+                        "original_path": str(original),
+                        "size": sensitive.stat().st_size,
+                        "mtime": sensitive.stat().st_mtime,
+                        "hash": "H" * 64,
+                        "trashed_at_path": str(sensitive),
+                    }
+                ],
+            }
+        )
+    )
+
+    result = restore_from_manifest(
+        manifest,
+        trash_dir_resolver=lambda _p: fake_trash,
+        allowed_trash_dirs=[fake_trash],
+    )
+    # Zero restores; the sensitive file is untouched; the original was
+    # never created.
+    assert result["restored"] == 0
+    assert len(result["errors"]) == 1
+    assert "Trash" in result["errors"][0] or "trash" in result["errors"][0].lower()
+    assert sensitive.exists()
+    assert sensitive.read_bytes() == b"secret"
+    assert not original.exists()
+
+
+def test_undo_refuses_manifest_relocating_via_symlink(tmp_path: Path) -> None:
+    """H2: even if ``trashed_at_path`` names something inside a Trash-looking
+    directory, if it's a symlink escaping to outside-Trash, resolve()
+    catches it.
+    """
+    outside = tmp_path / "outside" / "victim.txt"
+    outside.parent.mkdir()
+    outside.write_bytes(b"outside-data")
+
+    fake_trash = tmp_path / "fake_trash"
+    fake_trash.mkdir()
+    # A symlink INSIDE the trash pointing at a file OUTSIDE the trash.
+    symlink_in_trash = fake_trash / "trojan_horse.txt"
+    symlink_in_trash.symlink_to(outside)
+
+    original = tmp_path / "restored_target.txt"
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "created_at": "20260905T000000Z",
+                "entries": [
+                    {
+                        "original_path": str(original),
+                        "size": outside.stat().st_size,
+                        "mtime": outside.stat().st_mtime,
+                        "hash": "H" * 64,
+                        "trashed_at_path": str(symlink_in_trash),
+                    }
+                ],
+            }
+        )
+    )
+
+    result = restore_from_manifest(
+        manifest,
+        trash_dir_resolver=lambda _p: fake_trash,
+        allowed_trash_dirs=[fake_trash],
+    )
+    assert result["restored"] == 0
+    assert len(result["errors"]) == 1
+    # resolve() sees through the symlink; the containment check fails.
+    assert outside.exists()
+    assert not original.exists()
+
+
+def test_undo_refuses_archive_member_original_path(tmp_path: Path) -> None:
+    """H5: manifest containing ``original_path`` with the archive-member
+    separator ``::`` MUST be rejected up-front. Even one poisoned entry
+    aborts the whole restore.
+    """
+    fake_trash = tmp_path / "fake_trash"
+    fake_trash.mkdir()
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "created_at": "20260905T000000Z",
+                "entries": [
+                    {
+                        "original_path": str(tmp_path / "outer.zip") + "::etc/passwd",
+                        "size": 4,
+                        "mtime": 1000.0,
+                        "hash": "H" * 64,
+                        "trashed_at_path": None,
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UndoError):
+        restore_from_manifest(
+            manifest,
+            trash_dir_resolver=lambda _p: fake_trash,
+            allowed_trash_dirs=[fake_trash],
+        )
 
 
 def test_trash_dir_for_boot_volume_vs_external() -> None:

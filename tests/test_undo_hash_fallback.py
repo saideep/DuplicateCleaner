@@ -58,7 +58,9 @@ def test_undo_picks_collision_renamed_file_by_hash(tmp_path: Path) -> None:
     )
 
     result = restore_from_manifest(
-        manifest, trash_dir_resolver=lambda _p: fake_trash
+        manifest,
+        trash_dir_resolver=lambda _p: fake_trash,
+        allowed_trash_dirs=[fake_trash],
     )
     assert result["restored"] == 1, result["errors"]
     assert original.exists()
@@ -101,7 +103,9 @@ def test_undo_refuses_when_two_candidates_share_basename_and_size_but_differ_fro
     )
 
     result = restore_from_manifest(
-        manifest, trash_dir_resolver=lambda _p: fake_trash
+        manifest,
+        trash_dir_resolver=lambda _p: fake_trash,
+        allowed_trash_dirs=[fake_trash],
     )
     assert result["restored"] == 0
     assert not original.exists()
@@ -140,7 +144,9 @@ def test_undo_refuses_ambiguous_hash_match_collision(tmp_path: Path) -> None:
         )
     )
     result = restore_from_manifest(
-        manifest, trash_dir_resolver=lambda _p: fake_trash
+        manifest,
+        trash_dir_resolver=lambda _p: fake_trash,
+        allowed_trash_dirs=[fake_trash],
     )
     assert result["restored"] == 0
     assert not original.exists()
@@ -175,7 +181,9 @@ def test_undo_falls_back_when_manifest_has_no_hash(tmp_path: Path) -> None:
         )
     )
     result = restore_from_manifest(
-        manifest, trash_dir_resolver=lambda _p: fake_trash
+        manifest,
+        trash_dir_resolver=lambda _p: fake_trash,
+        allowed_trash_dirs=[fake_trash],
     )
     assert result["restored"] == 1, result["errors"]
     assert original.read_bytes() == content

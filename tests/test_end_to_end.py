@@ -181,7 +181,9 @@ def test_full_pipeline_scan_apply_undo(tmp_path: Path) -> None:
     # ------------------------------------------------------------------
     original_backup_bytes = (fake_trash / layout.exact_backup.name).read_bytes()
     undo_result = restore_from_manifest(
-        manifest_path, trash_dir_resolver=lambda _p: fake_trash
+        manifest_path,
+        trash_dir_resolver=lambda _p: fake_trash,
+        allowed_trash_dirs=[fake_trash],
     )
     assert undo_result["errors"] == []
     assert undo_result["restored"] == committed["moved"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,27 @@ CONFIG_DIR = Path.home() / ".config" / "duplicate_cleaner"
 CONFIG_PATH = CONFIG_DIR / "config.toml"
 WEIGHTS_PATH = CONFIG_DIR / "weights.json"
 
+# Default macOS bundle extensions — directories whose names end in one of
+# these are hashed as a single atomic unit rather than descended into.
+DEFAULT_BUNDLE_EXTENSIONS: tuple[str, ...] = (
+    ".app",
+    ".pages",
+    ".numbers",
+    ".keynote",
+    ".rtfd",
+    ".sparsebundle",
+    ".xcodeproj",
+    ".playground",
+    ".framework",
+    ".bundle",
+)
+
+
+def _default_max_workers() -> int:
+    """Half the reported CPU count, floor 1 — leaves the machine responsive."""
+    cpu = os.cpu_count() or 2
+    return max(1, cpu // 2)
+
 
 class Config(BaseModel):
     """User-editable configuration."""
@@ -25,6 +47,39 @@ class Config(BaseModel):
     min_size_bytes: int = 4096
     exclude_globs: list[str] = Field(default_factory=list)
     follow_symlinks: bool = False
+
+    # v0.1.1 — archive recursion.
+    max_archive_depth: int = 2
+
+    # v0.1.1 — macOS bundle handling.
+    bundle_extensions: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_BUNDLE_EXTENSIONS)
+    )
+
+    # v0.1.1 — system monitoring.
+    max_workers: int = Field(default_factory=_default_max_workers)
+    throttle_on_cpu_pct: float = 85.0
+    min_free_disk_gb: float = 5.0
+
+    @field_validator("max_workers")
+    @classmethod
+    def _validate_max_workers(cls, v: int) -> int:
+        """Floor at 1 — zero workers would deadlock the pipeline."""
+        return max(1, int(v))
+
+    @field_validator("bundle_extensions")
+    @classmethod
+    def _validate_bundle_extensions(cls, v: list[str]) -> list[str]:
+        """Normalise to lower-case, dot-prefixed extensions."""
+        out: list[str] = []
+        for raw in v:
+            s = str(raw).strip().lower()
+            if not s:
+                continue
+            if not s.startswith("."):
+                s = "." + s
+            out.append(s)
+        return out
 
     @field_validator("active_homes")
     @classmethod
@@ -69,6 +124,27 @@ exclude_globs = []
 
 # Follow symlinks during walk. Default false to avoid loops and duplicates.
 follow_symlinks = false
+
+# Archive recursion — how many levels of archive-in-archive to descend.
+# Depth 1 = recurse only the outer archive. Depth 2 recurses one level of
+# nested archives. Archives at depth > max_archive_depth are hashed as
+# opaque blobs, not descended into.
+max_archive_depth = 2
+
+# macOS bundles are directories the walker treats as single files.
+# bundle_extensions = [".app", ".pages", ".numbers", ".keynote", ".rtfd",
+#                     ".sparsebundle", ".xcodeproj", ".playground",
+#                     ".framework", ".bundle"]
+
+# System monitoring — how polite the scanner is on your machine.
+# max_workers — thread cap for hashing. Default: os.cpu_count() // 2.
+# max_workers = 4
+# throttle_on_cpu_pct — sleep between hash batches when system CPU exceeds
+# this percentage. Set to 100 to disable throttling. Default: 85.
+# throttle_on_cpu_pct = 85
+# min_free_disk_gb — refuse to scan if free space on the cache volume is
+# below this threshold. Default: 5 GB.
+# min_free_disk_gb = 5
 """
 
 

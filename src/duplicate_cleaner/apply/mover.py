@@ -11,6 +11,10 @@ from typing import Any
 
 import send2trash  # type: ignore[import-untyped]
 
+from duplicate_cleaner.compare.archive import (
+    ARCHIVE_SEP,
+    is_virtual_archive_path,
+)
 from duplicate_cleaner.paths import (
     is_within,
     resolve_for_check,
@@ -55,6 +59,12 @@ def _validate_report_paths(report: Report) -> list[Path]:
     check runs — otherwise every discard path would pass ``is_within``
     against ``/``.
     """
+    if report.discover:
+        raise ApplyError(
+            "Refusing to apply: report is in --discover mode "
+            "(no keepers proposed). Re-run `dc scan` without --discover to "
+            "produce an actionable report."
+        )
     if not report.roots:
         raise ApplyError(
             "Report has no scan roots recorded; refusing to apply. "
@@ -72,6 +82,18 @@ def _validate_report_paths(report: Report) -> list[Path]:
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
                 continue
+            path_str = str(m.path)
+            # v0.1.1: a virtual archive-member path (``outer.zip::inner``)
+            # is NEVER a legal discard target. The only way to reclaim
+            # bytes from a duplicated archive is to trash the whole outer
+            # archive — which is a real on-disk path without ``::``.
+            if is_virtual_archive_path(path_str):
+                raise ApplyError(
+                    "Refusing to trash archive member: "
+                    f"{path_str} contains the '{ARCHIVE_SEP}' virtual path "
+                    "separator. Only whole archives may be discarded — see "
+                    "the archive-whole groups."
+                )
             path = Path(m.path)
             resolved = resolve_for_check(path)
             try:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,6 +66,8 @@ class ScoredMember:
     signals: list[tuple[str, float]] = field(default_factory=list)
     is_proposed_keeper: bool = False
     is_informational: bool = False
+    is_archive_member: bool = False
+    is_bundle: bool = False
 
 
 @dataclass
@@ -121,7 +124,7 @@ def _is_git_repo_clean(path: Path, cache: dict[Path, bool]) -> bool:
         if cached is not None:
             return cached
         try:
-            result = subprocess.run(  # noqa: S603
+            result = subprocess.run(
                 ["git", "-C", str(parent), "status", "--porcelain"],
                 capture_output=True,
                 text=True,
@@ -145,8 +148,14 @@ def score_group(
     config: Config,
     weights: dict[str, float],
     git_clean_cache: dict[Path, bool] | None = None,
+    clone_id_lookup: Callable[[Path], int | None] | None = None,
 ) -> list[ScoredMember]:
-    """Score every member; mark the highest-scoring non-informational as keeper."""
+    """Score every member; mark the highest-scoring non-informational as keeper.
+
+    ``clone_id_lookup`` overrides :func:`sys.apfs.get_clone_id`; tests
+    inject their own to simulate APFS clone families without needing a
+    real APFS volume.
+    """
     members: list[ScoredMember] = [
         ScoredMember(
             path=h.path,
@@ -156,19 +165,52 @@ def score_group(
             dev=h.dev,
             nlink=h.nlink,
             hash=h.full_hash,
+            is_archive_member=h.is_archive_member,
+            is_bundle=h.is_bundle,
         )
         for h in group.members
     ]
 
-    # Hard-link / APFS-clone detection: two-pass so every member of an
-    # inode family is marked informational (not just the second-seen ones).
+    # Archive members are always informational — never a keeper, never a
+    # discard candidate. The mover-level whole-archive proposal is what
+    # actually reclaims space when every member is a duplicate elsewhere.
+    for m in members:
+        if m.is_archive_member:
+            m.is_informational = True
+
+    # Hard-link detection: two-pass so every member of an inode family is
+    # marked informational (not just the second-seen ones). Archive members
+    # are excluded — they don't map to a real inode.
     id_counts: dict[tuple[int, int], int] = {}
     for m in members:
+        if m.is_archive_member:
+            continue
         key = (m.dev, m.inode)
         id_counts[key] = id_counts.get(key, 0) + 1
     for m in members:
+        if m.is_archive_member:
+            continue
         if id_counts[(m.dev, m.inode)] > 1:
             m.is_informational = True
+
+    # APFS clone lineage detection: two files sharing a clone id share
+    # bytes on disk. Two-pass, same shape as the hard-link check, so a
+    # whole clone family is marked informational. The lookup is opt-in —
+    # callers that don't pass one skip clone detection entirely so tests
+    # against non-clone corpora stay deterministic.
+    if clone_id_lookup is not None:
+        clone_ids: dict[int, list[ScoredMember]] = {}
+        for m in members:
+            if m.is_archive_member:
+                continue
+            cid = clone_id_lookup(m.path)
+            if cid is None or cid == 0:
+                continue
+            clone_ids.setdefault(cid, []).append(m)
+        for _cid, family in clone_ids.items():
+            if len(family) > 1:
+                for m in family:
+                    m.is_informational = True
 
     non_info = [m for m in members if not m.is_informational]
     # If the entire group is one hardlink family, propose no keeper — the
@@ -280,12 +322,20 @@ def score_groups(
     groups: list[Group],
     config: Config,
     weights: dict[str, float],
+    *,
+    clone_id_lookup: Callable[[Path], int | None] | None = None,
 ) -> list[ScoredGroup]:
     """Score every group; compute reclaim bytes."""
     scored: list[ScoredGroup] = []
     git_clean_cache: dict[Path, bool] = {}
     for g in groups:
-        members = score_group(g, config, weights, git_clean_cache=git_clean_cache)
+        members = score_group(
+            g,
+            config,
+            weights,
+            git_clean_cache=git_clean_cache,
+            clone_id_lookup=clone_id_lookup,
+        )
         reclaim = sum(
             m.size
             for m in members

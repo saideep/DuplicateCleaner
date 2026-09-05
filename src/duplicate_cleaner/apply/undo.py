@@ -11,7 +11,10 @@ from typing import Any
 
 import blake3  # type: ignore[import-untyped]
 
+from duplicate_cleaner.compare.archive import ARCHIVE_SEP
 from duplicate_cleaner.paths import (
+    is_within,
+    known_trash_dirs,
     resolve_for_check,
     trash_dir_for,
     validate_not_excluded,
@@ -126,6 +129,7 @@ def restore_from_manifest(
     manifest_path: Path,
     *,
     trash_dir_resolver: TrashResolver | None = None,
+    allowed_trash_dirs: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Move each manifest entry from its trashed_at_path back to original_path.
 
@@ -134,12 +138,30 @@ def restore_from_manifest(
     * Every entry's ``original_path`` is validated against EXCLUDED_ROOTS
       BEFORE any filesystem write. A poisoned or altered manifest cannot
       trick undo into restoring into ``/System``, ``~/Library``, etc.
+    * H5: every entry's ``original_path`` is rejected if it contains the
+      archive-member separator (``::``). The mover already refuses to trash
+      archive members individually — undo must be symmetric.
+    * H2: every source path (``trashed_at_path`` or a candidate from the
+      basename fallback) must resolve into one of the platform's known
+      Trash directories (``~/.Trash``, ``/Volumes/*/.Trashes/<uid>/``).
+      Without this check, a poisoned manifest could point ``trashed_at_path``
+      at ``~/.ssh/id_rsa`` and undo would ``shutil.move`` that file into a
+      scan root.
     * When the manifest lacks a ``trashed_at_path`` (crash mid-apply), we
       pick the correct Trash directory for the original — ``~/.Trash`` for
       the boot volume, ``/Volumes/<VOL>/.Trashes/<uid>/`` for externals —
       and locate the trashed file by (basename, size).
+
+    ``allowed_trash_dirs`` overrides the production Trash-directory list —
+    tests inject a temp-directory Trash so end-to-end undo flows don't
+    require a real ``~/.Trash`` write.
     """
     resolve_trash = trash_dir_resolver or trash_dir_for
+    trash_roots: list[Path] = (
+        [resolve_for_check(p) for p in allowed_trash_dirs]
+        if allowed_trash_dirs is not None
+        else known_trash_dirs()
+    )
 
     data = json.loads(manifest_path.read_text())
     entries: list[dict[str, Any]] = data.get("entries", [])
@@ -158,6 +180,28 @@ def restore_from_manifest(
                 raise UndoError(
                     f"Refuse to restore: manifest.roots entry rejected — {e}"
                 ) from e
+
+    # H5: reject entries whose ``original_path`` includes the archive-member
+    # separator ``::`` — the mover would never trash an archive member
+    # individually, so a manifest that claims one must be malformed or
+    # poisoned. Raising up-front prevents restore-time creation of
+    # ``foo.zip::etc/passwd``-shaped directories.
+    offending = [
+        entry.get("original_path")
+        for entry in entries
+        if isinstance(entry.get("original_path"), str)
+        and ARCHIVE_SEP in entry["original_path"]
+    ]
+    if offending:
+        raise UndoError(
+            "Refuse to restore: manifest contains archive-member original_path "
+            f"entries (contain {ARCHIVE_SEP!r}): {offending}"
+        )
+
+    def _src_is_in_trash(src: Path) -> bool:
+        """Contain check — src.resolve() must sit inside a known Trash dir."""
+        resolved = resolve_for_check(src)
+        return any(is_within(resolved, root) for root in trash_roots)
 
     restored = 0
     errors: list[str] = []
@@ -186,9 +230,16 @@ def restore_from_manifest(
             candidate = Path(trashed_at_raw)
             if candidate.exists():
                 # trashed_at_path was recorded at trash time — trust it.
-                # Hash verification only runs on the fallback path where
-                # we're picking a candidate out of the Trash by basename,
-                # not on an explicit source recorded by the mover itself.
+                # H2: still require it to resolve inside a known Trash dir.
+                # A poisoned manifest may otherwise coerce undo into moving
+                # arbitrary user files (~/.ssh/id_rsa, ...).
+                if not _src_is_in_trash(candidate):
+                    errors.append(
+                        f"Refuse to restore: trashed_at_path {candidate} "
+                        f"is not inside a known Trash directory "
+                        f"({[str(r) for r in trash_roots]})"
+                    )
+                    continue
                 src = candidate
         if src is None:
             trash = resolve_trash(original)
@@ -201,6 +252,16 @@ def restore_from_manifest(
                 )
             except UndoError as e:
                 errors.append(str(e))
+                continue
+            # H2: apply the same containment check to fallback candidates.
+            # Even if ``resolve_trash`` was overridden, the located file
+            # must physically resolve into a whitelisted Trash root.
+            if src is not None and not _src_is_in_trash(src):
+                errors.append(
+                    f"Refuse to restore: located source {src} is not "
+                    f"inside a known Trash directory "
+                    f"({[str(r) for r in trash_roots]})"
+                )
                 continue
 
         if src is None:

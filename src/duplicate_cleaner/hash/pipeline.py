@@ -33,6 +33,8 @@ class HashedRecord:
     dev: int
     nlink: int
     full_hash: str
+    is_archive_member: bool = False
+    is_bundle: bool = False
 
 
 def _hash_partial(path: Path, size: int) -> str:
@@ -60,6 +62,8 @@ def _hash_full(path: Path) -> str:
 def hash_records(
     records: Iterable[FileRecord],
     store: Store,
+    *,
+    include_singletons: bool = False,
 ) -> Iterator[HashedRecord]:
     """Two-pass streaming: stage every walker row into SQLite, then hash by size bucket.
 
@@ -76,8 +80,29 @@ def hash_records(
     """
     scan_id = store.new_scan_id()
     store.sweep_stale_scan_stage()
+    # Records that arrive with a hash already computed (archive members,
+    # bundle roll-ups) are yielded directly and never enter the staging
+    # table — they cannot benefit from size-bucket pruning because their
+    # ``path`` may be virtual (contains ``::``) and they don't map to a
+    # single on-disk file the pipeline could re-hash.
+    prehashed: list[HashedRecord] = []
     staged = 0
     for rec in records:
+        if rec.precomputed_full_hash is not None:
+            prehashed.append(
+                HashedRecord(
+                    path=rec.path,
+                    size=rec.size,
+                    mtime=rec.mtime,
+                    inode=rec.inode,
+                    dev=rec.dev,
+                    nlink=rec.nlink,
+                    full_hash=rec.precomputed_full_hash,
+                    is_archive_member=rec.is_archive_member,
+                    is_bundle=rec.is_bundle,
+                )
+            )
+            continue
         store.stage_record(
             rec.path,
             scan_id=scan_id,
@@ -91,8 +116,25 @@ def hash_records(
         if staged % _STAGE_FLUSH_INTERVAL == 0:
             store.commit()
     store.commit()
+    yield from prehashed
 
     try:
+        if include_singletons:
+            # Yield synthetic HashedRecords for size-singleton files. They
+            # never enter the partial/full-hash stages; the marker prefix
+            # keeps them out of legitimate hash groups downstream, while
+            # still surfacing them for the singleton section of the report.
+            for row in store.iter_singleton_stage_records(scan_id):
+                path_str, size, mtime, inode, dev, nlink = row
+                yield HashedRecord(
+                    path=Path(path_str),
+                    size=size,
+                    mtime=mtime,
+                    inode=inode,
+                    dev=dev,
+                    nlink=nlink,
+                    full_hash=f"singleton-by-size:{size}:{path_str}",
+                )
         for bucket in store.iter_duplicate_size_buckets(scan_id):
             group = [
                 FileRecord(
@@ -105,14 +147,19 @@ def hash_records(
                 )
                 for path, size, mtime, inode, dev, nlink in bucket
             ]
-            yield from _hash_size_bucket(group, store)
+            yield from _hash_size_bucket(
+                group, store, include_singletons=include_singletons
+            )
     finally:
         # Always drop this scan's staged rows — even on generator abort.
         store.clear_scan_stage(scan_id)
 
 
 def _hash_size_bucket(
-    group: list[FileRecord], store: Store
+    group: list[FileRecord],
+    store: Store,
+    *,
+    include_singletons: bool = False,
 ) -> Iterator[HashedRecord]:
     # For each record: fetch (partial, full) from cache; compute partial if missing.
     with_partial: list[tuple[FileRecord, str, str | None]] = []
@@ -143,8 +190,28 @@ def _hash_size_bucket(
     for rec, partial, cached_full in with_partial:
         by_partial[partial].append((rec, cached_full))
 
-    for sub in by_partial.values():
+    for partial, sub in by_partial.items():
         if len(sub) < 2:
+            # H7: a size-collided file with a unique partial hash cannot be
+            # a duplicate, but it MUST still surface as a singleton — the
+            # old code silently dropped these because
+            # ``iter_singleton_stage_records`` only yielded files whose
+            # SIZE bucket had exactly one member. Emit a synthetic
+            # HashedRecord marked with a "singleton-by-partial" fake hash
+            # so the downstream cli singleton loop picks it up.
+            if include_singletons:
+                for rec, _cached_full in sub:
+                    yield HashedRecord(
+                        path=rec.path,
+                        size=rec.size,
+                        mtime=rec.mtime,
+                        inode=rec.inode,
+                        dev=rec.dev,
+                        nlink=rec.nlink,
+                        full_hash=(
+                            f"singleton-by-partial:{partial}:{rec.path}"
+                        ),
+                    )
             continue
         for rec, cached_full in sub:
             full = cached_full

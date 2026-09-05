@@ -61,6 +61,18 @@ Verify the CLI is available:
 uv run dc --help
 ```
 
+## Step 3.5: Verify `psutil` is installed
+
+`uv sync` pulls `psutil` in as a runtime dependency (it drives the live progress bar and the CPU-throttling monitor). Double-check the wheel is present:
+
+```shell
+uv run python -c "import psutil; print(psutil.__version__)"
+```
+
+You should see a version string. If the import fails, re-run `uv sync` — the wheel is Apple Silicon native and installs from the lockfile.
+
+`psutil` on macOS reads CPU, memory, and disk metrics through public sysctl and IOKit interfaces. Nothing prompts for a keychain password on the first scan, and `dc scan` does not request Full Disk Access beyond what macOS already grants Terminal for the paths you pass it.
+
 ## Step 4: First-run config
 
 Generate the default config file:
@@ -91,9 +103,23 @@ Run your first scan against a real directory. `dc scan` never modifies files —
 uv run dc scan ~/Documents ~/Desktop --report ~/dc-report
 ```
 
+While the scan is running you will see a live progress bar in the terminal that looks roughly like:
+
+```text
+Scanning  42% ━━━━━━━━━━━━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━  12,438 files  CPU 62%  RAM 184 MB  free-disk 128 GB
+```
+
+The four live counters — files processed, CPU %, RAM MB, and free disk GB — are refreshed a few times per second and give you an at-a-glance sense of the scan's footprint on the machine. If you want a lower footprint, lower `max_workers` in the config; if you want maximum throughput, raise `throttle_on_cpu_pct` toward `100`.
+
+If you would rather enumerate a drive without any deletion proposals — useful for surveying an unfamiliar external drive — pass `--discover`:
+
+```shell
+uv run dc scan --discover /Volumes/OldDrive --report ~/dc-survey
+```
+
 Output:
 
-- `~/dc-report/report.html` — the human review view.
+- `~/dc-report/report.html` — the human review view. Includes a "Unique files" section for singletons alongside the duplicate groups.
 - `~/dc-report/report.json` — the machine-readable decision list. You can hand-edit this before `apply`.
 
 ## Step 6: Review the HTML report
@@ -164,6 +190,19 @@ This overwrites `~/.config/duplicate_cleaner/config.toml` with the defaults. Rem
 ### `dc` command not found
 
 You need to prefix commands with `uv run` unless you have activated the venv (`source .venv/bin/activate`). Inside the venv, `dc` works directly.
+
+### Scan refuses to start: "insufficient free disk"
+
+`dc scan` runs a pre-flight check on the cache volume (where `~/.cache/duplicate_cleaner/cache.db` lives) and refuses to start if free space is below `min_free_disk_gb` (default `5` GB). Two ways to resolve:
+
+1. Free space on the volume — empty the Trash, clear browser caches, offload large files — until you are above the threshold.
+2. Lower the threshold in `~/.config/duplicate_cleaner/config.toml`:
+
+   ```toml
+   min_free_disk_gb = 2
+   ```
+
+   Only lower it if you understand the consequences of running the cache volume near-empty.
 
 ### Homebrew python conflicts with system python
 

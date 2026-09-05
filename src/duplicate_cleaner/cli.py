@@ -15,6 +15,10 @@ from rich.table import Table
 from duplicate_cleaner import __version__
 from duplicate_cleaner.apply.mover import ApplyError, apply_report
 from duplicate_cleaner.apply.undo import restore_from_manifest
+from duplicate_cleaner.compare.archive import (
+    is_archive_path,
+    scan_archive,
+)
 from duplicate_cleaner.compare.exact import group_by_hash
 from duplicate_cleaner.config import (
     CONFIG_PATH,
@@ -24,18 +28,28 @@ from duplicate_cleaner.config import (
     write_default_config,
     write_default_weights,
 )
-from duplicate_cleaner.hash.pipeline import hash_records
+from duplicate_cleaner.hash.pipeline import HashedRecord, hash_records
 from duplicate_cleaner.paths import validate_scan_root_candidate
 from duplicate_cleaner.report.render import render_report
 from duplicate_cleaner.report.schema import (
+    ArchiveSkipEntry,
     Report,
     ReportGroup,
     ReportMember,
     ReportSignal,
+    SingletonEntry,
 )
-from duplicate_cleaner.scan.walk import FileRecord, iter_files
+from duplicate_cleaner.scan.walk import FileRecord, WalkStats, iter_files
 from duplicate_cleaner.score.rules import score_groups
-from duplicate_cleaner.store import Store
+from duplicate_cleaner.store import CACHE_DIR, Store
+from duplicate_cleaner.sys.apfs import get_clone_id
+from duplicate_cleaner.sys.monitor import (
+    DiskSpaceError,
+    be_polite,
+    check_free_disk,
+    maybe_throttle,
+    sample_resources,
+)
 
 app = typer.Typer(help="Intelligent duplicate detection and cleanup.")
 weights_app = typer.Typer(help="Inspect or reset scoring weights.")
@@ -91,6 +105,112 @@ def init() -> None:
     )
 
 
+def _expand_archive_members(
+    rec: FileRecord,
+    max_depth: int,
+    archive_paths: list[Path],
+    member_hashes_by_archive: dict[str, list[str]],
+    archive_skips: list[ArchiveSkipEntry],
+    skipped_outer_archives: set[str],
+) -> Iterator[FileRecord]:
+    """Yield synthetic FileRecords for every readable member of ``rec``.
+
+    ``rec`` is a real on-disk archive. ``archive_paths`` accumulates every
+    on-disk archive processed so the post-processing pass can build the
+    whole-archive-delete proposals. Skips are recorded for the report and
+    also indexed by outer-archive path in ``skipped_outer_archives`` — the
+    whole-delete evaluator uses that index to guarantee no archive with an
+    encrypted/corrupt/too-large member is ever proposed (H1).
+    """
+    result = scan_archive(rec.path, max_depth=max_depth)
+    if result.members:
+        archive_paths.append(rec.path)
+        member_hashes_by_archive[str(rec.path)] = [
+            m.full_hash for m in result.members
+        ]
+    for m in result.members:
+        yield FileRecord(
+            path=Path(m.virtual_path),
+            size=m.size,
+            mtime=rec.mtime,
+            inode=0,
+            dev=0,
+            nlink=0,
+            is_archive_member=True,
+            precomputed_full_hash=m.full_hash,
+        )
+    if result.skips:
+        # H1: attribute every skip to its outer on-disk archive path. The
+        # outer path is the ``rec.path`` we just walked; any skip anywhere
+        # in its member tree disqualifies the whole archive from
+        # whole-delete. ``outer_archive_of`` handles both the "corrupt at
+        # depth 1" case (skip.path == str(rec.path)) and the nested case
+        # (skip.path == "outer.zip::mid.zip::..."), because the on-disk
+        # outer archive is always the first segment.
+        skipped_outer_archives.add(str(rec.path))
+    for s in result.skips:
+        archive_skips.append(
+            ArchiveSkipEntry(path=s.path, reason=s.reason, error=s.error)
+        )
+
+
+def _build_whole_archive_groups(
+    archive_paths: list[Path],
+    member_hashes_by_archive: dict[str, list[str]],
+    real_file_hashes: set[str],
+    archive_own_hashes: dict[str, str],
+    archive_sizes: dict[str, int],
+    archive_mtimes: dict[str, float],
+    skipped_outer_archives: set[str],
+) -> list[ReportGroup]:
+    """Emit a one-member "whole-archive-delete" ReportGroup per redundant archive.
+
+    Only fires when every member's hash is present as a non-archive on-disk
+    file elsewhere in the scan AND the archive's walk produced no skips
+    (H1). Groups have kind ``"archive-whole"`` and a single member marked
+    as a discard target — the mover trashes it and the contents are
+    recoverable from the surviving on-disk copies.
+    """
+    from duplicate_cleaner.compare.archive import find_wholly_duplicated_archives
+
+    proposals = find_wholly_duplicated_archives(
+        archive_paths=archive_paths,
+        member_hashes_by_archive=member_hashes_by_archive,
+        hashes_with_ondisk_copy=real_file_hashes,
+        skipped_archives=skipped_outer_archives,
+    )
+    groups: list[ReportGroup] = []
+    for i, path in enumerate(proposals):
+        key = str(path)
+        h = archive_own_hashes.get(key, "")
+        size = archive_sizes.get(key, 0)
+        mtime = archive_mtimes.get(key, 0.0)
+        signal = ReportSignal(
+            name="every member duplicated on-disk", contribution=-1.0
+        )
+        member = ReportMember(
+            path=path,
+            size=size,
+            mtime=mtime,
+            hash=h or "",
+            score=-1.0,
+            signals=[signal],
+            is_proposed_keeper=False,
+            is_informational=False,
+        )
+        groups.append(
+            ReportGroup(
+                id=f"archive-{i:04d}",
+                kind="archive-whole",
+                size=size,
+                hash=h or f"archive-{i:04d}",
+                reclaim_bytes=size,
+                members=[member],
+            )
+        )
+    return groups
+
+
 @app.command()
 def scan(
     roots: Annotated[
@@ -117,6 +237,16 @@ def scan(
         list[str] | None,
         typer.Option("--exclude", help="Extra exclude glob (repeatable)."),
     ] = None,
+    discover: Annotated[
+        bool,
+        typer.Option(
+            "--discover",
+            help=(
+                "Enumeration-only mode. No keepers proposed and dc apply "
+                "will refuse to run against the resulting report."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Walk, hash, group, score, and write a report."""
     cfg = load_config()
@@ -148,10 +278,29 @@ def scan(
             update={"exclude_globs": [*cfg.exclude_globs, *exclude]}
         )
 
+    # Pre-scan disk-space check — abort BEFORE we start hashing so an
+    # already-full cache volume doesn't get any worse.
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        check_free_disk(CACHE_DIR, cfg.min_free_disk_gb)
+    except DiskSpaceError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(2) from e
+
+    # Politeness — best-effort re-nice + I/O tier bump.
+    be_polite()
+
     weights = load_weights()
     store = Store()
 
     file_count = 0
+    archive_paths: list[Path] = []
+    member_hashes_by_archive: dict[str, list[str]] = {}
+    archive_skips: list[ArchiveSkipEntry] = []
+    # H1: on-disk outer-archive paths whose walk produced ≥1 skip. Any
+    # archive listed here is ineligible for whole-archive-delete.
+    skipped_outer_archives: set[str] = set()
+    walk_stats = WalkStats()
 
     with Progress(
         SpinnerColumn(),
@@ -167,16 +316,55 @@ def scan(
                 follow_symlinks=cfg.follow_symlinks,
                 exclude_globs=cfg.exclude_globs,
                 min_size_bytes=cfg.min_size_bytes,
+                bundle_extensions=cfg.bundle_extensions,
+                stats=walk_stats,
             ):
                 file_count += 1
                 if file_count % 500 == 0:
+                    snap = sample_resources(
+                        process=None,
+                        scan_path=roots[0],
+                        files_processed=file_count,
+                    )
                     progress.update(
-                        walk_task, description=f"Walked {file_count} files…"
+                        walk_task,
+                        description=(
+                            f"Walked {file_count} files · CPU "
+                            f"{snap.cpu_pct:.0f}% · RSS "
+                            f"{snap.rss_bytes // (1024 * 1024)} MB · "
+                            f"free disk {snap.free_disk_gb:.1f} GB"
+                        ),
+                    )
+                    # H6: reuse the cpu_pct from ``sample_resources`` — two
+                    # back-to-back ``psutil.cpu_percent(interval=None)`` calls
+                    # share an accumulator, so the second reading is ~0 and
+                    # the throttle never fires. One sample per iteration.
+                    maybe_throttle(
+                        cfg.throttle_on_cpu_pct, cpu_pct=snap.cpu_pct
                     )
                 yield rec
+                # Fan out archive members into synthetic virtual records so
+                # the exact-duplicate pipeline can group them alongside
+                # real on-disk files.
+                if not rec.is_bundle and is_archive_path(rec.path):
+                    yield from _expand_archive_members(
+                        rec,
+                        cfg.max_archive_depth,
+                        archive_paths,
+                        member_hashes_by_archive,
+                        archive_skips,
+                        skipped_outer_archives,
+                    )
 
-        hashed_iter = hash_records(_walk_iter(), store)
-        groups = list(group_by_hash(hashed_iter, min_size_bytes=cfg.min_size_bytes))
+        hashed_iter = hash_records(
+            _walk_iter(), store, include_singletons=True
+        )
+        # Materialise so we can index singletons AND groups without
+        # re-walking the tree.
+        all_hashed: list[HashedRecord] = list(hashed_iter)
+        groups = list(
+            group_by_hash(iter(all_hashed), min_size_bytes=cfg.min_size_bytes)
+        )
         progress.update(
             walk_task,
             description=(
@@ -184,7 +372,27 @@ def scan(
             ),
         )
 
-    scored = score_groups(groups, cfg, weights)
+    scored = score_groups(
+        groups, cfg, weights, clone_id_lookup=get_clone_id
+    )
+
+    # Real (on-disk, non-archive-member) hashes are the alternative pool
+    # used to decide whether a whole archive can be safely proposed for
+    # discard.
+    real_file_hashes: set[str] = set()
+    archive_own_hashes: dict[str, str] = {}
+    archive_sizes: dict[str, int] = {}
+    archive_mtimes: dict[str, float] = {}
+    for h in all_hashed:
+        if h.is_archive_member:
+            continue
+        real_file_hashes.add(h.full_hash)
+        # Record the on-disk hash and size for each archive path so the
+        # archive-whole proposal has full metadata.
+        if is_archive_path(h.path):
+            archive_own_hashes[str(h.path)] = h.full_hash
+            archive_sizes[str(h.path)] = h.size
+            archive_mtimes[str(h.path)] = h.mtime
 
     report_groups: list[ReportGroup] = []
     total_reclaim = 0
@@ -199,28 +407,73 @@ def scan(
                 signals=[
                     ReportSignal(name=n, contribution=c) for n, c in m.signals
                 ],
-                is_proposed_keeper=m.is_proposed_keeper,
+                is_proposed_keeper=m.is_proposed_keeper and not discover,
                 is_informational=m.is_informational,
+                is_archive_member=m.is_archive_member,
+                is_bundle=m.is_bundle,
             )
             for m in sg.members
         ]
         store.record_group(
             "exact",
             [
-                (m.path, m.score, m.is_proposed_keeper, m.is_informational)
+                (m.path, m.score, m.is_proposed_keeper and not discover, m.is_informational)
                 for m in sg.members
             ],
         )
         report_groups.append(
             ReportGroup(
                 id=sg.id,
+                kind="exact",
                 hash=sg.hash,
                 size=sg.size,
-                reclaim_bytes=sg.reclaim_bytes,
+                reclaim_bytes=0 if discover else sg.reclaim_bytes,
                 members=members,
             )
         )
-        total_reclaim += sg.reclaim_bytes
+        if not discover:
+            total_reclaim += sg.reclaim_bytes
+
+    # Archive-whole proposals (skipped in discover mode).
+    if not discover:
+        archive_groups = _build_whole_archive_groups(
+            archive_paths=archive_paths,
+            member_hashes_by_archive=member_hashes_by_archive,
+            real_file_hashes=real_file_hashes,
+            archive_own_hashes=archive_own_hashes,
+            archive_sizes=archive_sizes,
+            archive_mtimes=archive_mtimes,
+            skipped_outer_archives=skipped_outer_archives,
+        )
+        for ag in archive_groups:
+            report_groups.append(ag)
+            total_reclaim += ag.reclaim_bytes
+
+    # Singletons — hashes that appear exactly once across the whole scan,
+    # excluding archive members (which are informational by construction).
+    hash_counts: dict[str, int] = {}
+    for h in all_hashed:
+        if h.is_archive_member:
+            continue
+        hash_counts[h.full_hash] = hash_counts.get(h.full_hash, 0) + 1
+    singletons: list[SingletonEntry] = []
+    seen_singleton_hashes: set[str] = set()
+    for h in all_hashed:
+        if h.is_archive_member:
+            continue
+        if hash_counts.get(h.full_hash, 0) != 1:
+            continue
+        if h.full_hash in seen_singleton_hashes:
+            continue
+        seen_singleton_hashes.add(h.full_hash)
+        singletons.append(
+            SingletonEntry(
+                path=h.path,
+                size=h.size,
+                mtime=h.mtime,
+                hash=h.full_hash,
+            )
+        )
 
     report = Report(
         roots=[Path(r).expanduser().resolve() for r in roots],
@@ -228,6 +481,9 @@ def scan(
         total_groups=len(report_groups),
         total_reclaim_bytes=total_reclaim,
         groups=report_groups,
+        singletons=singletons,
+        archive_skips=archive_skips,
+        discover=discover,
     )
     html_path, json_path = render_report(report, report_dir)
     store.close()
@@ -236,16 +492,19 @@ def scan(
     tbl.add_column("Metric")
     tbl.add_column("Value", justify="right")
     tbl.add_row("Files scanned", str(file_count))
+    tbl.add_row("Bundles hashed", str(walk_stats.bundles_hashed))
     tbl.add_row("Duplicate groups", str(len(report_groups)))
+    tbl.add_row("Unique files", str(len(singletons)))
+    tbl.add_row("Skipped archives", str(len(archive_skips)))
     tbl.add_row("Reclaimable (bytes)", str(total_reclaim))
     tbl.add_row("HTML report", str(html_path))
     tbl.add_row("JSON report", str(json_path))
     console.print(tbl)
-    console.print(
-        "[yellow]Note[/yellow]: APFS clone detection is not implemented in v0.1 "
-        "(scheduled for v0.1.1). Reclaim estimates on cloned trees may be too "
-        "high — see docs/safety.md."
-    )
+    if discover:
+        console.print(
+            "[cyan]Discovery mode[/cyan]: no keepers proposed. "
+            "`dc apply` will refuse this report."
+        )
 
 
 @app.command()

@@ -280,6 +280,33 @@ class Store:
         """Public commit — used by batched staging."""
         self._conn.commit()
 
+    def iter_singleton_stage_records(
+        self, scan_id: str
+    ) -> Iterator[tuple[str, int, float, int, int, int]]:
+        """Yield staged rows whose size bucket has exactly one member.
+
+        Cheap: driven purely by ``COUNT(*)`` on the ``size`` group-by, so
+        no hashing is required. Callers use these rows to build the
+        singleton section of the report at "essentially free" cost.
+        """
+        rows = self._conn.execute(
+            "SELECT path, size, mtime, inode, dev, nlink FROM scan_stage "
+            "WHERE scan_id = ? AND size IN ("
+            "  SELECT size FROM scan_stage WHERE scan_id = ? "
+            "  GROUP BY size HAVING COUNT(*) = 1"
+            ")",
+            (scan_id, scan_id),
+        ).fetchall()
+        for r in rows:
+            yield (
+                str(r["path"]),
+                int(r["size"]),
+                float(r["mtime"]),
+                int(r["inode"] or 0),
+                int(r["dev"] or 0),
+                int(r["nlink"] or 0),
+            )
+
     def iter_duplicate_size_buckets(
         self, scan_id: str
     ) -> Iterator[list[tuple[str, int, float, int, int, int]]]:

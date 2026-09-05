@@ -47,6 +47,13 @@
   <p>Generated {{ report.generated_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC.
      Scanned {{ report.total_files_scanned }} files under
      {% for r in report.roots %}<code>{{ r }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</p>
+  {% if report.discover %}
+  <p style="background:#fff3cd;border:1px solid #d0a800;border-radius:4px;
+            padding:0.6em 1em;">
+    <strong>Discovery mode</strong> — no keepers proposed. This report is an
+    inventory; <code>dc apply</code> will refuse to run against it.
+  </p>
+  {% endif %}
 </header>
 
 <section class="summary">
@@ -116,6 +123,53 @@
 {% else %}
 <p>No duplicates found. Nothing to do.</p>
 {% endfor %}
+
+{% if report.singletons %}
+<h2>Unique files ({{ report.singletons | length }})</h2>
+<p>These files have no duplicate in this scan. Never proposed for deletion —
+   surfaced so you know what's irreplaceable.</p>
+<table>
+  <thead>
+    <tr>
+      <th>Path</th>
+      <th style="width:100px;">Size</th>
+      <th style="width:180px;">Hash</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for s in report.singletons %}
+    <tr>
+      <td class="path"><span class="path-text">{{ s.path }}</span></td>
+      <td>{{ s.size | human_bytes }}</td>
+      <td class="path">{{ s.hash[:16] }}…</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if report.archive_skips %}
+<h2>Skipped archives ({{ report.archive_skips | length }})</h2>
+<p>Archives that could not be walked. Contents are unknown to this scan.</p>
+<table>
+  <thead>
+    <tr>
+      <th>Path</th>
+      <th style="width:120px;">Reason</th>
+      <th>Error</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for s in report.archive_skips %}
+    <tr>
+      <td class="path"><span class="path-text">{{ s.path }}</span></td>
+      <td>{{ s.reason }}</td>
+      <td class="path">{{ s.error or "" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
 
 <footer>
   DuplicateCleaner {{ report.version }} · edit <code>report.json</code>

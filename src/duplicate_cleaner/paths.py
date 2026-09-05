@@ -161,4 +161,45 @@ def trash_dir_for(path: Path, uid: int | None = None) -> Path:
     return Path.home() / ".Trash"
 
 
+def known_trash_dirs(uid: int | None = None) -> list[Path]:
+    """Enumerate every Trash directory a legal ``trashed_at_path`` may live in.
+
+    H2: ``dc undo`` must refuse to ``shutil.move`` a source that is not
+    inside one of these directories — otherwise a poisoned manifest could
+    coerce undo into relocating arbitrary user-owned files (``~/.ssh/id_rsa``,
+    etc.) under the guise of a "restore".
+
+    Returns resolved paths so the caller can compare against
+    ``candidate.resolve()`` without further normalisation. Non-existent
+    volumes' Trashes are still returned — resolve() on a missing path yields
+    a comparable absolute path, and the containment check simply fails.
+    """
+    current_uid = uid if uid is not None else os.getuid()
+    dirs: list[Path] = [resolve_for_check(Path.home() / ".Trash")]
+    volumes = Path("/Volumes")
+    try:
+        for vol in volumes.iterdir():
+            if not vol.is_dir():
+                continue
+            dirs.append(
+                resolve_for_check(vol / ".Trashes" / str(current_uid))
+            )
+    except OSError:
+        # /Volumes may not exist (non-macOS host) or may not be readable —
+        # the ~/.Trash entry alone is still a legal target.
+        pass
+    return dirs
+
+
+def is_inside_any_trash(path: Path, uid: int | None = None) -> bool:
+    """True if ``path`` (after resolve) is contained in a known Trash directory.
+
+    Used by ``dc undo`` to gate every source path before ``shutil.move``.
+    Callers should pass a resolved path or trust ``resolve_for_check`` here
+    to catch symlink dodges.
+    """
+    resolved = resolve_for_check(path)
+    return any(is_within(resolved, trash) for trash in known_trash_dirs(uid=uid))
+
+
 TrashResolver = Callable[[Path], Path]
