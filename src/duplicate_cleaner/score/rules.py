@@ -81,6 +81,13 @@ class ScoredMember:
     source_id: str = "local"
     is_shared: bool = False
     is_singleton_across_sources: bool = False
+    # v0.2.1 additions — plumb the cloud identity fields through to the
+    # report so the mover can dispatch cross-source discards, and mark
+    # members whose hash was normalised by cross-algo reconciliation.
+    cloud_file_id: str | None = None
+    etag: str | None = None
+    owner: str | None = None
+    reconciled: bool = False
 
 
 @dataclass
@@ -183,6 +190,10 @@ def score_group(
             source_id=h.source_id,
             is_shared=h.is_shared,
             is_singleton_across_sources=h.is_singleton_across_sources,
+            cloud_file_id=h.cloud_file_id,
+            etag=h.etag,
+            owner=h.owner,
+            reconciled=h.reconciled,
         )
         for h in group.members
     ]

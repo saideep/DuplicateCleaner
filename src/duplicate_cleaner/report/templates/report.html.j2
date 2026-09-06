@@ -36,6 +36,7 @@
   .badge.keep    { background: #2e7d32; }
   .badge.discard { background: #c62828; }
   .badge.info    { background: #ef6c00; }
+  .badge.recon   { background: #1565c0; margin-left: 0.3em; }
   footer { margin-top: 3em; font-size: 0.85em; color: #888; }
   code { background: #f2f2f4; padding: 0.05em 0.35em; border-radius: 3px; }
 </style>
@@ -100,6 +101,7 @@
           {% else %}
             <span class="badge discard">TRASH</span>
           {% endif %}
+          {% if m.reconciled %}<span class="badge recon" title="hash normalised by cross-algo reconciliation">RECON</span>{% endif %}
         </td>
         <td class="path {% if not m.is_proposed_keeper and not m.is_informational %}discard{% endif %}">
           <span class="path-text">{{ m.path }}</span>
@@ -142,6 +144,34 @@
       <td class="path"><span class="path-text">{{ s.path }}</span></td>
       <td>{{ s.size | human_bytes }}</td>
       <td class="path">{{ s.hash[:16] }}…</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if report.not_yet_hashed_buckets %}
+<h2>Cross-source size buckets not yet reconciled ({{ report.not_yet_hashed_buckets | length }})</h2>
+<p>These size buckets contain files from multiple sources but reconciliation
+   was deferred because it would have exceeded
+   <code>--max-cloud-download-mb</code>. Raise the cap and re-scan to fold
+   them into duplicate groups.</p>
+<table>
+  <thead>
+    <tr>
+      <th style="width:100px;">Size</th>
+      <th style="width:140px;">Reason</th>
+      <th>Paths</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for b in report.not_yet_hashed_buckets %}
+    <tr>
+      <td>{{ b.size | human_bytes }}</td>
+      <td>{{ b.reason }}</td>
+      <td class="path">
+        {% for p in b.paths %}<span class="path-text">{{ p }}</span>{% if not loop.last %}<br>{% endif %}{% endfor %}
+      </td>
     </tr>
   {% endfor %}
   </tbody>

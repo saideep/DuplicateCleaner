@@ -31,6 +31,12 @@ class HashedRecord:
     ``"local"`` so every v0.1.1 construction site keeps working; cloud
     sources stamp their own id.  ``is_shared`` marks shared-with-me cloud
     files (informational-only invariant, enforced in the scorer).
+
+    v0.2.1 — cloud metadata fields (``foreign_hash``, ``etag``,
+    ``cloud_file_id``, ``owner``) are preserved from the source
+    ``FileRecord`` so the post-hash reconciliation pass and the mover
+    dispatch on cross-source groups can find them.  ``reconciled`` marks
+    members whose ``full_hash`` was normalised by cross-algo reconciliation.
     """
 
     path: Path
@@ -46,6 +52,13 @@ class HashedRecord:
     source_id: str = "local"
     is_shared: bool = False
     is_singleton_across_sources: bool = False
+    # v0.2.1 additions — preserve cloud-side fields so reconciliation and
+    # the mover can dispatch cross-source groups.
+    foreign_hash: str | None = None
+    etag: str | None = None
+    cloud_file_id: str | None = None
+    owner: str | None = None
+    reconciled: bool = False
 
 
 def _hash_partial(path: Path, size: int) -> str:
@@ -113,6 +126,10 @@ def hash_records(
                     is_bundle=rec.is_bundle,
                     source_id=rec.source_id,
                     is_shared=rec.is_shared,
+                    foreign_hash=rec.foreign_hash,
+                    etag=rec.etag,
+                    cloud_file_id=rec.cloud_file_id,
+                    owner=rec.owner,
                 )
             )
             continue

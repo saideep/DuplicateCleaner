@@ -7,21 +7,29 @@ re-alignment as cheaply as possible: it only issues a stream-download for a
 cloud member whose peers use a different algorithm AND whose BLAKE3 isn't
 already cached in :class:`~duplicate_cleaner.store.Store`.
 
-Sub-phase 2 exposes the module and its data types; sub-phase 5 wires it
-into ``hash/pipeline.py``.  A partial hookup here keeps behaviour of the
-existing 158-test suite unchanged — the reconcile step is invoked only when
-a size bucket contains ``source_id != 'local'`` members.
+v0.2.1 wires :func:`reconcile_cross_source` into ``cli.py::scan`` after the
+size-bucket → partial-hash → full-hash pipeline.  Same-algo buckets stay
+zero-cost; cross-algo buckets stream cloud bytes through the source's
+``read_bytes`` iterator (memory-flat) and cache the resulting BLAKE3 so
+subsequent scans re-use it.
 """
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import blake3  # type: ignore[import-untyped]
 
 from duplicate_cleaner.scan.walk import FileRecord
 from duplicate_cleaner.store import Store
+
+if TYPE_CHECKING:
+    from duplicate_cleaner.hash.pipeline import HashedRecord
+    from duplicate_cleaner.report.schema import NotYetHashedBucket
+    from duplicate_cleaner.sources.base import Source
 
 log = logging.getLogger(__name__)
 
@@ -192,3 +200,173 @@ def _stream_blake3(chunks: Iterator[bytes]) -> str:
 def purge_stale_cache(store: Store, max_age_days: float = _MAX_CACHE_AGE_DAYS) -> int:
     """Drop cloud_hash_cache rows older than ``max_age_days``."""
     return store.purge_stale_cloud_hashes(max_age_days=max_age_days)
+
+
+def _record_from_hashed(h: HashedRecord) -> FileRecord:
+    """Rebuild a FileRecord surface from a HashedRecord so reconcile_bucket can read it."""
+    return FileRecord(
+        path=h.path,
+        size=h.size,
+        mtime=h.mtime,
+        inode=h.inode,
+        dev=h.dev,
+        nlink=h.nlink,
+        is_archive_member=h.is_archive_member,
+        is_bundle=h.is_bundle,
+        source_id=h.source_id,
+        foreign_hash=h.foreign_hash,
+        etag=h.etag,
+        cloud_file_id=h.cloud_file_id,
+        owner=h.owner,
+        is_shared=h.is_shared,
+    )
+
+
+def reconcile_cross_source(
+    records: list[HashedRecord],
+    sources: dict[str, Source],
+    store: Store,
+    budget: ReconciliationBudget,
+) -> tuple[list[HashedRecord], list[NotYetHashedBucket]]:
+    """Align cross-source size buckets to a single canonical hash space.
+
+    Iterates the flat ``records`` list by ``size``.  For each size bucket
+    with ≥ 2 members whose ``source_id`` values differ (i.e. a genuine
+    cross-source candidate), invokes :func:`reconcile_bucket` and rewrites
+    every touched record's ``full_hash`` to the canonical value.  Members
+    are also flagged ``reconciled=True`` so the report can surface the
+    provenance.  Same-source buckets are left untouched (the pipeline
+    already handed us a matching BLAKE3 for local peers, and same-algo
+    cloud peers already share a ``foreign_hash`` string).
+
+    Buckets that would exceed the download cap are recorded in the
+    returned list of :class:`NotYetHashedBucket` and their members are
+    left with their original per-source hashes — surfaced but not grouped.
+
+    Archive members are excluded from reconciliation — their hashes are
+    already canonical BLAKE3 emitted by the archive walker, and their
+    "path" is a virtual ``outer::inner`` string with no ``source_id`` for
+    the cloud dispatch to consult.
+    """
+    from duplicate_cleaner.report.schema import NotYetHashedBucket
+
+    if not records:
+        return records, []
+
+    def _read_bytes(rec: FileRecord) -> Iterator[bytes]:
+        src = sources.get(rec.source_id)
+        if src is None:
+            raise OSError(
+                f"no source registered for id {rec.source_id!r} — cannot "
+                "reconcile"
+            )
+        return src.read_bytes(rec)
+
+    # Index records that participate in reconciliation by size.  Excluded:
+    # archive members (virtual paths, no source dispatch) and any record
+    # already flagged reconciled (defensive — should never happen on the
+    # single-pass path but keeps the function idempotent).
+    by_size: dict[int, list[int]] = defaultdict(list)
+    for idx, h in enumerate(records):
+        if h.is_archive_member:
+            continue
+        by_size[h.size].append(idx)
+
+    # Build a local-BLAKE3 lookup keyed by (path, size).  Local records
+    # emerge from the pipeline with a real BLAKE3 in ``full_hash``; the
+    # reconciler consults this instead of re-hashing local bytes.
+    local_hashes: dict[tuple[str, int], str] = {
+        (str(records[idx].path), records[idx].size): records[idx].full_hash
+        for indices in by_size.values()
+        for idx in indices
+        if records[idx].source_id == "local"
+    }
+
+    def _local_lookup(m: FileRecord) -> str | None:
+        return local_hashes.get((str(m.path), m.size))
+
+    updated: dict[int, HashedRecord] = {}
+    not_yet: list[NotYetHashedBucket] = []
+
+    for size, indices in by_size.items():
+        if len(indices) < 2:
+            continue
+        source_ids = {records[i].source_id for i in indices}
+        if len(source_ids) < 2:
+            # Same-source bucket — the pipeline (local) or the foreign_hash
+            # stamp (cloud) has already given every member a hash that
+            # groups correctly.  Nothing to reconcile.
+            continue
+        members = [_record_from_hashed(records[i]) for i in indices]
+        result = reconcile_bucket(
+            members,
+            store,
+            _read_bytes,
+            budget=budget,
+            local_blake3_lookup=_local_lookup,
+        )
+        if result is None:
+            # Budget-exceeded — surface the whole bucket as not-yet-hashed
+            # and leave every member's existing hash in place.
+            not_yet.append(
+                NotYetHashedBucket(
+                    paths=[str(records[i].path) for i in indices],
+                    size=size,
+                    reason="budget_exceeded",
+                )
+            )
+            continue
+        # Reconciled → rewrite each touched member's full_hash to the
+        # canonical value from ``reconcile_bucket`` and flag it.
+        by_path: dict[str, str] = {
+            str(r.record.path): r.blake3 for r in result
+        }
+        for i in indices:
+            rec = records[i]
+            new_hash = by_path.get(str(rec.path))
+            if new_hash is None:
+                # ``reconcile_bucket`` dropped the record (e.g. cloud member
+                # missing cloud_file_id/etag) — leave the original hash in
+                # place so it can still surface as a singleton.
+                continue
+            if new_hash == rec.full_hash and not _needs_reconciled_flag(rec):
+                continue
+            updated[i] = _replace_hash(rec, new_hash)
+
+    if not updated:
+        return records, not_yet
+
+    out: list[HashedRecord] = [
+        updated.get(idx, rec) for idx, rec in enumerate(records)
+    ]
+    return out, not_yet
+
+
+def _needs_reconciled_flag(rec: HashedRecord) -> bool:
+    """Cloud members always get flagged when the reconcile pass touches their bucket."""
+    return rec.source_id != "local"
+
+
+def _replace_hash(rec: HashedRecord, new_hash: str) -> HashedRecord:
+    """Return a copy of ``rec`` with ``full_hash`` replaced and ``reconciled=True``."""
+    from duplicate_cleaner.hash.pipeline import HashedRecord
+
+    return HashedRecord(
+        path=rec.path,
+        size=rec.size,
+        mtime=rec.mtime,
+        inode=rec.inode,
+        dev=rec.dev,
+        nlink=rec.nlink,
+        full_hash=new_hash,
+        is_archive_member=rec.is_archive_member,
+        is_bundle=rec.is_bundle,
+        source_id=rec.source_id,
+        is_shared=rec.is_shared,
+        is_singleton_across_sources=rec.is_singleton_across_sources,
+        foreign_hash=rec.foreign_hash,
+        etag=rec.etag,
+        cloud_file_id=rec.cloud_file_id,
+        owner=rec.owner,
+        reconciled=True,
+    )

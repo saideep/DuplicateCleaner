@@ -15,7 +15,6 @@ import json
 from pathlib import Path
 
 import blake3  # type: ignore[import-untyped]
-import pytest
 
 from duplicate_cleaner.apply.undo import restore_from_manifest
 

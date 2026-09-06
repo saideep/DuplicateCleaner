@@ -96,6 +96,25 @@ CREATE TABLE IF NOT EXISTS cloud_hash_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_cloud_hash_cache_hash
     ON cloud_hash_cache(blake3_hash);
+
+-- v0.3 sub-milestone 5.3-a: extracted signal cache for the organizer.
+-- One row per (path, source_id, signal_kind).  ``signal_value`` is TEXT so
+-- numeric values are stringified.  Rerunning ``dc organize discover`` reuses
+-- rows whose ``stored_mtime`` still matches the file's current mtime; a
+-- stat change invalidates every row for the path via the discover
+-- orchestrator's mtime tolerance check.
+CREATE TABLE IF NOT EXISTS file_signals (
+    path         TEXT NOT NULL,
+    source_id    TEXT NOT NULL DEFAULT 'local',
+    signal_kind  TEXT NOT NULL,
+    signal_value TEXT NOT NULL,
+    confidence   REAL,
+    stored_mtime REAL NOT NULL DEFAULT 0,
+    extracted_ts REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (path, source_id, signal_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_file_signals_path
+    ON file_signals(source_id, path);
 """
 
 # v0.2 schema version — bumped whenever ``files`` picks up new columns or
@@ -525,6 +544,73 @@ class Store:
         )
         self._conn.commit()
 
+    # ------------------------------------------------------------------ #
+    # v0.3 organize discovery — signal cache.                            #
+    # ------------------------------------------------------------------ #
+
+    def get_cached_signals(
+        self, path: str, source_id: str, mtime: float
+    ) -> Any:
+        """Return a cached SignalSet dict, or None on miss / mtime drift.
+
+        Discover rerun cost is dominated by PDF text extraction; caching
+        keeps a stable-corpus repeat scan close to walker cost.
+        """
+        cur = self._conn.execute(
+            "SELECT signal_value, stored_mtime FROM file_signals "
+            "WHERE path = ? AND source_id = ? AND signal_kind = ?",
+            (path, source_id, "__signalset__"),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        stored_mtime = float(row["stored_mtime"])
+        if abs(stored_mtime - mtime) > _MTIME_EPS:
+            return None
+        raw = row["signal_value"]
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        # Import here to avoid a circular import at module load.
+        from duplicate_cleaner.organize.signals import SignalSet
+
+        try:
+            return SignalSet(**_signal_set_from_json(data))
+        except (TypeError, ValueError):
+            return None
+
+    def put_signal_set(
+        self,
+        path: str,
+        source_id: str,
+        mtime: float,
+        signal_set: Any,
+    ) -> None:
+        """Persist a SignalSet as a JSON blob keyed on path+source+mtime."""
+        try:
+            payload = _signal_set_to_json(signal_set)
+        except (TypeError, ValueError):
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO file_signals "
+            "(path, source_id, signal_kind, signal_value, confidence, "
+            " stored_mtime, extracted_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                path,
+                source_id,
+                "__signalset__",
+                json.dumps(payload),
+                None,
+                mtime,
+                time.time(),
+            ),
+        )
+        self._conn.commit()
+
     def purge_stale_cloud_hashes(self, max_age_days: float = 90.0) -> int:
         """Drop cloud_hash_cache rows older than ``max_age_days``.
 
@@ -538,3 +624,28 @@ class Store:
         )
         self._conn.commit()
         return int(cur.rowcount or 0)
+
+
+def _signal_set_to_json(signal_set: Any) -> dict[str, Any]:
+    """Coerce a SignalSet dataclass to a JSON-safe dict; frozensets become sorted lists."""
+    out: dict[str, Any] = {}
+    for k, v in signal_set.__dict__.items():
+        if isinstance(v, frozenset):
+            out[k] = sorted(v)
+        elif isinstance(v, tuple):
+            out[k] = list(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _signal_set_from_json(data: dict[str, Any]) -> dict[str, Any]:
+    """Restore frozenset/tuple typing from a stored JSON blob."""
+    out = dict(data)
+    if "fname_keywords" in out and out["fname_keywords"] is not None:
+        out["fname_keywords"] = frozenset(out["fname_keywords"])
+    if "pdf_keyword_hits" in out and out["pdf_keyword_hits"] is not None:
+        out["pdf_keyword_hits"] = frozenset(out["pdf_keyword_hits"])
+    if "path_tokens" in out and out["path_tokens"] is not None:
+        out["path_tokens"] = tuple(out["path_tokens"])
+    return out

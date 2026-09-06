@@ -6,10 +6,12 @@ from pathlib import Path
 
 import blake3  # type: ignore[import-untyped]
 
+from duplicate_cleaner.hash.pipeline import HashedRecord
 from duplicate_cleaner.hash.reconciliation import (
     ReconciliationBudget,
     make_budget,
     reconcile_bucket,
+    reconcile_cross_source,
 )
 from duplicate_cleaner.scan.walk import FileRecord
 from duplicate_cleaner.store import Store
@@ -240,6 +242,246 @@ def test_etag_change_invalidates_cache(tmp_path: Path) -> None:
     store.put_cloud_hash("gdrive:x", "id1", "old-etag", "OLD", size=10)
     assert store.get_cloud_hash("gdrive:x", "id1", "old-etag") == "OLD"
     assert store.get_cloud_hash("gdrive:x", "id1", "new-etag") is None
+    store.close()
+
+
+class _StubSource:
+    """Minimal ``Source`` shim — hands back a canned byte payload per record."""
+
+    def __init__(self, sid: str, payloads: dict[str, bytes]) -> None:
+        self.id = sid
+        self.is_read_only_scan = True
+        self._payloads = payloads
+        self.reads: list[str] = []
+
+    def read_bytes(
+        self, record: FileRecord, chunk_size: int = 1 << 20
+    ) -> Iterator[bytes]:
+        key = record.cloud_file_id or str(record.path)
+        self.reads.append(key)
+        payload = self._payloads.get(key)
+        if payload is None:
+            raise OSError(f"no payload registered for {key!r}")
+        yield payload
+
+
+def _hashed_local(
+    path: Path,
+    *,
+    size: int,
+    full_hash: str,
+    mtime: float = 0.0,
+) -> HashedRecord:
+    return HashedRecord(
+        path=path,
+        size=size,
+        mtime=mtime,
+        inode=1,
+        dev=1,
+        nlink=1,
+        full_hash=full_hash,
+        source_id="local",
+    )
+
+
+def _hashed_cloud(
+    *,
+    source: str,
+    size: int,
+    foreign: str,
+    cloud_id: str,
+    etag: str,
+    path: str | None = None,
+) -> HashedRecord:
+    return HashedRecord(
+        path=Path(path or f"{source}://virtual/{cloud_id}"),
+        size=size,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        full_hash=foreign,
+        source_id=source,
+        foreign_hash=foreign,
+        etag=etag,
+        cloud_file_id=cloud_id,
+    )
+
+
+def test_cross_algo_bucket_reconciles_and_groups(tmp_path: Path) -> None:
+    """A local BLAKE3 record + a cloud MD5 record with matching bytes must
+    end up with the same canonical hash after ``reconcile_cross_source``,
+    so ``group_by_hash`` treats them as duplicates."""
+    from duplicate_cleaner.compare.exact import group_by_hash
+
+    payload = b"cross-algo-match-payload"
+    local_hash = _blake3(payload)
+    local_path = tmp_path / "keep.bin"
+    local_path.write_bytes(payload)
+
+    records = [
+        _hashed_local(local_path, size=len(payload), full_hash=local_hash),
+        _hashed_cloud(
+            source="gdrive:x",
+            size=len(payload),
+            foreign="md5:aabbcc",
+            cloud_id="cid1",
+            etag="etag1",
+        ),
+    ]
+    store = Store(path=tmp_path / "cache.db")
+    src = _StubSource("gdrive:x", {"cid1": payload})
+    budget = make_budget(1000.0)
+    out, not_yet = reconcile_cross_source(
+        records, {"local": _StubSource("local", {}), "gdrive:x": src}, store, budget
+    )
+    assert not_yet == []
+    assert {r.full_hash for r in out} == {local_hash}
+    groups = list(group_by_hash(iter(out)))
+    assert len(groups) == 1
+    assert {m.source_id for m in groups[0].members} == {"local", "gdrive:x"}
+    store.close()
+
+
+def test_reconciled_group_marked_in_report(tmp_path: Path) -> None:
+    """The cloud member reconciled from cross-algo bytes carries ``reconciled=True``."""
+    payload = b"payload-for-report-flag"
+    local_hash = _blake3(payload)
+    local_path = tmp_path / "keep.bin"
+    local_path.write_bytes(payload)
+
+    records = [
+        _hashed_local(local_path, size=len(payload), full_hash=local_hash),
+        _hashed_cloud(
+            source="gdrive:x",
+            size=len(payload),
+            foreign="md5:zz",
+            cloud_id="cid2",
+            etag="etag2",
+        ),
+    ]
+    store = Store(path=tmp_path / "cache.db")
+    src = _StubSource("gdrive:x", {"cid2": payload})
+    out, _ = reconcile_cross_source(
+        records,
+        {"local": _StubSource("local", {}), "gdrive:x": src},
+        store,
+        make_budget(1000.0),
+    )
+    by_source = {r.source_id: r for r in out}
+    assert by_source["gdrive:x"].reconciled is True
+    # Local member's hash was already canonical BLAKE3 — the flag is
+    # noise on locals so it stays False.
+    assert by_source["local"].reconciled is False
+    store.close()
+
+
+def test_budget_exceeded_bucket_skipped(tmp_path: Path) -> None:
+    """A bucket over the ``--max-cloud-download-mb`` cap lands in
+    ``not_yet_hashed_buckets`` and no download runs."""
+    payload = b"payload"
+    local_hash = _blake3(payload)
+    huge_size = 100 * 1024 * 1024
+    local_path = tmp_path / "big.bin"
+    local_path.write_bytes(payload)  # size on disk doesn't matter — records carry it
+
+    records = [
+        HashedRecord(
+            path=local_path,
+            size=huge_size,
+            mtime=0.0,
+            inode=1,
+            dev=1,
+            nlink=1,
+            full_hash=local_hash,
+            source_id="local",
+        ),
+        _hashed_cloud(
+            source="gdrive:x",
+            size=huge_size,
+            foreign="md5:zz",
+            cloud_id="huge",
+            etag="e",
+        ),
+    ]
+    store = Store(path=tmp_path / "cache.db")
+    src = _StubSource("gdrive:x", {"huge": payload})
+    # 1 KiB cap — cannot fit a 100 MB download.
+    budget = ReconciliationBudget(max_download_bytes=1024)
+    out, not_yet = reconcile_cross_source(
+        records,
+        {"local": _StubSource("local", {}), "gdrive:x": src},
+        store,
+        budget,
+    )
+    assert src.reads == []
+    assert len(not_yet) == 1
+    assert not_yet[0].size == huge_size
+    assert not_yet[0].reason == "budget_exceeded"
+    assert str(local_path) in not_yet[0].paths
+    # Records untouched — original per-source hashes kept.
+    assert {r.full_hash for r in out} == {local_hash, "md5:zz"}
+    store.close()
+
+
+def test_singleton_size_bucket_skips_reconciliation(tmp_path: Path) -> None:
+    """A size bucket with a single member never triggers a download."""
+    payload = b"single"
+    local_hash = _blake3(payload)
+    local_path = tmp_path / "only.bin"
+    local_path.write_bytes(payload)
+    records = [
+        _hashed_local(local_path, size=len(payload), full_hash=local_hash),
+    ]
+    store = Store(path=tmp_path / "cache.db")
+    src = _StubSource("gdrive:x", {})
+    out, not_yet = reconcile_cross_source(
+        records, {"local": _StubSource("local", {}), "gdrive:x": src}, store, make_budget(1000.0)
+    )
+    assert src.reads == []
+    assert not_yet == []
+    assert out == records
+    store.close()
+
+
+def test_cache_hit_avoids_download(tmp_path: Path) -> None:
+    """On the second scan the ``cloud_hash_cache`` entry short-circuits the download."""
+    payload = b"second-scan-cache-hit"
+    local_hash = _blake3(payload)
+    local_path = tmp_path / "keep.bin"
+    local_path.write_bytes(payload)
+
+    def _make_records() -> list[HashedRecord]:
+        return [
+            _hashed_local(local_path, size=len(payload), full_hash=local_hash),
+            _hashed_cloud(
+                source="gdrive:x",
+                size=len(payload),
+                foreign="md5:zz",
+                cloud_id="cid-cache",
+                etag="etag-stable",
+            ),
+        ]
+
+    store = Store(path=tmp_path / "cache.db")
+    src = _StubSource("gdrive:x", {"cid-cache": payload})
+    # First run — downloads and caches.
+    reconcile_cross_source(
+        _make_records(),
+        {"local": _StubSource("local", {}), "gdrive:x": src},
+        store,
+        make_budget(1000.0),
+    )
+    assert src.reads == ["cid-cache"]
+    # Second run with a fresh source — cache hit means no download.
+    src2 = _StubSource("gdrive:x", {"cid-cache": payload})
+    reconcile_cross_source(
+        _make_records(),
+        {"local": _StubSource("local", {}), "gdrive:x": src2},
+        store,
+        make_budget(1000.0),
+    )
+    assert src2.reads == []
     store.close()
 
 

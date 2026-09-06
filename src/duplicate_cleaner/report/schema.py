@@ -41,6 +41,12 @@ class ReportMember(BaseModel):
     etag: str | None = None
     owner: str | None = None
     is_shared: bool = False
+    # v0.2.1 addition — True when the member's ``hash`` was normalised by
+    # the cross-algo reconciliation pass (BLAKE3 downloaded and cached for
+    # cloud members whose siblings used a different algorithm).  Purely
+    # informational — the mover treats reconciled and non-reconciled members
+    # identically.
+    reconciled: bool = False
 
 
 class ReportGroup(BaseModel):
@@ -74,6 +80,21 @@ class SingletonEntry(BaseModel):
     hash: str
 
 
+class NotYetHashedBucket(BaseModel):
+    """A cross-source size bucket that could not be reconciled this scan.
+
+    v0.2.1: emitted when the cumulative cross-algo download budget
+    (``--max-cloud-download-mb``) would be exceeded by reconciling the
+    bucket.  The bucket's members exist and are named so the user can
+    lift the cap and re-run, but no cross-source duplicate claim is
+    surfaced for them until reconciliation actually runs.
+    """
+
+    paths: list[str]
+    size: int
+    reason: str = "budget_exceeded"
+
+
 class Report(BaseModel):
     # v0.2 sub-phase 5a: bumped from ``"0.1.1"`` → ``"0.2.0"``.  The loader
     # (``apply/mover.py::load_report``) accepts any older value and treats
@@ -89,6 +110,11 @@ class Report(BaseModel):
     groups: list[ReportGroup]
     singletons: list[SingletonEntry] = Field(default_factory=list)
     archive_skips: list[ArchiveSkipEntry] = Field(default_factory=list)
+    # v0.2.1 addition — cross-source size buckets skipped because the
+    # cumulative cloud-download budget would have been exceeded.  Empty for
+    # local-only scans and for scans whose reconciliation stayed under the
+    # cap.
+    not_yet_hashed_buckets: list[NotYetHashedBucket] = Field(default_factory=list)
     # ``discover`` mode: no keeper is proposed on any group. ``dc apply``
     # refuses to run a discover-mode report so nothing accidentally deletes.
     discover: bool = False

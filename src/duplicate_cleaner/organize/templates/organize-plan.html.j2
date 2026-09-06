@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DuplicateCleaner Organize Plan — {{ plan.generated_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         margin: 2em; color: #222; }
+  header { border-bottom: 2px solid #444; padding-bottom: 1em; margin-bottom: 2em; }
+  header h1 { margin: 0 0 0.3em; }
+  .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1em; margin: 1em 0; }
+  .summary .card { background: #f7f7f9; padding: 1em; border-radius: 6px; }
+  .summary .card .n { font-size: 1.8em; font-weight: 600; }
+  .domain { border: 1px solid #ddd; border-radius: 6px; margin-bottom: 1.5em; padding: 1em; }
+  .domain h3 { margin: 0 0 0.5em 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              font-size: 1em; color: #444; }
+  .domain .meta { color: #666; font-size: 0.9em; margin-bottom: 0.75em; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 0.4em 0.6em; text-align: left; border-bottom: 1px solid #eee;
+           vertical-align: top; }
+  th { background: #fafafa; font-weight: 600; font-size: 0.8em;
+       text-transform: uppercase; color: #666; letter-spacing: 0.03em; }
+  tr.unsorted { background: #fff3cd; }
+  tr.cohesive { background: #eaffea; }
+  .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 0.85em; word-break: break-all; }
+  .conf { font-weight: 600; text-align: right;
+          font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .signals { font-size: 0.8em; color: #555; }
+  .signals ul { margin: 0; padding-left: 1.1em; }
+  .signals li { margin: 0.1em 0; }
+  .badge { display: inline-block; padding: 0.1em 0.55em; border-radius: 3px;
+           font-size: 0.72em; font-weight: 700; letter-spacing: 0.04em; color: white; }
+  .badge.hi   { background: #2e7d32; }
+  .badge.mid  { background: #ef6c00; }
+  .badge.lo   { background: #c62828; }
+  .badge.cohesion { background: #6d1b7b; }
+  details { margin-top: 0.4em; }
+  details > summary { cursor: pointer; color: #444; font-size: 0.85em; }
+  .alts { font-size: 0.85em; }
+  .alts .alt { display: block; margin: 0.15em 0; }
+  footer { margin-top: 3em; font-size: 0.85em; color: #888; }
+  code { background: #f2f2f4; padding: 0.05em 0.35em; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>DuplicateCleaner Organize Plan</h1>
+  <p>Generated {{ plan.generated_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC.
+     Discovered {{ plan.total_files }} files under
+     {% for r in plan.roots %}<code>{{ r }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+     Taxonomy version <code>{{ plan.taxonomy_version }}</code>.</p>
+  <p style="background:#e8f4fd;border:1px solid #90caf9;border-radius:4px;
+            padding:0.6em 1em;">
+    <strong>Discovery only</strong> — this plan is read-only.  Nothing has
+    been moved yet.  Review, edit <code>organize-plan.json</code> if
+    needed, then run <code>dc organize apply plan.json --commit</code>
+    (available in v0.3-b).
+  </p>
+</header>
+
+<section class="summary">
+  <div class="card">
+    <div class="n">{{ plan.total_files }}</div>
+    <div>files discovered</div>
+  </div>
+  <div class="card">
+    <div class="n">{{ plan.total_by_domain | length }}</div>
+    <div>domain{% if plan.total_by_domain|length != 1 %}s{% endif %} in play</div>
+  </div>
+  <div class="card">
+    <div class="n">{{ plan.cohesion_groups | length }}</div>
+    <div>cohesion group{% if plan.cohesion_groups|length != 1 %}s{% endif %}</div>
+  </div>
+  <div class="card">
+    <div class="n">{{ plan.total_by_domain.get("Unsorted", 0) }}</div>
+    <div>files in Unsorted</div>
+  </div>
+</section>
+
+{% if plan.cohesion_groups %}
+<h2>Cohesion groups</h2>
+<p>Files in each group MUST move together — <code>dc organize apply</code>
+   refuses to split a cohesion group unless <code>--split-cohesive-units</code>
+   is passed.</p>
+{% for cg in plan.cohesion_groups %}
+<div class="domain">
+  <h3><span class="badge cohesion">{{ cg.kind | upper }}</span>
+      {{ cg.id }} &middot; {{ cg.destination }}</h3>
+  <div class="meta">{{ cg.description }} &middot;
+       {{ cg.member_paths | length }} member{% if cg.member_paths|length != 1 %}s{% endif %}</div>
+  <details>
+    <summary>Show members</summary>
+    <ul>
+    {% for p in cg.member_paths %}
+      <li class="path">{{ p }}</li>
+    {% endfor %}
+    </ul>
+  </details>
+</div>
+{% endfor %}
+{% endif %}
+
+<h2>Proposed destinations by domain</h2>
+
+{% set grouped = {} %}
+{% for e in plan.entries %}
+  {% set _ = grouped.setdefault(e.domain, []).append(e) %}
+{% endfor %}
+
+{% for domain in grouped.keys() | sort %}
+<div class="domain">
+  <h3>{{ domain }} &middot; {{ grouped[domain] | length }} file{% if grouped[domain]|length != 1 %}s{% endif %}</h3>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:64px;">Conf</th>
+        <th>Source</th>
+        <th>Destination</th>
+        <th>Details</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for e in grouped[domain] %}
+      {% set conf_class = "hi" if e.confidence >= 0.75 else ("mid" if e.confidence >= 0.4 else "lo") %}
+      <tr class="{% if domain == 'Unsorted' %}unsorted{% elif e.cohesion_group_id %}cohesive{% endif %}">
+        <td class="conf">
+          <span class="badge {{ conf_class }}">{{ '%.2f' | format(e.confidence) }}</span>
+        </td>
+        <td class="path">{{ e.source_path }}</td>
+        <td class="path">{{ e.proposed_dest }}</td>
+        <td class="signals">
+          <ul>
+            {% for s in e.signals %}
+              <li>{{ s.kind }}{% if s.value and s.value != 'matched' %}: {{ s.value }}{% endif %}</li>
+            {% endfor %}
+            {% if e.cohesion_group_id %}
+              <li><em>Cohesion group:</em> <code>{{ e.cohesion_group_id }}</code></li>
+            {% endif %}
+            {% if e.fired_rules %}
+              <li><em>Rules:</em> {{ e.fired_rules | join(', ') }}</li>
+            {% endif %}
+          </ul>
+          {% if e.alternatives %}
+          <details class="alts">
+            <summary>Alternatives</summary>
+            {% for a in e.alternatives %}
+              <span class="alt">{{ a.domain }}/{{ a.subfolder }}
+                <span class="badge {{ 'hi' if a.confidence >= 0.75 else ('mid' if a.confidence >= 0.4 else 'lo') }}">{{ '%.2f' | format(a.confidence) }}</span>
+              </span>
+            {% endfor %}
+          </details>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endfor %}
+
+<footer>
+  DuplicateCleaner &middot; taxonomy {{ plan.taxonomy_version }} &middot;
+  edit <code>organize-plan.json</code> to change any proposed destination,
+  then <code>dc organize apply plan.json --commit</code> (available in
+  v0.3-b).
+</footer>
+
+</body>
+</html>

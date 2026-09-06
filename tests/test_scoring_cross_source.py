@@ -206,6 +206,96 @@ def test_retained_cloud_order_unknown_account_sorts_last() -> None:
     assert any("retained_cloud_order[unlisted]" in s for s in unlisted_signal_names)
 
 
+def test_reconciled_cross_algo_group_scores_local_keeper(tmp_path: Path) -> None:
+    """v0.2.1: after ``reconcile_cross_source`` folds a local BLAKE3 record
+    and a cloud MD5 record into the same duplicate group, the scorer must
+    still pick the local under an active home as keeper.  Wires the whole
+    pipeline (reconciliation → group_by_hash → score_group) so a regression
+    that drops reconciliation would leave the two members in separate
+    groups and this test would find zero cross-source groups.
+    """
+    import blake3  # type: ignore[import-untyped]
+
+    from duplicate_cleaner.compare.exact import group_by_hash
+    from duplicate_cleaner.hash.reconciliation import (
+        make_budget,
+        reconcile_cross_source,
+    )
+    from duplicate_cleaner.store import Store
+
+    payload = b"reconciled-cross-algo-payload"
+    canonical = str(blake3.blake3(payload).hexdigest())
+
+    active = tmp_path / "Users" / "me"
+    (active / "Documents").mkdir(parents=True)
+    local_path = active / "Documents" / "foo.bin"
+    local_path.write_bytes(payload)
+    cloud_path = Path("gdrive:personal://Docs/foo.bin")
+
+    records = [
+        HashedRecord(
+            path=local_path,
+            size=len(payload),
+            mtime=local_path.stat().st_mtime,
+            inode=1,
+            dev=1,
+            nlink=1,
+            full_hash=canonical,
+            source_id="local",
+        ),
+        HashedRecord(
+            path=cloud_path,
+            size=len(payload),
+            mtime=0.0,
+            inode=0,
+            dev=0,
+            nlink=1,
+            full_hash="md5:opaque",  # foreign — won't match local until reconcile
+            source_id="gdrive:personal",
+            foreign_hash="md5:opaque",
+            etag="etag-x",
+            cloud_file_id="cid-x",
+        ),
+    ]
+
+    class _Src:
+        id = "gdrive:personal"
+        is_read_only_scan = True
+
+        def read_bytes(
+            self, _r: HashedRecord, chunk_size: int = 1 << 20
+        ) -> list[bytes]:
+            return [payload]
+
+    class _LocalSrc:
+        id = "local"
+        is_read_only_scan = True
+
+        def read_bytes(
+            self, _r: HashedRecord, chunk_size: int = 1 << 20
+        ) -> list[bytes]:
+            raise AssertionError("local should not be re-read during reconcile")
+
+    store = Store(path=tmp_path / "cache.db")
+    reconciled, not_yet = reconcile_cross_source(
+        records,
+        {"local": _LocalSrc(), "gdrive:personal": _Src()},  # type: ignore[dict-item]
+        store,
+        make_budget(1000.0),
+    )
+    store.close()
+    assert not_yet == []
+
+    groups = list(group_by_hash(iter(reconciled)))
+    assert len(groups) == 1
+    cfg = Config(active_homes=[active])
+    scored = score_group(groups[0], cfg, DEFAULT_WEIGHTS)
+    by_source = {m.source_id: m for m in scored}
+    assert by_source["local"].is_proposed_keeper
+    assert not by_source["gdrive:personal"].is_proposed_keeper
+    assert by_source["gdrive:personal"].reconciled is True
+
+
 def test_mixed_local_cloud_shared_scoring_matrix(tmp_path: Path) -> None:
     """Big group: 1 local + 1 gdrive shared + 1 onedrive owned.
 

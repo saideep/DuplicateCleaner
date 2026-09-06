@@ -32,9 +32,8 @@ def test_replace_failure_leaves_prior_manifest_intact(tmp_path: Path) -> None:
     with patch(
         "duplicate_cleaner.apply.mover.os.replace",
         side_effect=OSError("simulated crash mid-replace"),
-    ):
-        with pytest.raises(OSError):
-            _write_manifest(manifest, new_payload)
+    ), pytest.raises(OSError):
+        _write_manifest(manifest, new_payload)
 
     # The old manifest survived — no partial-write clobber.
     assert manifest.exists()
@@ -53,9 +52,8 @@ def test_replace_failure_on_first_write_leaves_no_partial(
     with patch(
         "duplicate_cleaner.apply.mover.os.replace",
         side_effect=OSError("simulated crash"),
-    ):
-        with pytest.raises(OSError):
-            _write_manifest(manifest, payload)
+    ), pytest.raises(OSError):
+        _write_manifest(manifest, payload)
 
     assert not manifest.exists(), "target must not exist after failed replace"
     tmp = tmp_path / "manifest.json.tmp"

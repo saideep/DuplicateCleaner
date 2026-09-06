@@ -53,6 +53,10 @@ from duplicate_cleaner.config import (
     write_default_weights,
 )
 from duplicate_cleaner.hash.pipeline import HashedRecord, hash_records
+from duplicate_cleaner.hash.reconciliation import (
+    make_budget,
+    reconcile_cross_source,
+)
 from duplicate_cleaner.paths import validate_scan_root_candidate
 from duplicate_cleaner.report.render import render_report
 from duplicate_cleaner.report.schema import (
@@ -407,28 +411,12 @@ def scan(
         # v0.2 sub-milestone 5e: build cloud sources for every requested
         # non-local id.  Read-only scan (``is_read_only_scan=True``) is
         # correct here — the scanner never trashes; ``apply`` builds its
-        # own sources with the flag off.  The full reconcile-with-BLAKE3
-        # step is deferred to 5f, so cloud records with a ``foreign_hash``
-        # are surfaced with their algo-prefixed digest as their grouping
-        # key.  Same-algo cloud pairs group; cross-algo pairs surface as
-        # separate groups and the scorer's cross-source signals apply.
+        # own sources with the flag off.  v0.2.1 wires the cross-algo
+        # BLAKE3 reconciler (see ``hash/reconciliation.reconcile_cross_source``)
+        # so mixed local + cloud size buckets converge to a single
+        # canonical hash space, and same-algo cloud pairs continue to
+        # group by ``foreign_hash`` for free.
         cloud_sources = _build_scan_sources(cloud_source_ids)
-
-        # Audit pass 12 finding #2: cross-algo scans (local BLAKE3 +
-        # gdrive MD5 or onedrive SHA-256) currently miss cross-source
-        # duplicates because ``hash/reconciliation.reconcile_bucket`` isn't
-        # wired into the scan pipeline yet — it lands in v0.2.1 alongside
-        # LocalFileSystemSource.restore_from_trash lock-in.  Warn loudly
-        # so users understand the current limitation and don't trust the
-        # reclaim total for cross-cloud groups.
-        if cloud_sources:
-            console.print(
-                "[yellow]Cross-algo hash reconciliation is deferred to "
-                "v0.2.1[/yellow] — local (BLAKE3) and cloud (MD5/SHA-256) "
-                "duplicates will surface as separate groups. Same-algo "
-                "cloud pairs (e.g. two Google Drive accounts) group "
-                "correctly. Full cross-algo dedup lands in v0.2.1."
-            )
 
         def _walk_iter() -> Iterator[FileRecord]:
             nonlocal file_count
@@ -512,6 +500,27 @@ def scan(
         # Materialise so we can index singletons AND groups without
         # re-walking the tree.
         all_hashed: list[HashedRecord] = list(hashed_iter)
+
+        # v0.2.1: reconcile cross-source size buckets to a single
+        # canonical hash space.  Same-algo buckets (all local BLAKE3, or
+        # two gdrive accounts sharing MD5) already collide correctly and
+        # cost zero I/O.  Cross-algo buckets (local BLAKE3 + gdrive MD5)
+        # stream cloud bytes through ``Source.read_bytes`` to compute a
+        # canonical BLAKE3 for every cloud member, cached by
+        # ``(source_id, cloud_file_id, etag)`` so subsequent scans re-use
+        # the result.  Any bucket whose reconciliation would blow the
+        # cumulative download cap is recorded in ``not_yet_hashed_buckets``.
+        sources_for_reconcile: dict[str, Any] = {
+            local_source.id: local_source,
+            **{cs.id: cs for cs in cloud_sources},
+        }
+        budget = make_budget(max_cloud_download_mb)
+        all_hashed, not_yet_hashed = reconcile_cross_source(
+            all_hashed,
+            sources_for_reconcile,
+            store,
+            budget,
+        )
         groups = list(
             group_by_hash(iter(all_hashed), min_size_bytes=cfg.min_size_bytes)
         )
@@ -561,6 +570,12 @@ def scan(
                 is_informational=m.is_informational,
                 is_archive_member=m.is_archive_member,
                 is_bundle=m.is_bundle,
+                source_id=m.source_id,
+                cloud_file_id=m.cloud_file_id,
+                etag=m.etag,
+                owner=m.owner,
+                is_shared=m.is_shared,
+                reconciled=m.reconciled,
             )
             for m in sg.members
         ]
@@ -633,6 +648,7 @@ def scan(
         groups=report_groups,
         singletons=singletons,
         archive_skips=archive_skips,
+        not_yet_hashed_buckets=not_yet_hashed,
         discover=discover,
     )
     html_path, json_path = render_report(report, report_dir)
@@ -646,10 +662,21 @@ def scan(
     tbl.add_row("Duplicate groups", str(len(report_groups)))
     tbl.add_row("Unique files", str(len(singletons)))
     tbl.add_row("Skipped archives", str(len(archive_skips)))
+    if not_yet_hashed:
+        tbl.add_row(
+            "Cross-source buckets deferred", str(len(not_yet_hashed))
+        )
     tbl.add_row("Reclaimable (bytes)", str(total_reclaim))
     tbl.add_row("HTML report", str(html_path))
     tbl.add_row("JSON report", str(json_path))
     console.print(tbl)
+    if not_yet_hashed:
+        console.print(
+            f"[yellow]{len(not_yet_hashed)} cross-source size bucket(s) "
+            "were left un-reconciled because reconciliation would exceed "
+            "[bold]--max-cloud-download-mb[/bold].[/yellow] Raise the cap "
+            "and re-scan to fold them into duplicate groups."
+        )
     if discover:
         console.print(
             "[cyan]Discovery mode[/cyan]: no keepers proposed. "
@@ -1541,6 +1568,171 @@ def sources_list() -> None:
     for e in AccountsRegistry().load():
         tbl.add_row(e.id, e.type, e.user or "-")
     console.print(tbl)
+
+
+# --------------------------------------------------------------------------- #
+# v0.3 sub-milestone 5.3-a — organizer discovery.                             #
+#                                                                             #
+# Adds `dc organize discover` only.  Apply + undo land in 5.3-b; review TUI   #
+# in 5.3-e.  Discovery is READ-ONLY — no filesystem writes to user            #
+# directories, only the report artifacts and (optionally) the signal cache   #
+# under ``~/.cache/duplicate_cleaner/``.                                      #
+# --------------------------------------------------------------------------- #
+
+organize_app = typer.Typer(help="Organize files into a domain-based taxonomy (v0.3).")
+app.add_typer(organize_app, name="organize")
+
+
+@organize_app.command("discover")
+def organize_discover(
+    roots: Annotated[
+        list[Path], typer.Argument(help="One or more directories to discover.")
+    ],
+    report_dir: Annotated[
+        Path,
+        typer.Option(
+            "--report",
+            help="Output directory for organize-plan.html and organize-plan.json.",
+        ),
+    ],
+    dest: Annotated[
+        Path | None,
+        typer.Option(
+            "--dest",
+            help="Destination root for the eventual apply step (annotated only).",
+        ),
+    ] = None,
+    min_size: Annotated[
+        int | None,
+        typer.Option("--min-size", help="Override min_size_bytes from config."),
+    ] = None,
+    follow_symlinks: Annotated[
+        bool,
+        typer.Option("--follow-symlinks", help="Follow symlinks during walk."),
+    ] = False,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option("--exclude", help="Extra exclude glob (repeatable)."),
+    ] = None,
+    confidence_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--confidence-threshold",
+            help="Files below this classifier score go to Unsorted/.",
+        ),
+    ] = None,
+    event_gap_hours: Annotated[
+        int | None,
+        typer.Option(
+            "--event-gap-hours",
+            help="Hours between successive photos that split an event.",
+        ),
+    ] = None,
+    skip_dedup_check: Annotated[
+        bool,
+        typer.Option(
+            "--skip-dedup-check",
+            help="Suppress the pending-dedup-groups soft warning.",
+        ),
+    ] = False,
+) -> None:
+    """Read-only pass: walks roots, extracts signals, writes an organize plan."""
+    from duplicate_cleaner.organize.discover import discover as run_discover
+    from duplicate_cleaner.organize.render import render_plan
+
+    cfg = load_config()
+    if not cfg.active_homes:
+        console.print(
+            "[red]Refusing to run[/red]: no [cyan]active_homes[/cyan] declared "
+            f"in {CONFIG_PATH}. Edit the file and set "
+            "active_homes = ['/Users/you'] before running organize discover."
+        )
+        raise typer.Exit(2)
+
+    for r in roots:
+        try:
+            validate_scan_root_candidate(r)
+        except ValueError as e:
+            console.print(f"[red]Refusing to run[/red]: {e}")
+            raise typer.Exit(2) from e
+
+    updates: dict[str, Any] = {}
+    if min_size is not None:
+        updates["min_size_bytes"] = min_size
+    if follow_symlinks:
+        updates["follow_symlinks"] = True
+    if exclude:
+        updates["exclude_globs"] = [*cfg.exclude_globs, *exclude]
+    if confidence_threshold is not None:
+        updates["organize_confidence_threshold"] = confidence_threshold
+    if event_gap_hours is not None:
+        updates["event_gap_hours"] = event_gap_hours
+    if updates:
+        cfg = cfg.model_copy(update=updates)
+
+    _check_pending_dedup(cfg, skip_dedup_check)
+
+    store = Store()
+    try:
+        plan, summary = run_discover(
+            roots,
+            cfg,
+            store=store,
+            dest_root=dest,
+        )
+    finally:
+        store.close()
+
+    html_path, json_path = render_plan(plan, report_dir)
+    console.print(
+        f"[green]Discovered[/green] {summary.files_scanned} files across "
+        f"{summary.cohesion_groups} cohesion group(s); proposed taxonomy has "
+        f"{len(summary.domains)} domain(s)."
+    )
+    console.print(f"Plan JSON: {json_path}")
+    console.print(f"Plan HTML: {html_path}")
+
+
+def _check_pending_dedup(cfg: Any, skip: bool) -> None:
+    """Emit a soft warning (or hard refuse) if a dedup scan has pending groups.
+
+    Non-fatal by default: organize before dedup is legitimate on a fresh
+    external drive.  Users opt in to hard refusal via
+    ``enforce_dedup_ordering = true`` in config.toml.
+    """
+    if skip:
+        return
+    try:
+        store = Store()
+    except OSError:
+        return
+    try:
+        cur = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM group_members "
+            "WHERE is_proposed_keeper = 0 AND is_informational = 0"
+        )
+        row = cur.fetchone()
+    except Exception:
+        row = None
+    finally:
+        store.close()
+    if row is None:
+        return
+    pending = int(row["n"] or 0)
+    if pending <= 0:
+        return
+    if getattr(cfg, "enforce_dedup_ordering", False):
+        console.print(
+            f"[red]Refusing to run[/red]: {pending} pending dedup discard(s) "
+            "detected.  Run `dc apply <report.json> --commit` first, or set "
+            "`enforce_dedup_ordering = false` in config.toml."
+        )
+        raise typer.Exit(2)
+    console.print(
+        f"[yellow]Warning[/yellow]: {pending} pending dedup discard(s) "
+        "detected.  Organize runs best AFTER dedup — consider running "
+        "`dc apply` first.  Pass `--skip-dedup-check` to suppress this warning."
+    )
 
 
 def _google_credentials_from_token(data: dict[str, object]) -> object:

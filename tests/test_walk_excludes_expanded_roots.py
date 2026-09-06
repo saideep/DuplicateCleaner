@@ -21,7 +21,6 @@ import pytest
 from duplicate_cleaner.constants import EXCLUDED_ROOTS
 from duplicate_cleaner.scan.walk import iter_files
 
-
 EXPANDED_EXCLUDED_ROOTS: list[str] = [
     "/Library",
     "/Applications",

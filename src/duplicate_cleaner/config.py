@@ -5,7 +5,7 @@ import json
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -72,6 +72,28 @@ class Config(BaseModel):
     # — this list has no effect on groups containing a local member.  See
     # ``docs/config.md`` for worked examples.
     retained_cloud_order: list[str] = Field(default_factory=list)
+
+    # v0.3 sub-milestone 5.3-a — organizer discovery.
+    #
+    # ``organize_confidence_threshold``: files below this classifier score go
+    # to ``Unsorted/`` rather than a guessed domain.
+    # ``organize_dir_mode``: mode applied to freshly-created destination
+    # directories during ``dc organize apply`` (unused in 5.3-a; declared
+    # here so users can pin it before apply lands in 5.3-b).
+    # ``rename_policy``: LOCKED default ``"preserve"`` — filename bytes are
+    # never mutated by ``dc organize`` unless the user has explicitly opted
+    # in to a date-prefix policy via config.
+    # ``event_gap_hours`` / ``min_event_photos``: photo-video event
+    # clustering knobs; see design doc §4.
+    # ``enforce_dedup_ordering``: when True, ``dc organize discover``
+    # refuses to run if any pending dedup group exists.  Default False —
+    # emits a soft warning instead.
+    organize_confidence_threshold: float = 0.75
+    organize_dir_mode: int = 0o755
+    rename_policy: Literal["preserve", "date_prefix", "date_event_prefix"] = "preserve"
+    event_gap_hours: int = 12
+    min_event_photos: int = 5
+    enforce_dedup_ordering: bool = False
 
     @field_validator("max_workers")
     @classmethod
@@ -191,6 +213,10 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
     ``[cross_source_preference]`` TOML section.  ``retained_cloud_order``
     is spliced into the top-level config dict here so users can keep the
     file grouped without polluting the flat model with a sub-model type.
+
+    v0.3 sub-milestone 5.3-a: organizer knobs may live in an ``[organize]``
+    TOML section for grouping; keys are flattened into the top-level
+    config dict with the ``organize_`` prefix already present.
     """
     if not path.exists():
         raise FileNotFoundError(
@@ -203,7 +229,22 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
         order = pref.get("retained_cloud_order")
         if order is not None:
             data.setdefault("retained_cloud_order", order)
+    organize = data.pop("organize", None)
+    if isinstance(organize, dict):
+        # ``[organize.domains]`` sub-table is reserved for future rule
+        # customization; keys we recognize today are flattened here.
+        organize.pop("domains", None)
+        for key, value in organize.items():
+            if key.startswith("organize_"):
+                data.setdefault(key, value)
+            else:
+                data.setdefault(f"organize_{key}" if key in _ORGANIZE_PREFIXED else key, value)
     return Config.model_validate(data)
+
+
+# Organizer TOML keys that live under ``[organize]`` without the
+# ``organize_`` prefix (for readability) — the loader adds the prefix.
+_ORGANIZE_PREFIXED: frozenset[str] = frozenset({"confidence_threshold", "dir_mode"})
 
 
 def write_default_config(path: Path = CONFIG_PATH) -> None:

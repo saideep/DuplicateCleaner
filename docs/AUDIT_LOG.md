@@ -40,6 +40,50 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 
 ## Round-by-round history
 
+### v0.3 — organizer core (sub-milestone 5.3-a: discovery pass — read-only)
+
+**Sub-milestone 5.3-a Dev delivered** (2026-09-06): 34 new tests (baseline + 34). Ruff clean on every changed source and test file. Mypy `--strict` clean modulo the pre-existing `unused-ignore` warnings on 3rd-party import stubs (same shape as sub-milestones 2 and 4, documented as unchanged). Zero-behavior-change for local scans; the v0.2 rails still run untouched. Discovery is READ-ONLY — no filesystem writes to user directories.
+
+Shipped:
+- New package `src/duplicate_cleaner/organize/` — five modules:
+  - `plan.py` — Pydantic schemas: `PlanFile`, `PlanEntry`, `CohesionGroup`, `Alternative`, `FiredSignal`. `TAXONOMY_VERSION = "0.3.0"`.
+  - `signals.py` — signal extractors implementing a `SignalExtractor` Protocol. `SignalSet` dataclass carries every signal kind in one flat frozen record. Concrete extractors: `FilenameSignalExtractor` (regex only — dates, seqnos, keywords, static vendor/institution/brokerage lexicons), `MusicSignalExtractor` (mutagen ID3), `PhotoSignalExtractor` (Pillow EXIF + GPS via IFD), `VideoSignalExtractor` (hachoir creation date + duration), `PDFSignalExtractor` (pikepdf Info dict + pdfplumber first-page text, capped at 5000 chars). PDF text keyword classifier via `classify_pdf_text()` — 10 classes, 0.6 confidence threshold. Every heavy third-party import is lazy inside `extract()` so `organize.signals` remains importable on a bare install; missing dep degrades cleanly to an empty `SignalSet`.
+  - `taxonomy.py` — declarative rule catalog. `TaxonomyRule` dataclass with `predicate`, `domain`, `subfolder_template`, `precedence`, `confidence_boost`. `default_rules()` returns the v0.3 rule set: HR/Payslips, HR/OfferLetters, HR/Tax, Personal/IDs, Personal/Insurance, Finances/Receipts, Finances/Statements, Finances/Invoices, Finances/Investments, Photos, Videos, Media/Music, Media/Books, Work. `classify()` returns a `Classification` with domain + subfolder + confidence + top-3 alternatives, using deterministic tie-breaking (score → precedence → template specificity → rule id).
+  - `discover.py` — orchestrator. `discover(roots, config, *, sources=None, store=None, dest_root=None)` walks via existing `iter_files`, extracts signals per file, classifies, and detects per-directory cohesion (80% threshold on shared domain+subfolder tuple). Photo/video event clustering via `cluster_events()` (12h gap default, ≥5 min items). Project-marker detection (`.git`, `pyproject.toml`, etc.) emits `project:` cohesion groups. Returns a `PlanFile` + `DiscoverySummary`.
+  - `render.py` — `render_plan(plan, out_dir)` writes `organize-plan.html` + `organize-plan.json` via a new Jinja2 template `templates/organize-plan.html.j2`. Self-contained (embedded CSS, no external assets). Matches the existing `report.html.j2` visual style with domain grouping, confidence badges, cohesion-group indicators, and per-entry alternatives dropdowns.
+- `store.py` — new `file_signals` table with columns `path, source_id, signal_kind, signal_value, confidence, stored_mtime, extracted_ts`. Idempotent DDL guarded by `CREATE TABLE IF NOT EXISTS`. New helpers `get_cached_signals()` / `put_signal_set()` cache a `SignalSet` as a JSON blob keyed on `(path, source_id, signal_kind="__signalset__")`; mtime drift invalidates the cache (tolerance via `_MTIME_EPS`).
+- `config.py` — five new fields: `organize_confidence_threshold: float = 0.75`, `organize_dir_mode: int = 0o755`, `rename_policy: Literal["preserve", "date_prefix", "date_event_prefix"] = "preserve"` (LOCKED default per invariant), `event_gap_hours: int = 12`, `min_event_photos: int = 5`, `enforce_dedup_ordering: bool = False`. Loader accepts a `[organize]` TOML section and splices its keys into the top-level config dict with the correct prefix.
+- `cli.py` — new `dc organize` subcommand group (Typer sub-app). `dc organize discover <src>... --report DIR` runs the discovery pass, writes both artifacts, and prints the summary (`"Discovered N files across M cohesion groups; proposed taxonomy has K domains."`). Emits a soft warning when pending dedup groups exist unless `--skip-dedup-check` is passed (hard refusal when `enforce_dedup_ordering=true` in config).
+- `pyproject.toml` — core deps added: `mutagen>=1.47.0,<2`, `pikepdf>=9.0.0,<10`, `hachoir>=3.3.0,<4`, `Pillow>=10.4.0,<11`, `pdfplumber>=0.11.4,<0.12`. New optional-extras: `[docs]` (python-docx, python-pptx, openpyxl), `[gps]` (piexif, geopy), `[ocr]` (pytesseract).
+- `tests/test_organize_discovery.py` — 34 new tests:
+  - Signal extractors: date/keyword/seqno/vendor regex hits; mutagen mock ID3 tags → SignalSet; mutagen ImportError → empty SignalSet; Pillow non-image graceful; PDF extractor missing-deps tolerance; `classify_pdf_text` payslip + receipt.
+  - Taxonomy classifier: payslip → HR/Payslips/{year}, music album → Media/Music/{artist}/{album}, receipt+vendor → Finances/Receipts/{year}/{vendor}, sub-threshold → Unsorted, empty signals → flat Unsorted, deterministic tie-break, default_rules stable across calls.
+  - Event clustering: 6h gap → single event, 24h gap → split, empty items → empty list.
+  - Cohesion detection: 4/5 shared classification → group formed; 5 different classifications → no group.
+  - End-to-end discover: full walk over a mixed fixture directory produces a valid Pydantic-round-tripping PlanFile.
+  - Renderer: writes both HTML + JSON to the report dir; HTML contains the expected header.
+  - CLI: `dc organize discover` produces the artifacts, refuses without active_homes, emits soft warning when pending dedup groups exist.
+  - SignalSet cache round-trip: put+get preserves frozenset/tuple fields; mtime drift returns None.
+  - Regression: discover is read-only (source dir unchanged after run); `rename_policy` default is `"preserve"`; organize config defaults sanity check.
+
+Invariants preserved:
+- All pre-existing tests still pass (352 total with the new 34 + parallel v0.2.1 additions).
+- `test_no_forbidden_calls.py` still green over `organize/`. Zero destructive filesystem calls added; discovery does not write.
+- `shutil.move` still confined to `apply/undo.py`.
+- Cloud `Path` never `.resolve()`d (organize discovery is local-only in 5.3-a; forward-compat `sources` parameter is accepted but unused).
+- Cohesive units are marked atomic on every plan entry via `cohesion_group_id`; the eventual `dc organize apply` (5.3-b) will refuse to split them without `--split-cohesive-units`.
+- Rename policy defaults to `"preserve"` — filename bytes are never mutated by discovery output; `PlanEntry.filename` mirrors the source basename.
+- Ruff clean on every changed source and test file. Mypy `--strict` clean on all changed files modulo the pre-existing `unused-ignore` pattern.
+
+Explicitly deferred to 5.3-b and later:
+- `dc organize apply <plan>` + directory creation + collision policy + cross-volume handling (5.3-b).
+- `dc organize undo <manifest>` (5.3-b).
+- Rich TUI `dc organize review` (5.3-e).
+- Cross-source cloud organization (5.3-g).
+- Full PDF classification with real pikepdf tests (5.3-c pending fixture-level PDF fixtures).
+- Full EXIF event clustering with real image fixtures (5.3-d).
+- `--enable-geocode` + Nominatim wiring (5.3-d).
+
 ### v0.1 — exact-duplicate pipeline (shipped: bc974cc / d81fc0d, GitHub push confirmed 2026-09-05)
 
 **First audit (Code Review pass 1 + Security pass 1)** — 12 safety findings + 6 correctness/perf + 2 test gaps = 20 items. 4 DATA-LOSS blockers:
