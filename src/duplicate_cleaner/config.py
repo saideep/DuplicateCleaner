@@ -194,15 +194,18 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "clean_git_repo": 2.0,
     "external_drive_penalty": -2.0,
     "larger_size": 2.0,
-    # v0.2 sub-milestone 5e — cross-source signals.  The two marker-only
-    # weights (``is_shared_file``, ``is_singleton_across_sources``) do NOT
-    # additively affect the score — they force ``is_informational=True``
-    # at the same layer as hardlinks and APFS clones.  Kept in the weight
-    # map so config-round-trip stays stable and so future revisions can
-    # experiment without touching every construction site.
+    # v0.2 sub-milestone 5e — cross-source signals.  The marker-only
+    # weight (``is_shared_file``) does NOT additively affect the score —
+    # it forces ``is_informational=True`` at the same layer as hardlinks
+    # and APFS clones.  Kept in the weight map so config-round-trip stays
+    # stable and so future revisions can experiment without touching
+    # every construction site.
+    #
+    # v0.3-c — ``is_singleton_across_sources`` removed from the weight
+    # map alongside the corresponding field on HashedRecord/ScoredMember
+    # (see audit pass 12 + 13 — dead field).
     "cloud_when_local_exists": -3.0,
     "is_shared_file": 0.0,
-    "is_singleton_across_sources": 0.0,
 }
 
 

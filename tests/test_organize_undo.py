@@ -6,10 +6,13 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from duplicate_cleaner.config import Config
 from duplicate_cleaner.organize.mover import apply_plan
 from duplicate_cleaner.organize.plan import PlanEntry, PlanFile, dest_for
 from duplicate_cleaner.organize.undo import (
+    OrganizeUndoError,
     restore_from_organize_manifest,
 )
 
@@ -100,7 +103,7 @@ def test_organize_undo_rejects_excluded_original_path(tmp_path: Path) -> None:
 
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps({
-        "version": "0.3.0",
+        "manifest_version": "0.3.0",
         "kind": "organize",
         "created_at": "20260906T000000Z",
         "dest_root": str(tmp_path / "organized"),
@@ -113,7 +116,7 @@ def test_organize_undo_rejects_excluded_original_path(tmp_path: Path) -> None:
                 "mtime": 1_700_000_000.0,
                 "cohesion_group_id": None,
                 "cross_volume": False,
-                "ts": "2026-09-06T00:00:00+00:00",
+                "ts": 1_757_116_800.0,
             },
         ],
         "collisions": [],
@@ -245,3 +248,121 @@ def test_organize_undo_refuses_to_overwrite_existing_source(tmp_path: Path) -> N
     assert "already exists" in undo_result.errors[0].lower()
     # User's fresh file is unchanged.
     assert src.read_bytes() == b"user-put-something-back-here"
+
+
+# --------------------------------------------------------------------------- #
+# v0.3-c hardening: Pydantic schema + walker depth cap                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_organize_undo_rejects_malformed_manifest(tmp_path: Path) -> None:
+    """C1: Pydantic ValidationError on manifest schema drift → OrganizeUndoError.
+
+    A hand-edited manifest with ``size="banana"`` (wrong type) must fail
+    at load time — before any move fires — with an actionable message
+    that surfaces the pydantic ValidationError details.  Previously the
+    reader routed through ``json.loads`` + ``dict.get()`` which only
+    enforced ``isinstance(source_path, str)``.
+    """
+    dest_real = tmp_path / "organized" / "HR" / "junk.pdf"
+    dest_real.parent.mkdir(parents=True)
+    dest_real.write_bytes(b"payload")
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "0.3.0",
+        "kind": "organize",
+        "created_at": "20260906T000000Z",
+        "dest_root": str(tmp_path / "organized"),
+        "roots": [str(tmp_path)],
+        "entries": [
+            {
+                "source_path": str(tmp_path / "src" / "junk.pdf"),
+                "dest_path": str(dest_real),
+                "size": "banana",   # ← wrong type; pydantic must reject
+                "mtime": 1_700_000_000.0,
+                "cohesion_group_id": None,
+                "cross_volume": False,
+                "ts": 1_700_000_000.0,
+            },
+        ],
+        "collisions": [],
+    }))
+
+    with pytest.raises(OrganizeUndoError) as excinfo:
+        restore_from_organize_manifest(manifest_path)
+    msg = str(excinfo.value)
+    assert "schema validation" in msg or "size" in msg
+    # No move fired — dest_real is untouched.
+    assert dest_real.exists()
+
+
+def test_organize_undo_empty_parent_walker_capped(tmp_path: Path) -> None:
+    """C4: send2trash on empty parents is capped at 8 hops.
+
+    Construct a manifest with a dest_root that is unreachable from the
+    leaf (a sibling dir), and stack ≥ 10 empty parent dirs above the
+    leaf. Verify the walker sends at most 8 dirs to Trash even though
+    the stop_at check never matches.
+    """
+    # Build a deep empty tree: leaf lives at tmp/leaf-tree/l1/l2/.../l12/file
+    # dest_root points at tmp/other-tree/ — never reached by the parent walker
+    # (walker climbs leaf-tree lineage).
+    deep = tmp_path / "leaf-tree"
+    parent = deep
+    for i in range(12):
+        parent = parent / f"l{i}"
+    parent.mkdir(parents=True)
+    dest_leaf = parent / "file.pdf"
+    dest_leaf.write_bytes(b"payload")
+
+    unreachable_root = tmp_path / "other-tree"
+    unreachable_root.mkdir()
+
+    # Source path safely under tmp so validate_not_excluded passes.
+    src_path = tmp_path / "orig" / "file.pdf"
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({
+        "manifest_version": "0.3.0",
+        "kind": "organize",
+        "created_at": "20260906T000000Z",
+        "dest_root": str(unreachable_root),
+        "roots": [str(tmp_path)],
+        "entries": [
+            {
+                "source_path": str(src_path),
+                "dest_path": str(dest_leaf),
+                "size": len(b"payload"),
+                "mtime": 1_700_000_000.0,
+                "cohesion_group_id": None,
+                "cross_volume": False,
+                "ts": 1_700_000_000.0,
+            },
+        ],
+        "collisions": [],
+    }))
+
+    import send2trash as _s2t_mod
+    real_send2trash = _s2t_mod.send2trash
+
+    cleanup_calls: list[str] = []
+
+    def _spy(target: str) -> None:
+        cleanup_calls.append(target)
+        # Actually delete the empty directory so the next iteration climbs.
+        # Delegate to the pre-patch function so we don't recurse into the
+        # mock.  send2trash on pytest tmp dirs is recoverable.
+        with contextlib.suppress(OSError):
+            real_send2trash(target)
+
+    with patch("send2trash.send2trash", side_effect=_spy):
+        result = restore_from_organize_manifest(manifest_path)
+
+    assert result.restored == 1
+    # Walker capped at 8 hops — must NOT keep going indefinitely just
+    # because stop_at (unreachable_root) never matches.
+    assert len(cleanup_calls) <= 8, (
+        f"empty-parent walker sent {len(cleanup_calls)} dirs to Trash; "
+        f"cap is 8 hops. Calls: {cleanup_calls}"
+    )

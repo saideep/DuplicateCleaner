@@ -37,6 +37,11 @@ class HashedRecord:
     ``FileRecord`` so the post-hash reconciliation pass and the mover
     dispatch on cross-source groups can find them.  ``reconciled`` marks
     members whose ``full_hash`` was normalised by cross-algo reconciliation.
+
+    v0.3-c — the ``is_singleton_across_sources`` field was removed as
+    dead code (audit pass 12 + 13): no production code path ever set it
+    to True.  Singleton-safety is enforced elsewhere (mover, and the
+    scorer's group-size-1 filter via ``group_by_hash``).
     """
 
     path: Path
@@ -51,7 +56,6 @@ class HashedRecord:
     # v0.2 additions — all defaulted so v0.1.1 constructions keep working.
     source_id: str = "local"
     is_shared: bool = False
-    is_singleton_across_sources: bool = False
     # v0.2.1 additions — preserve cloud-side fields so reconciliation and
     # the mover can dispatch cross-source groups.
     foreign_hash: str | None = None

@@ -518,8 +518,13 @@ def test_cli_organize_discover_pending_dedup_prints_warning(tmp_path: Path) -> N
                     "--report", str(tmp_path / "out"),
                 ],
             )
-    combined = result.stdout + (result.stderr or "")
-    assert "pending dedup" in combined.lower() or "Warning" in combined
+    # Rich's console.print routes to stdout by default; stderr is not
+    # separately captured on the default CliRunner (mix_stderr=True) so we
+    # can't safely reference result.stderr. Warning text lands in stdout.
+    assert (
+        "pending dedup" in result.stdout.lower()
+        or "warning" in result.stdout.lower()
+    )
 
 
 def test_extract_all_universal_signals(tmp_path: Path) -> None:
@@ -605,3 +610,126 @@ def test_config_organize_defaults() -> None:
     assert c.event_gap_hours == 12
     assert c.min_event_photos == 5
     assert c.enforce_dedup_ordering is False
+
+
+# --------------------------------------------------------------------------- #
+# C3: EXIF-first event clustering (v0.3-c)                                    #
+# --------------------------------------------------------------------------- #
+
+
+def test_event_clustering_uses_exif_timestamp(tmp_path: Path) -> None:
+    """PlanEntry.capture_ts drives event clustering when EXIF is present.
+
+    Simulate a folder of 6 photos with EXIF DateTimeOriginal spanning 3
+    calendar days but mtimes collapsed into a 5-minute window (a fresh
+    download from a camera).  With EXIF-first clustering (design § 4)
+    the entries must split into multiple date-based events, not one
+    "download-day" event.
+    """
+    from duplicate_cleaner.config import Config as _Cfg
+    from duplicate_cleaner.organize.discover import _apply_event_clustering
+    from duplicate_cleaner.organize.plan import (
+        CohesionGroup,
+        PlanEntry,
+        dest_for,
+    )
+
+    # 3 photos on 2024-01-01 12:00-12:30 (three shots 15 min apart)
+    # 3 photos on 2024-01-03 12:00-12:30 (a full day + gap of 48h)
+    # All mtimes: 2024-06-15 12:00 (recent download).  Noon-UTC anchors
+    # keep the local-time date determinism intact under CI offsets.
+    day1_base = 1_704_110_400.0  # 2024-01-01 12:00 UTC
+    day3_base = 1_704_283_200.0  # 2024-01-03 12:00 UTC (2 days after)
+    recent_mtime = 1_718_452_800.0  # 2024-06-15 12:00 UTC (all share this)
+
+    entries: list[PlanEntry] = []
+    for i, cap_ts in enumerate([
+        day1_base, day1_base + 900, day1_base + 1800,
+        day3_base, day3_base + 900, day3_base + 1800,
+    ]):
+        p = tmp_path / f"IMG_{i:04d}.HEIC"
+        p.write_bytes(b"stub-heic-payload")
+        entries.append(PlanEntry(
+            source_path=p,
+            proposed_dest=dest_for("Photos", "2024/2024-06", p.name),
+            domain="Photos",
+            subfolder="2024/2024-06",
+            filename=p.name,
+            size=p.stat().st_size,
+            mtime=recent_mtime,
+            capture_ts=cap_ts,
+            confidence=0.9,
+        ))
+
+    cfg = _Cfg(active_homes=[tmp_path], min_event_photos=3, event_gap_hours=12)
+    cohesion_groups: list[CohesionGroup] = []
+    _apply_event_clustering(entries, cohesion_groups, cfg)
+
+    # Two events must form — one per capture day. If clustering fell back
+    # to mtime (all identical), only ONE event would emerge.
+    event_cohesion_ids = {
+        e.cohesion_group_id for e in entries
+        if e.cohesion_group_id is not None
+        and e.cohesion_group_id.startswith("event:")
+    }
+    assert len(event_cohesion_ids) >= 2, (
+        f"expected ≥ 2 date-based events, got {event_cohesion_ids}. "
+        f"Clustering may have fallen back to mtime."
+    )
+    # Each entry's subfolder should encode its capture date, not the
+    # mtime download date (2024-06-XX).
+    subfolders = {e.subfolder for e in entries}
+    assert any("2024-01-01" in s for s in subfolders), (
+        f"expected 2024-01-01 subfolder from EXIF ts; got {subfolders}"
+    )
+    assert any("2024-01-03" in s for s in subfolders), (
+        f"expected 2024-01-03 subfolder from EXIF ts; got {subfolders}"
+    )
+
+
+def test_event_clustering_falls_back_to_mtime_when_no_exif(tmp_path: Path) -> None:
+    """When ``capture_ts is None`` (no EXIF/video ts), mtime drives clustering."""
+    from duplicate_cleaner.config import Config as _Cfg
+    from duplicate_cleaner.organize.discover import _apply_event_clustering
+    from duplicate_cleaner.organize.plan import (
+        CohesionGroup,
+        PlanEntry,
+        dest_for,
+    )
+
+    day_base = 1_704_110_400.0  # 2024-01-01 12:00 UTC
+    entries: list[PlanEntry] = []
+    for i in range(5):
+        p = tmp_path / f"nooexif_{i}.jpg"
+        p.write_bytes(b"stub")
+        entries.append(PlanEntry(
+            source_path=p,
+            proposed_dest=dest_for("Photos", "2024/2024-01", p.name),
+            domain="Photos",
+            subfolder="2024/2024-01",
+            filename=p.name,
+            size=p.stat().st_size,
+            mtime=day_base + i * 60.0,  # 5 photos spaced 1 min apart
+            capture_ts=None,  # ← no EXIF
+            confidence=0.9,
+        ))
+
+    cfg = _Cfg(active_homes=[tmp_path], min_event_photos=5, event_gap_hours=12)
+    cohesion_groups: list[CohesionGroup] = []
+    _apply_event_clustering(entries, cohesion_groups, cfg)
+
+    # Fallback to mtime — all within 1-minute window → single event.
+    event_cohesion_ids = {
+        e.cohesion_group_id for e in entries
+        if e.cohesion_group_id is not None
+        and e.cohesion_group_id.startswith("event:")
+    }
+    assert len(event_cohesion_ids) == 1, (
+        f"mtime-fallback clustering should produce exactly one event; "
+        f"got {event_cohesion_ids}"
+    )
+    # The subfolder must reflect the mtime date (2024-01-01).
+    subfolders = {e.subfolder for e in entries}
+    assert any("2024-01-01" in s for s in subfolders), (
+        f"expected mtime-based 2024-01-01 subfolder; got {subfolders}"
+    )

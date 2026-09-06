@@ -230,7 +230,11 @@ def _build_entry(
     ]
     filename = record.path.name
     dest = dest_for(cls.domain, cls.subfolder, filename)
-    _ = signals  # signals already reflected in ``cls.matched_signals``
+    # v0.3-c: prefer EXIF DateTimeOriginal / video creation date over
+    # mtime for event clustering (design § 4).  Falls back to None when
+    # no capture metadata was extracted; the clustering pass in
+    # ``_apply_event_clustering`` then defaults to ``mtime``.
+    capture_ts = signals.exif_ts_epoch or signals.video_ts_epoch
     return PlanEntry(
         source_id=record.source_id,
         source_path=record.path,
@@ -240,6 +244,7 @@ def _build_entry(
         filename=filename,
         size=record.size,
         mtime=record.mtime,
+        capture_ts=capture_ts,
         confidence=cls.confidence,
         signals=fired,
         alternatives=alternatives,
@@ -423,14 +428,16 @@ def _apply_event_clustering(
 
 
 def _timestamp_for_entry(entry: PlanEntry) -> float | None:
-    """Pull the best available capture timestamp for event clustering."""
-    # Signals are collapsed to FiredSignal(kind, value) on the entry; we
-    # can't reach back to the SignalSet from here.  Use mtime as the
-    # deterministic fallback — the second-pass caller already had EXIF
-    # signals available and encoded them into the classification, but for
-    # clustering purposes mtime is a safe approximation when EXIF is
-    # absent.
-    return entry.mtime
+    """Pull the best available capture timestamp for event clustering.
+
+    v0.3-c: EXIF-first per design § 4.  ``PlanEntry.capture_ts`` is
+    stamped from ``SignalSet.exif_ts_epoch`` / ``video_ts_epoch`` in
+    :func:`_build_entry`.  Falls back to ``mtime`` when no capture
+    timestamp was extracted — a folder of freshly-downloaded photos
+    whose mtimes all cluster in a 5-minute window will now split into
+    date-based events based on their actual EXIF capture times.
+    """
+    return entry.capture_ts if entry.capture_ts is not None else entry.mtime
 
 
 def _record_signals(records: Iterable[FileRecord]) -> None:

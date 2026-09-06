@@ -361,7 +361,7 @@ def test_organize_apply_manifest_records_entries(tmp_path: Path) -> None:
     assert result.moved == 2
 
     manifest = json.loads(Path(result.manifest_path).read_text())  # type: ignore[arg-type]
-    assert manifest["version"] == "0.3.0"
+    assert manifest["manifest_version"] == "0.3.0"
     assert manifest["kind"] == "organize"
     assert len(manifest["entries"]) == 2
     for e in manifest["entries"]:
@@ -369,3 +369,173 @@ def test_organize_apply_manifest_records_entries(tmp_path: Path) -> None:
         assert "dest_path" in e
         assert "size" in e
         assert "mtime" in e
+
+
+# --------------------------------------------------------------------------- #
+# v0.3-c cross-volume hardening (C2 + C6)                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_cross_volume_happy_path(tmp_path: Path) -> None:
+    """C6: cross-volume dispatch runs copy2 + BLAKE3 verify + send2trash(source).
+
+    Patches ``_same_volume`` to return False so the cross-volume branch
+    fires even though source + dest are on the same real filesystem.
+    Verifies the manifest row records ``cross_volume=True``.
+    """
+    src = _mk_source(tmp_path, name="cv.pdf", body=b"cross-volume-bytes")
+    plan_path = _mk_plan(tmp_path, [_mk_entry(src)])
+    cfg = _mk_cfg(tmp_path)
+
+    copy_calls: list[tuple[str, str]] = []
+    trash_calls: list[str] = []
+
+    import shutil as _shutil_mod
+
+    import send2trash as _s2t_mod
+    real_copy2 = _shutil_mod.copy2
+    real_send2trash = _s2t_mod.send2trash
+
+    def _spy_copy2(a: str, b: str) -> str:
+        copy_calls.append((a, b))
+        return str(real_copy2(a, b))
+
+    def _spy_trash(target: str) -> None:
+        trash_calls.append(target)
+        # Delegate to the pre-patch function so we don't recurse.
+        real_send2trash(target)
+
+    with (
+        patch(
+            "duplicate_cleaner.organize.mover._same_volume",
+            return_value=False,
+        ),
+        patch("shutil.copy2", side_effect=_spy_copy2),
+        patch("send2trash.send2trash", side_effect=_spy_trash),
+    ):
+        result = apply_plan(
+            plan_path, commit=True, config=cfg, runs_dir=tmp_path / "runs"
+        )
+
+    assert result.moved == 1
+    assert copy_calls, "shutil.copy2 was not invoked on the cross-volume path"
+    # Trash was called on the source (may also be called for empty-parent
+    # cleanup in undo; here only source-trash counts).
+    assert any(str(src) == t for t in trash_calls), (
+        f"send2trash(source) not called. Trash calls: {trash_calls}"
+    )
+    manifest = json.loads(Path(result.manifest_path).read_text())  # type: ignore[arg-type]
+    assert manifest["entries"][0]["cross_volume"] is True
+
+
+def test_cross_volume_copy_verifies_content_hash(tmp_path: Path) -> None:
+    """C6 + audit pass 13 #1: BLAKE3 verify runs on cross-volume path.
+
+    Simulate a bit-flip during shutil.copy2 by replacing the dest file's
+    content between copy and verify. On hash mismatch the mover must
+    send the botched dest to Trash + raise OrganizeApplyError. Source
+    must remain untouched.
+    """
+    import contextlib as _contextlib
+
+    src = _mk_source(tmp_path, name="cv-verify.pdf", body=b"original-content-here")
+    plan_path = _mk_plan(tmp_path, [_mk_entry(src)])
+    cfg = _mk_cfg(tmp_path)
+
+    import shutil as _shutil_mod
+
+    import send2trash as _s2t_mod
+    real_copy2 = _shutil_mod.copy2
+    real_send2trash = _s2t_mod.send2trash
+
+    def _flip_copy2(a: str, b: str) -> str:
+        real_copy2(a, b)
+        # Simulate a bit-flip mid-copy: same file size, different content.
+        Path(b).write_bytes(b"BITFLIPPED-CONTENT-XX")
+        return b
+
+    trash_calls: list[str] = []
+
+    def _spy_trash(target: str) -> None:
+        trash_calls.append(target)
+        with _contextlib.suppress(OSError):
+            real_send2trash(target)
+
+    with (
+        patch(
+            "duplicate_cleaner.organize.mover._same_volume",
+            return_value=False,
+        ),
+        patch("shutil.copy2", side_effect=_flip_copy2),
+        patch("send2trash.send2trash", side_effect=_spy_trash),
+        pytest.raises(OrganizeApplyError) as excinfo,
+    ):
+        apply_plan(plan_path, commit=True, config=cfg, runs_dir=tmp_path / "runs")
+
+    msg = str(excinfo.value).lower()
+    assert "content hash" in msg or "hash" in msg
+    # Source is intact — untouched by the failed cross-volume copy.
+    assert src.exists()
+    assert src.read_bytes() == b"original-content-here"
+    # Trash was called on the botched dest, NOT on the source.
+    assert trash_calls, "send2trash was never called for the botched dest"
+    assert not any(str(src) == t for t in trash_calls), (
+        f"source was trashed on hash-mismatch — must not happen. Calls: {trash_calls}"
+    )
+
+
+def test_cross_volume_send2trash_failure_trashes_dest_not_source(
+    tmp_path: Path,
+) -> None:
+    """C2: send2trash on source fails after verified copy → dest is trashed, error raised.
+
+    Cross-volume copy succeeds, BLAKE3 verify passes, then send2trash on
+    the source raises OSError.  The mover MUST trash the successful dest
+    copy (one-file-one-location) and raise OrganizeApplyError with an
+    actionable message. Source stays intact (data safe); dest is
+    reclaimed so the operator's disk usage does not silently double.
+    """
+    src = _mk_source(
+        tmp_path, name="cv-trash-fail.pdf", body=b"safe-source-bytes"
+    )
+    plan_path = _mk_plan(tmp_path, [_mk_entry(src)])
+    cfg = _mk_cfg(tmp_path)
+
+    # send2trash raises on the SOURCE but works on the dest cleanup.
+    src_str = str(src)
+    trash_calls: list[str] = []
+
+    import send2trash as _s2t_mod
+    real_send2trash = _s2t_mod.send2trash
+
+    def _selective_trash(target: str) -> None:
+        trash_calls.append(target)
+        if target == src_str:
+            raise OSError("simulated Trash permission drift on source")
+        # For non-source targets (dest cleanup, empty parents) succeed via
+        # the pre-patch function so we don't recurse into the mock.
+        real_send2trash(target)
+
+    with (
+        patch(
+            "duplicate_cleaner.organize.mover._same_volume",
+            return_value=False,
+        ),
+        patch("send2trash.send2trash", side_effect=_selective_trash),
+        pytest.raises(OrganizeApplyError) as excinfo,
+    ):
+        apply_plan(plan_path, commit=True, config=cfg, runs_dir=tmp_path / "runs")
+
+    msg = str(excinfo.value)
+    assert "send2trash" in msg.lower() or "cross-volume" in msg.lower()
+    # send2trash was called on source (failed) AND on dest (fallback).
+    assert src_str in trash_calls, (
+        f"send2trash(source) never attempted. Calls: {trash_calls}"
+    )
+    dest_expected = tmp_path / "organized" / "HR" / "Payslips" / "2024" / "cv-trash-fail.pdf"
+    assert any(str(dest_expected) == t for t in trash_calls), (
+        f"send2trash(dest) fallback not attempted. Calls: {trash_calls}"
+    )
+    # Source is untouched — data intact.
+    assert src.exists()
+    assert src.read_bytes() == b"safe-source-bytes"

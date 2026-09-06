@@ -11,8 +11,6 @@ Invariants under test:
   sibling with a penalty large enough to keep local as keeper.
 * ``is_shared=True`` on a cloud member marks it informational — a shared
   file is NEVER a discard candidate (AUDIT_LOG invariant).
-* ``is_singleton_across_sources=True`` marks a member informational —
-  defense-in-depth against upstream mistakes.
 * When a group has no local member, the earliest source id listed in
   ``retained_cloud_order`` wins the keeper role.
 * A cloud source id absent from ``retained_cloud_order`` sorts strictly
@@ -39,7 +37,6 @@ def _hr(
     inode: int | None = None,
     source_id: str = "local",
     is_shared: bool = False,
-    is_singleton_across_sources: bool = False,
 ) -> HashedRecord:
     """Small factory — every test tweaks only the fields it cares about."""
     return HashedRecord(
@@ -52,7 +49,6 @@ def _hr(
         full_hash="H" * 64,
         source_id=source_id,
         is_shared=is_shared,
-        is_singleton_across_sources=is_singleton_across_sources,
     )
 
 
@@ -108,40 +104,6 @@ def test_shared_cloud_file_is_informational(tmp_path: Path) -> None:
     assert by_source["gdrive:personal"].is_informational
     assert not by_source["gdrive:personal"].is_proposed_keeper
     assert by_source["local"].is_proposed_keeper
-
-
-def test_singleton_across_sources_never_discard(tmp_path: Path) -> None:
-    """A member flagged is_singleton_across_sources is informational.
-
-    Defense-in-depth: the upstream mover already refuses to discard
-    singletons; the scorer enforces the same invariant so a poisoned
-    HashedRecord that reaches the scorer with an unmatched hash can never
-    end up as a discard candidate.
-    """
-    active = tmp_path / "Users" / "me"
-    (active / "Documents").mkdir(parents=True)
-    local_peer = active / "Documents" / "peer.bin"
-    local_peer.write_bytes(b"x")
-    singleton_path = Path("gdrive:personal://Unique/only-here.bin")
-
-    group = Group(
-        hash="H",
-        size=1,
-        members=[
-            _hr(local_peer, source_id="local"),
-            _hr(
-                singleton_path,
-                source_id="gdrive:personal",
-                is_singleton_across_sources=True,
-            ),
-        ],
-    )
-    cfg = Config(active_homes=[active])
-    members = score_group(group, cfg, DEFAULT_WEIGHTS)
-    by_source = {m.source_id: m for m in members}
-
-    assert by_source["gdrive:personal"].is_informational
-    assert not by_source["gdrive:personal"].is_proposed_keeper
 
 
 def test_retained_cloud_order_when_no_local() -> None:

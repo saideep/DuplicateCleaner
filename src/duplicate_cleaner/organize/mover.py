@@ -17,13 +17,17 @@ import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
 
 import blake3  # type: ignore[import-untyped]
 import send2trash  # type: ignore[import-untyped]
 
 from duplicate_cleaner.config import Config, load_config
-from duplicate_cleaner.organize.plan import PlanEntry, PlanFile
+from duplicate_cleaner.organize.plan import (
+    OrganizeManifest,
+    OrganizeManifestEntry,
+    PlanEntry,
+    PlanFile,
+)
 from duplicate_cleaner.paths import (
     is_within,
     resolve_for_check,
@@ -265,15 +269,16 @@ def _check_cohesion(
     )
 
 
-def _write_manifest(manifest_path: Path, data: dict[str, Any]) -> None:
-    """Atomically write ``data`` — tempfile + fsync + os.replace + dir fsync.
+def _write_manifest(manifest_path: Path, payload: str) -> None:
+    """Atomically write ``payload`` — tempfile + fsync + os.replace + dir fsync.
 
-    Mirrors :func:`duplicate_cleaner.apply.mover._write_manifest`.
+    Mirrors :func:`duplicate_cleaner.apply.mover._write_manifest`.  ``payload``
+    is the serialized JSON string produced by ``OrganizeManifest.model_dump_json``.
     """
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
     with open(tmp, "w") as f:
-        json.dump(data, f, indent=2, default=str)
+        f.write(payload)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, manifest_path)
@@ -353,7 +358,37 @@ def _do_move(
             f"differs from {dest} after copy — botched copy trashed, "
             f"source is untouched."
         )
-    send2trash.send2trash(str(source))
+    # Audit pass 13 finding #4: send2trash-failure orphan handling. If
+    # send2trash on the source fails after the verified copy, we have a
+    # dest copy the manifest hasn't recorded yet AND a live source. Data
+    # is safe (source untouched, no bytes lost), but leaving the orphan
+    # copy at dest silently doubles disk usage. Trash the dest copy so
+    # the operator can rerun with a clean state — the source is
+    # verified-intact, so this discards only the redundant work, not
+    # data.
+    try:
+        send2trash.send2trash(str(source))
+    except OSError as e:
+        log.error(
+            "send2trash failed on source %s after successful cross-volume "
+            "copy to %s: %s — trashing the dest copy to keep one-file-one-"
+            "location and re-raising so the run aborts cleanly.",
+            source, dest, e,
+        )
+        try:
+            send2trash.send2trash(str(dest))
+        except OSError as inner_e:
+            log.error(
+                "Also failed to trash the dest copy %s: %s — operator "
+                "must manually clean it up.", dest, inner_e,
+            )
+        raise OrganizeApplyError(
+            f"Cross-volume copy verified but send2trash failed on source "
+            f"{source}: {e}. The verified copy at {dest} has been sent to "
+            f"Trash so source remains the sole location. Re-run "
+            f"`dc organize apply --commit` after resolving the "
+            f"send2trash permission / space issue."
+        ) from e
     return True
 
 
@@ -478,22 +513,23 @@ def apply_plan(
         _verify_source_unchanged(entry, src_resolved)
     result.verified = len(prepared)
 
-    entries_out: list[dict[str, Any]] = []
+    entries_out: list[OrganizeManifestEntry] = []
     collisions: list[dict[str, str]] = []
+    run_ts_epoch = datetime.now(UTC).timestamp()
 
     def _flush_manifest() -> None:
-        _write_manifest(
-            manifest_path,
-            {
-                "version": "0.3.0",
-                "kind": "organize",
-                "created_at": ts,
-                "dest_root": str(dest_root_resolved),
-                "roots": [str(r) for r in plan.roots],
-                "entries": list(entries_out),
-                "collisions": list(collisions),
-            },
+        manifest = OrganizeManifest(
+            manifest_version="0.3.0",
+            kind="organize",
+            created_at=ts,
+            dest_root=dest_root_resolved,
+            roots=[str(r) for r in plan.roots],
+            entries=list(entries_out),
+            collisions=list(collisions),
+            plan_path=str(plan_path),
+            run_ts=run_ts_epoch,
         )
+        _write_manifest(manifest_path, manifest.model_dump_json(indent=2))
 
     # Manifest is written BEFORE the first move so a crash mid-loop is still
     # recoverable via ``dc organize undo``.
@@ -518,16 +554,17 @@ def apply_plan(
             ) from e
 
         entries_out.append(
-            {
-                "source_path": str(entry.source_path),
-                "source_resolved": str(src_resolved),
-                "dest_path": str(final_dest),
-                "size": entry.size,
-                "mtime": entry.mtime,
-                "cohesion_group_id": entry.cohesion_group_id,
-                "cross_volume": cross_volume,
-                "ts": datetime.now(UTC).isoformat(),
-            }
+            OrganizeManifestEntry(
+                source_path=entry.source_path,
+                dest_path=final_dest,
+                size=entry.size,
+                mtime=entry.mtime,
+                hash=None,
+                capture_ts=entry.capture_ts,
+                cohesion_group_id=entry.cohesion_group_id,
+                cross_volume=cross_volume,
+                ts=datetime.now(UTC).timestamp(),
+            )
         )
         result.moved += 1
         _flush_manifest()

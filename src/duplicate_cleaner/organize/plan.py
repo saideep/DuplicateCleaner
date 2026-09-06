@@ -29,7 +29,16 @@ class Alternative(BaseModel):
 
 
 class PlanEntry(BaseModel):
-    """One file's proposed destination."""
+    """One file's proposed destination.
+
+    ``capture_ts`` is the best-available capture timestamp (EXIF
+    DateTimeOriginal or video creation date) in seconds since epoch, per
+    design § 4.  ``None`` when no metadata was extracted — the event-
+    clustering pass in :mod:`organize.discover` then falls back to
+    ``mtime``.  Wired up in v0.3-c (audit pass 13 finding: the previous
+    ``_timestamp_for_entry`` unconditionally returned mtime, defeating
+    EXIF-based event boundaries).
+    """
 
     source_id: str = "local"
     source_path: Path
@@ -39,6 +48,7 @@ class PlanEntry(BaseModel):
     filename: str
     size: int
     mtime: float
+    capture_ts: float | None = None
     confidence: float
     signals: list[FiredSignal] = Field(default_factory=list)
     alternatives: list[Alternative] = Field(default_factory=list)
@@ -94,3 +104,53 @@ def dest_for(domain: str, subfolder: str, filename: str) -> str:
         parts.extend(str(PurePosixPath(subfolder)).split("/"))
     parts.append(filename)
     return str(PurePosixPath(*parts))
+
+
+# --------------------------------------------------------------------------- #
+# Organize undo manifest schema (v0.3-c)                                      #
+# --------------------------------------------------------------------------- #
+
+
+class OrganizeManifestEntry(BaseModel):
+    """One row of an organize apply manifest.
+
+    Written by :mod:`duplicate_cleaner.organize.mover` after each successful
+    move, read by :mod:`duplicate_cleaner.organize.undo` on restore.  Every
+    field is required — a hand-edited manifest with a missing or wrong-
+    typed column raises a Pydantic ``ValidationError`` at load time (audit
+    pass 13 finding: previously routed via ``json.loads`` + ``dict.get``
+    which only enforced ``isinstance(source, str)``).
+    """
+
+    source_path: Path
+    dest_path: Path
+    size: int
+    mtime: float
+    hash: str | None = None
+    capture_ts: float | None = None
+    cohesion_group_id: str | None = None
+    cross_volume: bool = False
+    ts: float
+
+
+class OrganizeManifest(BaseModel):
+    """Top-level envelope for an organize apply manifest.
+
+    v0.3-c: schema-locked so a hand-edited manifest cannot silently
+    degrade to per-field ``dict.get`` behaviour on undo.  ``dest_root``
+    is required — a manifest with a missing dest_root cannot bound the
+    empty-parent-cleanup walker to a safe subtree (audit pass 13
+    finding).  ``manifest_version`` is the modern spelling; the legacy
+    key ``"version"`` remains recognised by :meth:`load_permissive` for
+    forward compatibility.
+    """
+
+    manifest_version: Literal["0.3.0"] = "0.3.0"
+    kind: Literal["organize"] = "organize"
+    created_at: str
+    dest_root: Path
+    roots: list[str] = Field(default_factory=list)
+    entries: list[OrganizeManifestEntry] = Field(default_factory=list)
+    collisions: list[dict[str, str]] = Field(default_factory=list)
+    plan_path: str | None = None
+    run_ts: float | None = None

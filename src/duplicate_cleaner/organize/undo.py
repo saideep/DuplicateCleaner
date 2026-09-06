@@ -9,19 +9,26 @@ forbidden-calls test allowlist is extended to include it.
 """
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
+from pydantic import ValidationError
+
+from duplicate_cleaner.organize.plan import OrganizeManifest
 from duplicate_cleaner.paths import (
     resolve_for_check,
     validate_not_excluded,
 )
 
 log = logging.getLogger(__name__)
+
+# Audit pass 13 finding: cap the empty-parent-cleanup walker at 8 hops
+# even when the manifest's dest_root check is intact. Belt-and-braces
+# against a hand-edited manifest whose dest_root points somewhere the
+# walker will never reach (a sibling volume, a moved directory).
+_EMPTY_PARENT_MAX_HOPS = 8
 
 
 class OrganizeUndoError(RuntimeError):
@@ -51,14 +58,23 @@ def _remove_empty_parents(leaf: Path, stop_at: Path | None) -> None:
     ``tests/test_no_forbidden_calls.py``) and instead route removal via
     ``send2trash`` so an accidentally non-empty directory ends up in Trash
     rather than being nuked in place.
+
+    Audit pass 13 finding: bound the walker at ``_EMPTY_PARENT_MAX_HOPS``
+    hops even when ``stop_at`` looks correct.  A hand-edited manifest
+    whose ``dest_root`` points at a moved / sibling-volume directory
+    could otherwise let the walker climb until ``parent.exists()`` is
+    False — which is a lot of send2trash calls.  Every real dedup /
+    organize tree is well within 8 levels of ``dest_root``.
     """
     import send2trash  # type: ignore[import-untyped]
 
     stop_resolved = resolve_for_check(stop_at) if stop_at is not None else None
     parent = leaf.parent
-    while parent.exists() and (
-        stop_resolved is None or resolve_for_check(parent) != stop_resolved
-    ):
+    for _hop in range(_EMPTY_PARENT_MAX_HOPS):
+        if not parent.exists():
+            return
+        if stop_resolved is not None and resolve_for_check(parent) == stop_resolved:
+            return
         try:
             entries = list(parent.iterdir())
         except OSError:
@@ -80,6 +96,10 @@ def restore_from_organize_manifest(
 
     Safety rails:
 
+    * Manifest loaded via Pydantic ``OrganizeManifest.model_validate_json``
+      — a hand-edited manifest with a wrong-typed column (e.g. ``size="banana"``)
+      raises :class:`OrganizeUndoError` before any move fires (audit
+      pass 13 finding).
     * Each ``source_path`` must resolve outside ``EXCLUDED_ROOTS`` — a
       poisoned manifest cannot coerce restore into planting a file at
       ``~/Library/...`` or ``/System``.
@@ -88,38 +108,28 @@ def restore_from_organize_manifest(
     * If a ``source_path`` already exists on disk, refuse to overwrite it
       and skip the entry (symmetric with ``apply/undo.py`` behaviour).
     * After a successful restore, best-effort remove any parent directories
-      that became empty inside the organize destination tree.
+      that became empty inside the organize destination tree, bounded at
+      :data:`_EMPTY_PARENT_MAX_HOPS` hops.
     """
-    data = json.loads(manifest_path.read_text())
-    entries: list[dict[str, Any]] = data.get("entries", [])
-    dest_root_raw = data.get("dest_root")
-    dest_root = Path(dest_root_raw) if isinstance(dest_root_raw, str) else None
+    raw = manifest_path.read_text()
+    try:
+        manifest = OrganizeManifest.model_validate_json(raw)
+    except ValidationError as e:
+        raise OrganizeUndoError(
+            f"Refusing to restore: manifest at {manifest_path} failed schema "
+            f"validation. This usually means the file was hand-edited or "
+            f"produced by a different tool version. Details: {e}"
+        ) from e
 
-    result = RestoreOrganizeResult(total=len(entries))
-    for entry in entries:
-        source_str = entry.get("source_path")
-        dest_str = entry.get("dest_path")
-        if not isinstance(source_str, str) or not isinstance(dest_str, str):
-            result.errors.append(
-                f"Manifest entry missing source_path/dest_path: {entry!r}"
-            )
-            continue
-        source_path = Path(source_str)
-        dest_path = Path(dest_str)
+    dest_root = manifest.dest_root
+
+    result = RestoreOrganizeResult(total=len(manifest.entries))
+    for entry in manifest.entries:
+        source_path = entry.source_path
+        dest_path = entry.dest_path
 
         try:
             resolved_source = _validate_original_path(source_path)
-        except ValueError as e:
-            result.errors.append(
-                f"Refuse to restore into excluded location {source_path}: {e}"
-            )
-            continue
-
-        # A second check: reject a manifest that says "restore this file to
-        # /Volumes/*/System/..." even if the raw string didn't trip an
-        # exclusion.  ``resolve_for_check`` normalises symlinks first.
-        try:
-            validate_not_excluded(resolved_source)
         except ValueError as e:
             result.errors.append(
                 f"Refuse to restore into excluded location {source_path}: {e}"
@@ -148,7 +158,7 @@ def restore_from_organize_manifest(
 
         # Cleanup empty parent dirs under the organize destination tree, but
         # stop at ``dest_root`` so we never walk above the operator's chosen
-        # organize root.  Missing / non-string dest_root → no cleanup.
+        # organize root.  Bounded at _EMPTY_PARENT_MAX_HOPS.
         _remove_empty_parents(dest_path, dest_root)
 
     return result

@@ -363,7 +363,6 @@ def _replace_hash(rec: HashedRecord, new_hash: str) -> HashedRecord:
         is_bundle=rec.is_bundle,
         source_id=rec.source_id,
         is_shared=rec.is_shared,
-        is_singleton_across_sources=rec.is_singleton_across_sources,
         foreign_hash=rec.foreign_hash,
         etag=rec.etag,
         cloud_file_id=rec.cloud_file_id,

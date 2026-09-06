@@ -58,9 +58,13 @@ class ScoredMember:
     v0.2 sub-milestone 5e — carries the source-side fields the scorer
     needs for cross-source signals.  ``source_id`` defaults to ``"local"``
     so every v0.1.1 construction site keeps working; cloud sources stamp
-    their own id.  ``is_shared`` and ``is_singleton_across_sources`` are
-    monotone informational-only markers — once True, no scoring rule can
-    make the member a discard candidate.
+    their own id.  ``is_shared`` is a monotone informational-only marker —
+    once True, no scoring rule can make the member a discard candidate.
+
+    v0.3-c — the ``is_singleton_across_sources`` field was removed as
+    dead code (audit pass 12 + 13).  No production code path ever set
+    it to True; the singleton-never-a-discard invariant is enforced at
+    the mover and by ``group_by_hash`` filtering group size < 2.
     """
 
     path: Path
@@ -80,7 +84,6 @@ class ScoredMember:
     # construction sites keep passing untouched.
     source_id: str = "local"
     is_shared: bool = False
-    is_singleton_across_sources: bool = False
     # v0.2.1 additions — plumb the cloud identity fields through to the
     # report so the mover can dispatch cross-source discards, and mark
     # members whose hash was normalised by cross-algo reconciliation.
@@ -189,7 +192,6 @@ def score_group(
             is_bundle=h.is_bundle,
             source_id=h.source_id,
             is_shared=h.is_shared,
-            is_singleton_across_sources=h.is_singleton_across_sources,
             cloud_file_id=h.cloud_file_id,
             etag=h.etag,
             owner=h.owner,
@@ -206,18 +208,20 @@ def score_group(
             m.is_informational = True
 
     # v0.2 sub-milestone 5e — cross-source informational-only markers.
-    # ``is_shared`` (cloud shared-with-me files) and
-    # ``is_singleton_across_sources`` (files whose hash appears exactly
-    # once across every configured source) are monotone informational
-    # flags — once set, no other signal can un-set them.  Applied at the
-    # same layer as archive/hardlink/APFS marking so the scorer never
-    # proposes deleting either kind.  Enforced here for defense-in-depth
-    # even though upstream code paths (mover, hash pipeline) also honor
-    # the invariants.
+    # ``is_shared`` (cloud shared-with-me files) is a monotone
+    # informational flag — once set, no other signal can un-set it.
+    # Applied at the same layer as archive/hardlink/APFS marking so the
+    # scorer never proposes deleting a shared file.  Enforced here for
+    # defense-in-depth even though upstream code paths (mover, hash
+    # pipeline) also honor the invariant.
+    #
+    # v0.3-c — the sibling ``is_singleton_across_sources`` field was
+    # removed as dead code (audit pass 12 + 13): the invariant was never
+    # actually set to True in production, and singleton-safety is now
+    # enforced by ``group_by_hash`` filtering group size < 2 plus the
+    # mover's own singleton guard.
     for m in members:
         if m.is_shared:
-            m.is_informational = True
-        if m.is_singleton_across_sources:
             m.is_informational = True
 
     # Hard-link detection: two-pass so every member of an inode family is
