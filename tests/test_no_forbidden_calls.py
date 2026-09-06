@@ -32,7 +32,9 @@ _FORBIDDEN: list[re.Pattern[str]] = [
 # a different module (``src/duplicate_cleaner/other/undo.py``) would still
 # trip the guard.
 _SHUTIL_MOVE_PAT = re.compile(r"\bshutil\.move\(")
-_SHUTIL_MOVE_ALLOWED_RELPATHS: frozenset[str] = frozenset({"apply/undo.py"})
+_SHUTIL_MOVE_ALLOWED_RELPATHS: frozenset[str] = frozenset(
+    {"apply/undo.py", "organize/undo.py"}
+)
 
 # subprocess.run + a bare 'rm' string literal in the same file is a red
 # flag — shelling out to /bin/rm would bypass Trash entirely. Applied per

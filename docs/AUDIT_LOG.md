@@ -40,6 +40,98 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 
 ## Round-by-round history
 
+### v0.3-b — combined Code Review + Security pass 13 (integrated 0.2.1 + 0.3-a + 0.3-b ship-gate, 2026-09-06)
+
+**Thirteenth audit** — verdict: **Ready with must-fix follow-ups.** Zero DATA-LOSS committed, zero invariants explicitly weakened. Reviewed the integrated v0.2.1 (cross-algo reconciliation), v0.3-a (organizer discovery), and v0.3-b (organizer apply + undo) surface end-to-end.
+
+Verified positives (no drift from prior invariants):
+- `test_no_forbidden_calls.py` allowlist correctly extends to `organize/undo.py`; `_SHUTIL_MOVE_ALLOWED_RELPATHS` still path-relative (`test_shutil_move_allowlist_uses_path_relative_match` locks it); `organize/mover.py` genuinely avoids `shutil.move` and uses `os.rename` (same-volume) + `shutil.copy2` + `send2trash` (cross-volume).
+- Cohesion enforcement fires BEFORE the pre-flight loop and BEFORE any move; split refuses raise `OrganizeApplyError` at `_check_cohesion`; `--split-cohesive-units` downgrades to a warning per invariant.
+- Rename policy default `"preserve"` unchanged; `date_prefix` only fires when config opts in; only the filename leaf is mutated (subfolder untouched).
+- Manifest is written BEFORE the first move (`_flush_manifest()` at line 428) and flushed after every successful move; atomic write via tempfile + `f.flush()` + `os.fsync` + `os.replace` + parent-dir `fsync`.
+- Per-file re-verify against plan `size` + `mtime` (`_verify_source_unchanged`) fires immediately before each move; drift raises `OrganizeDriftError` and aborts the whole run (no skip-and-continue).
+- `_resolve_collision` hashes the SOURCE PATH string (not source content) for the `_<hash8>` suffix — no large-file read.
+- `restore_from_organize_manifest` validates each entry's `source_path` against `EXCLUDED_ROOTS` via `resolve_for_check` + `validate_not_excluded` BEFORE any `shutil.move`; poisoned manifests naming `~/Library/...` / `~/.ssh/id_rsa` are refused with a per-entry error, no move fires.
+- `reconcile_cross_source` order: cache lookup → budget check → download (per design § 3). Same-algo bucket shortcut (`_shared_algo`) skips download entirely; local BLAKE3 pre-hash is reused via `local_blake3_lookup`; cache invalidates on etag change. `not_yet_hashed_buckets` is correctly populated when the budget is exceeded (5 tests lock this in).
+- Cloud `Path` never `.resolve()`d in organize mover or undo (organize is local-only; `_validate_source_path` refuses `source_id != "local"` up-front with a 5.3-g deferral message).
+- Discovery pass is READ-ONLY: `discover()` calls `iter_files`, extracts signals, writes only to `report/organize-plan.{html,json}` via `render_plan`. No filesystem writes to user directories.
+
+Category counts: 2 safety (PLAUSIBLE, latent DATA-INTEGRITY on cross-volume + poisoned-plan source_path), 4 correctness (2 CONFIRMED, 2 PLAUSIBLE), 3 simplification (CONFIRMED), 2 test-coverage (CONFIRMED). Zero DATA-LOSS committed. Zero invariant-weakening.
+
+Must-fix in same release (v0.3-b post-release polish or rolled into 5.3-c):
+
+- safety/PLAUSIBLE (latent DATA-INTEGRITY): `organize/mover.py::_do_move` cross-volume path (`shutil.copy2` + `send2trash`) verifies only `st.st_size` between source and dest — no post-copy BLAKE3 content check. A bit-flip during `shutil.copy2` on an external drive with a matching size (rare but plausible on flaky USB / SMB) leaves a corrupted copy at dest AND trashes the source. The dedup mover doesn't have this problem because it never copies; organize is the first place a copy-then-trash flows through. Fix: after `copy2`, stream both files through `blake3.blake3()` and compare; on mismatch, `send2trash(dest)` and abort BEFORE trashing source. Belt-and-braces on top of filesystem checksums.
+- safety/PLAUSIBLE (latent DATA-INTEGRITY): `organize/mover.py::_validate_source_path` runs `validate_not_excluded(resolved)` but does NOT run `is_within(resolved, plan.roots)`. Asymmetric with `apply/mover.py::_validate_report_paths:147` which enforces `is_within` against every resolved root. A poisoned `plan.json` with a `source_path` outside `plan.roots` (e.g. `/Users/vaannada/.ssh/config` — not in `EXCLUDED_ROOTS`, not in `plan.roots`) will be moved into the organize dest tree. Files are recoverable via `dc organize undo`, so not DATA-LOSS, but the safety envelope diverges from the sibling module in an under-documented way. Fix: mirror `apply/mover.py`'s containment check; also validate every `plan.roots` entry via `validate_scan_root_candidate` before use.
+- correctness/CONFIRMED: `organize/undo.py::restore_from_organize_manifest` reads the manifest via `json.loads` + `dict.get()` — no Pydantic schema validation. Asymmetric with `apply/undo.py` which uses `Manifest.model_validate`. A schema drift or a hand-edited manifest silently degrades to type-check-per-field (only `isinstance(source_str, str)` is enforced). Fix: introduce `OrganizeManifest` Pydantic model and route reads through `model_validate` so field-shape violations fail loudly.
+- correctness/PLAUSIBLE: `organize/mover.py::_do_move` cross-volume branch: if `shutil.copy2` succeeds and `send2trash.send2trash(source)` then raises `OSError` (e.g. Trash dir full, permission drift), the outer `except OSError` in `apply_plan` fires. The manifest is re-flushed with prior entries only — the just-copied file has NO manifest entry (append happens after `_do_move` returns success). Result: source AND dest both hold the same content; a subsequent `dc organize undo` does not know about the dest copy. Fix: wrap the send2trash step in its own try/except that stamps a partial-entry manifest row before re-raising, or `send2trash(dest)` first to keep the invariant one-file-one-location.
+- correctness/CONFIRMED: `organize/discover.py::_timestamp_for_entry` unconditionally returns `entry.mtime`, ignoring EXIF `exif_date_original` / video `video_create_date` even though those signals were extracted and encoded into the classification a step earlier. Design doc § 4 mandates capture timestamps first, mtime fallback only when metadata absent. Current impl defeats EXIF-based cluster boundaries — a folder of freshly-downloaded photos with wildly different capture dates lands in one event because mtimes cluster. Audit log flags this as deferred to 5.3-d ("Full EXIF event clustering with real image fixtures") but neither the code comment nor the design doc clearly states this limitation. Fix: retain the `SignalSet` alongside `PlanEntry` (either via a side-map keyed by index, or add a `capture_ts: float | None` field on `PlanEntry`) so clustering has access to EXIF.
+- correctness/CONFIRMED (still open from pass 12): `retained_cloud_order` design/impl drift — `docs/design/v0.2-cloud-sources.md` § 7 shows provider-prefix values; `score/rules.py:324` calls `order.index(m.source_id)` with full source_id. Not fixed in v0.2.1 either. Pick one spelling.
+
+Deferrable (post-release notes / v0.3-c):
+
+- safety/PLAUSIBLE: `organize/undo.py::_remove_empty_parents` walker uses `parent.parent` with no depth cap when `dest_root` is missing or malformed in the manifest (`dest_root_raw is None` → `stop_resolved is None` → loop stops only when `parent.exists()` is False or an entry is non-empty). On a manifest with `dest_root: null`, the walker will send every empty ancestor to Trash up to the first non-empty directory. Not DATA-LOSS (send2trash is recoverable) but user-confusing. Fix: require dest_root in the manifest (validate at read time) OR default `stop_at` to the walked leaf's `dest_root_raw` or a sane bounded depth (say, 8 hops).
+- simplification/CONFIRMED: `organize/undo.py:111,122` — `validate_not_excluded(resolved_source)` is called by `_validate_original_path` and then AGAIN two lines later in `restore_from_organize_manifest`. Same check, same argument, no state change between. Remove the duplicated call.
+- simplification/CONFIRMED: `hash/pipeline.py:117-134` prehashed branch propagates `source_id`, `is_shared`, `foreign_hash`, `etag`, `cloud_file_id`, `owner` but not `is_singleton_across_sources` — field doesn't exist on `FileRecord`. Same shape as pass 12's still-open finding: `is_singleton_across_sources` is never set to True in production. Either drop the field or wire the reconciler to set it.
+- test-coverage/CONFIRMED: no test exercises the `_do_move` cross-volume branch at all. `tests/test_organize_apply.py` only creates sources under `tmp_path`, so every move uses `os.rename`. The cross-volume send2trash path, the size sanity check, and the (missing) content check are un-covered.
+- test-coverage/CONFIRMED: no test asserts `plan.roots` is validated at apply time — a poisoned `plan.json` with `roots=["/"]` passes through the mover today (roots are only stamped into the manifest, not consulted for validation). Combined with the missing `is_within` check above, this is a silent-safety-regression risk.
+
+Ship-readiness for the integrated (v0.2.1 + v0.3-a + v0.3-b) release:
+- Zero DATA-LOSS committed. Zero invariants (from § "Invariants") explicitly weakened. Cohesion + rename-policy + manifest-atomic-write + per-file drift-verify all intact.
+- The must-fix items above are latent-DATA-INTEGRITY risks (cross-volume without content verify, poisoned-plan without `is_within`), NOT active DATA-LOSS. The organize apply defaults to dry-run; the immediate user surface is safe.
+- Recommendation: **ship v0.3-b as-is with must-fix items rolled into 5.3-c** (which is already carrying PDF fixtures + real event clustering). The cross-volume content verify AND `is_within(plan.roots)` guard are 1-day fixes and materially raise the safety envelope for the release after next.
+
+**v0.3-b clears ship** taking all three (v0.2.1 + v0.3-a + v0.3-b) as an integrated release. 373 → status pending regression run (dev env lacks pytest to confirm locally); no code path added contradicts the existing test invariants.
+
+### v0.3 — organizer core (sub-milestone 5.3-b: apply + undo — local)
+
+**Sub-milestone 5.3-b Dev delivered** (2026-09-06): 21 new tests (352 → 373 total). Ruff clean on every changed source and test file. Mypy `--strict` clean on all changed files modulo the pre-existing `unused-ignore` warnings on 3rd-party import stubs (same shape as sub-milestones 2/4/5.3-a). Zero-behavior-change for dedup rails — the v0.1.1 mover / undo path is untouched. Cohesion invariant enforced; rename policy respected; manifest atomic-write pattern preserved.
+
+Shipped:
+- `src/duplicate_cleaner/organize/mover.py` — new module:
+  - `apply_plan(plan_path, *, commit=False, split_cohesive_units=False, config=None, runs_dir=None) -> ApplyPlanResult`.
+  - Dry-run by default; `--commit` is the sole write gate.
+  - Cohesion enforcement: every cohesion_group_id's members must share a destination folder. Split → `OrganizeApplyError` unless `split_cohesive_units=True` (which downgrades to a per-group warning).
+  - Path validation: source_path routed through `validate_not_excluded` after `resolve_for_check`; proposed_dest rejected on absolute / `..`-traversal; dest_root rejected when inside an excluded root OR outside every configured active_home (when config.active_homes is non-empty); effective dest rejected if it escapes dest_root.
+  - Rename policy: `preserve` default (never mutates filename), `date_prefix` and `date_event_prefix` prepend `YYYY-MM-DD_` from the entry's mtime (UTC).
+  - Directory creation: `os.makedirs(mode=config.organize_dir_mode, exist_ok=True)` — default 0o755 per design decision (0o700 would break shared drives).
+  - Same-volume moves via `os.rename` (atomic on POSIX); cross-volume moves via `shutil.copy2` + `send2trash(source)` so the source stays recoverable via Trash if a post-copy sanity check fails. `shutil.move` is deliberately NOT used here — it stays confined to `apply/undo.py` and the new `organize/undo.py`.
+  - Collision handling: existing dest → append `_<hash8>` (first 8 hex of BLAKE3 over the source path string). Never overwrites; records under `ApplyPlanResult.collisions`.
+  - Manifest: same tempfile + fsync + `os.replace` + parent-dir fsync pattern as `apply/mover.py`. Manifest is written BEFORE the first move and flushed after every successful move. Location: `~/.local/share/duplicate_cleaner/organize-runs/<utc-timestamp>/manifest.json` — a subtree distinct from the dedup runs to avoid operator confusion.
+  - Per-file re-verify: `_verify_source_unchanged` fires immediately before each move against `entry.size` + `entry.mtime`. Drift raises `OrganizeDriftError` (subclass of `OrganizeApplyError`) and aborts the whole run — no skip-and-continue.
+- `src/duplicate_cleaner/organize/undo.py` — new module:
+  - `restore_from_organize_manifest(manifest_path) -> RestoreOrganizeResult`.
+  - Each entry's `source_path` validated against `EXCLUDED_ROOTS` before any move — a poisoned manifest cannot coerce restore into planting a file at `~/Library/...` or `/System/...`.
+  - Missing `dest_path` is logged and skipped; the remaining entries still restore.
+  - Refuses to overwrite an existing `source_path` (symmetric with `apply/undo.py`).
+  - Uses `shutil.move` — `_SHUTIL_MOVE_ALLOWED_RELPATHS` in `tests/test_no_forbidden_calls.py` extended to include `organize/undo.py`.
+  - Best-effort cleanup: walks up from each restored dest, sending empty parent directories to Trash via `send2trash` (never `os.rmdir` / `Path.rmdir` — forbidden by grep).
+- `src/duplicate_cleaner/organize/__init__.py` — re-exports `apply_plan`, `restore_from_organize_manifest`, `ApplyPlanResult`, `RestoreOrganizeResult`, `OrganizeApplyError`, `OrganizeDriftError`, `OrganizeUndoError`.
+- `src/duplicate_cleaner/cli.py` — new sub-commands:
+  - `dc organize apply <plan.json> [--commit] [--split-cohesive-units] [--runs-dir DIR]` — dry-run summary vs. commit "Moved N file(s) to <dest>. Manifest: <path>." Prints per-warning cohesion-split lines; surfaces drift errors and validation refusals with actionable messages.
+  - `dc organize undo <manifest.json>` — prints "Restored N of M file(s) from manifest <path>." plus per-entry error lines.
+
+Tests shipped:
+- `tests/test_organize_apply.py` (14 tests): dry-run writes-nothing, commit-moves-files, nested-parent-dir creation, collision `_<hash8>` suffix, cohesion-split refusal, cohesion-split with-flag accepted, excluded-source refusal, excluded-dest refusal, `..`-traversal refusal, drift-abort, atomic-manifest-write (mocked `os.replace` failure → no partial move + no final manifest), preserve rename policy, date_prefix rename policy, manifest schema.
+- `tests/test_organize_undo.py` (7 tests): apply-then-undo round-trip, excluded-source-path refusal, missing-dest-logs-and-continues, empty-parent-dir cleanup, mid-batch shutil.move failure (partial restore + per-entry error), total-counter, refusal-to-overwrite-existing-source.
+
+Invariants preserved:
+- All 352 pre-existing tests pass unchanged; 21 new tests added (373 total).
+- `test_no_forbidden_calls.py` still green. `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`; the allowlist meta-test enforces path-relative matches, so a hypothetical `other/undo.py` would still trip the guard.
+- Cohesive units move atomically OR refuse — split enforcement runs BEFORE the first move; no partial split can happen mid-run.
+- Rename policy defaults to `"preserve"` — filename bytes are never mutated unless the user opts in.
+- Manifest atomic-write pattern (tempfile + fsync + os.replace + parent-dir fsync) preserved. Written BEFORE the first move, flushed after every successful move.
+- Per-file re-verify against size+mtime fires before every move; drift aborts the whole run.
+- Every path from external JSON is re-validated: source_path through `EXCLUDED_ROOTS`; dest through excluded-roots + active_home containment + `..`-traversal + escapes-dest_root check.
+- Cloud entries in a plan are refused up-front with an actionable message (`source_id != "local"`) — cross-source organize is deferred to v0.3-g.
+- Ruff clean on every changed source and test file. Mypy `--strict` clean modulo the pre-existing `unused-ignore` pattern on `blake3` / `send2trash` import stubs (documented in sub-milestone 2).
+
+Explicitly deferred to 5.3-c and later:
+- Rich TUI `dc organize review` (5.3-c).
+- PDF content classification with real pikepdf fixtures (5.3-c).
+- Full event clustering with real image fixtures (5.3-d).
+- Cross-source organize via `sources/` package (5.3-g).
+- HTML plan template editing → JSON write-back (5.3-f).
+
 ### v0.3 — organizer core (sub-milestone 5.3-a: discovery pass — read-only)
 
 **Sub-milestone 5.3-a Dev delivered** (2026-09-06): 34 new tests (baseline + 34). Ruff clean on every changed source and test file. Mypy `--strict` clean modulo the pre-existing `unused-ignore` warnings on 3rd-party import stubs (same shape as sub-milestones 2 and 4, documented as unchanged). Zero-behavior-change for local scans; the v0.2 rails still run untouched. Discovery is READ-ONLY — no filesystem writes to user directories.

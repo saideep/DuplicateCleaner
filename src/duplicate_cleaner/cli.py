@@ -1735,6 +1735,118 @@ def _check_pending_dedup(cfg: Any, skip: bool) -> None:
     )
 
 
+# --------------------------------------------------------------------------- #
+# v0.3 sub-milestone 5.3-b — organizer apply + undo.                          #
+# --------------------------------------------------------------------------- #
+
+
+@organize_app.command("apply")
+def organize_apply(
+    plan_path: Annotated[
+        Path, typer.Argument(help="Path to the organize-plan.json to apply.")
+    ],
+    commit: Annotated[
+        bool,
+        typer.Option(
+            "--commit",
+            help="Actually move files. Without this flag, apply is a dry-run.",
+        ),
+    ] = False,
+    split_cohesive_units: Annotated[
+        bool,
+        typer.Option(
+            "--split-cohesive-units",
+            help="Allow a cohesion group's members to move to different folders.",
+        ),
+    ] = False,
+    runs_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--runs-dir",
+            help="Where to write the undo manifest. "
+            "Default ~/.local/share/duplicate_cleaner/organize-runs/.",
+        ),
+    ] = None,
+) -> None:
+    """Move files per the plan — dry-run unless --commit is passed."""
+    from duplicate_cleaner.organize.mover import (
+        OrganizeApplyError,
+        OrganizeDriftError,
+        apply_plan,
+    )
+
+    cfg = load_config()
+    try:
+        result = apply_plan(
+            plan_path,
+            commit=commit,
+            split_cohesive_units=split_cohesive_units,
+            config=cfg,
+            runs_dir=runs_dir,
+        )
+    except OrganizeDriftError as e:
+        console.print(f"[red]Drift detected[/red]: {e}")
+        raise typer.Exit(2) from e
+    except OrganizeApplyError as e:
+        console.print(f"[red]Refusing to apply[/red]: {e}")
+        raise typer.Exit(2) from e
+
+    for w in result.warnings:
+        console.print(f"[yellow]Warning[/yellow]: {w}")
+
+    if not commit:
+        console.print(
+            f"[cyan]Dry-run[/cyan]: {result.planned} planned, "
+            f"{result.verified} verified, {len(result.errors)} drift error(s). "
+            "Pass --commit to move."
+        )
+        for err in result.errors:
+            console.print(f"  [yellow]drift[/yellow]: {err}")
+        return
+
+    dest = result.dest_root
+    console.print(
+        f"[green]Moved[/green] {result.moved} file(s) to {dest}. "
+        f"Manifest: {result.manifest_path}."
+    )
+    if result.collisions:
+        console.print(
+            f"[yellow]{len(result.collisions)} collision(s) renamed with "
+            "_<hash8> suffix.[/yellow]"
+        )
+    if result.errors:
+        console.print(
+            f"[yellow]{len(result.errors)} error(s) — see manifest for detail.[/yellow]"
+        )
+
+
+@organize_app.command("undo")
+def organize_undo(
+    manifest_path: Annotated[
+        Path,
+        typer.Argument(help="Path to the organize-run manifest.json to reverse."),
+    ],
+) -> None:
+    """Reverse every move recorded in an organize-run manifest."""
+    from duplicate_cleaner.organize.undo import (
+        OrganizeUndoError,
+        restore_from_organize_manifest,
+    )
+
+    try:
+        result = restore_from_organize_manifest(manifest_path)
+    except OrganizeUndoError as e:
+        console.print(f"[red]Refusing to restore[/red]: {e}")
+        raise typer.Exit(2) from e
+
+    console.print(
+        f"[green]Restored[/green] {result.restored} of {result.total} file(s) "
+        f"from manifest {manifest_path}."
+    )
+    for err in result.errors:
+        console.print(f"  [yellow]skip[/yellow]: {err}")
+
+
 def _google_credentials_from_token(data: dict[str, object]) -> object:
     """Build a google.oauth2 Credentials object from a stored token blob."""
     from google.oauth2.credentials import Credentials  # type: ignore[import-not-found]
