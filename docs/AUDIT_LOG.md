@@ -35,7 +35,7 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 ## Rejected alternatives (do not reopen without new info)
 
 - **macOS Keychain for OAuth token storage** — rejected. User preference. Tokens live in `~/.config/duplicate_cleaner/tokens/<id>.json` mode 0600.
-- **BYO-only OAuth clients** — rejected in favor of bundled default + BYO override (`--client-secret path.json`). Precedent: rclone, gsutil. User approved bundled.
+- **Bundled OAuth clients in public repo** — REJECTED (2026-09-07 user decision). Repo is public on GitHub; bundling personal Google / Microsoft OAuth client IDs would (a) share the maintainer's quota with every downstream user, (b) create shared-revocation risk (one abuse revokes the client for everyone), (c) obscure the exact permission grants from users. BYO-only for cloud auth is the permanent design. The `_TO_REPLACE` sentinel guard in `_resolve_client_credentials` will keep firing indefinitely and its error messages now describe BYO as intentional, not a "coming soon" state. Supersedes the earlier "bundled default + BYO override" decision (which was made before the repo went public).
 - **`/private` blanket exclusion** — reverted. `/private/tmp` and `/private/var/folders` (initially unblocked to allow pytest `tmp_path`) exposed live app state. `/private/var/folders` and `/var/folders` re-blocked; pytest uses `--basetemp=/tmp/pytest-dc` under `/private/tmp` which remains scannable.
 - **Adaptive weight learning (was v0.7)** — DROPPED per architect review. Rule-based scorer suffices for single-user; ML on <500 override examples adds noise not signal.
 - **Perceptual near-dup ahead of organizer** — DROPPED sequencing. Reshuffled: organizer to v0.3, near-dup pushed to v0.7/v0.8.

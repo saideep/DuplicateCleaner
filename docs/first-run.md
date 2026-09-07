@@ -108,7 +108,7 @@ Every trashed file goes back to its original location. Refuses to overwrite anyt
 
 ## Cloud dedup (Google Drive + OneDrive) — optional, BYO OAuth
 
-Cloud scan requires you to register your own OAuth clients (BYO). Zero-setup bundled clients are not yet available — they'll ship in a future release once the project owner registers apps under their Google/Microsoft accounts.
+Cloud scan requires you to register your own OAuth clients (BYO). This is by design: DuplicateCleaner is a public repo and bundling personal OAuth client IDs would share quota + revocation risk across every user. You register once per provider (10 minutes each), then it's transparent.
 
 Full walkthrough with click-by-click screenshots: [`docs/cloud-oauth-setup.md`](cloud-oauth-setup.md).
 
@@ -224,7 +224,7 @@ Track progress in [`README.md`](../README.md) roadmap section or `CHANGELOG.md`.
 
 - `dc scan` refuses to start because `active_homes` isn't set → edit `~/.config/duplicate_cleaner/config.toml`.
 - `dc apply --commit` refuses "insufficient free disk" → free some space or lower `min_free_disk_gb` in config.
-- `dc auth add gdrive` fails "bundled Google OAuth client is not registered" → use `--client-secret path.json` with your own OAuth app.
+- `dc auth add gdrive` refuses without `--client-secret` → BYO is required (by design; see docs/cloud-oauth-setup.md). Register your own Google OAuth client at console.cloud.google.com and pass the downloaded JSON.
 - Something got trashed you wanted to keep → `dc undo <manifest.json>` OR right-click Trash → "Put Back".
 - Config file corrupted → `rm ~/.config/duplicate_cleaner/config.toml && dc init`.
 - Cache slow / disk full → `dc cache clear`.

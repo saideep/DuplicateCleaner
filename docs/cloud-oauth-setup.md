@@ -16,29 +16,23 @@ DuplicateCleaner uses OAuth 2.0 for Google and Microsoft. Each `dc auth add` cal
 
 You never paste a password into the CLI. The browser handles it.
 
-## Bundled OAuth clients
+## Bring your own OAuth client (BYO — required)
 
-**Status as of the current release**: the bundled Google + Microsoft OAuth client IDs are placeholders (`BUNDLED_GDRIVE_CLIENT_ID_TO_REPLACE` and the Microsoft equivalent). Running `dc auth add gdrive` or `dc auth add onedrive` **without** `--client-secret` will fail with an actionable error pointing you at BYO. The bundled path becomes live once the project owner registers real OAuth clients under their Google / Microsoft accounts and ships them in a future release.
+**DuplicateCleaner is BYO-only for cloud auth by design.** The repo is public and bundling personal OAuth client IDs in a public project would (a) share the maintainer's quota with every user, (b) create a shared-revocation risk (one bad actor can get the client_id revoked and break every user at once), and (c) make it harder for you to audit the exact permissions the app is asking for. rclone / gsutil ship bundled clients because they're maintained by companies with dedicated OAuth teams — a personal-scale tool is different.
 
-**Until then, use BYO** — see "Bring your own OAuth client" below. It's a one-time 10-minute setup per provider and unlocks the full cloud scan / apply / undo pipeline.
+You register your own OAuth clients once (10 minutes per provider) at Google Cloud Console + Azure Portal, then pass `--client-secret path.json` to `dc auth add`. See "Register your Google client" and "Register your OneDrive client" below.
 
-Once bundled clients are baked in, you'll be able to drop `--client-secret` and run `dc auth add gdrive` for zero-setup OAuth (the pattern rclone / gsutil use). Both paths — bundled and BYO — will continue to work.
+The `dc auth add gdrive` / `dc auth add onedrive` commands without `--client-secret` will refuse with an actionable error telling you to BYO — this is intentional, not a "coming soon" state.
 
 ## Google Drive
 
 ### Add a Google account
 
-**Today (bundled placeholder — use BYO)**:
-
 ```shell
 dc auth add gdrive --client-secret ~/Downloads/client_secret_YOUR_ID.apps.googleusercontent.com.json
 ```
 
-**Once bundled clients ship** (drop the flag):
-
-```shell
-dc auth add gdrive
-```
+See "Register your Google client" at the bottom of this page for how to produce the JSON file.
 
 What happens:
 
@@ -112,17 +106,11 @@ Reserved for v0.6. In v0.2 through v0.5 this command prints a "coming soon" noti
 
 ### Add a OneDrive account
 
-**Today (bundled placeholder — use BYO)**:
-
 ```shell
 dc auth add onedrive --client-secret ~/msal-client.json
 ```
 
-**Once bundled clients ship** (drop the flag):
-
-```shell
-dc auth add onedrive
-```
+See "Register your OneDrive client" at the bottom of this page for how to produce the JSON file.
 
 The flow mirrors Google Drive: local callback server, browser opens to `login.microsoftonline.com`, you consent, tokens are saved.
 

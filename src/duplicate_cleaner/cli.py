@@ -1459,10 +1459,13 @@ def _resolve_client_credentials(
         # ``invalid_client`` that is confusing to end users.
         if client_id.endswith("_TO_REPLACE"):
             console.print(
-                "[red]This build's bundled Google OAuth client is not "
-                "registered yet.[/red] Use [cyan]--client-secret path/to/oauth.json"
-                "[/cyan] with your own Cloud Console-downloaded client "
-                "credentials until the release build ships."
+                "[red]DuplicateCleaner is BYO-only for cloud OAuth[/red] "
+                "(the public repo does not bundle a personal Google client "
+                "ID to avoid shared-quota / shared-revocation risk). Register "
+                "your own OAuth client at [cyan]https://console.cloud.google.com"
+                "[/cyan] (Desktop app type; enable Drive API) and pass the "
+                "downloaded JSON via [cyan]--client-secret path/to/oauth.json"
+                "[/cyan]. See docs/cloud-oauth-setup.md."
             )
             raise typer.Exit(1)
         return client_id, BUNDLED_GDRIVE_CLIENT_SECRET
@@ -1474,10 +1477,14 @@ def _resolve_client_credentials(
         # only) so the returned secret is intentionally the empty string.
         if client_id.endswith("_TO_REPLACE"):
             console.print(
-                "[red]This build's bundled Microsoft OAuth client is not "
-                "registered yet.[/red] Use [cyan]--client-secret path/to/msal.json"
-                "[/cyan] with your own Entra App Registration id until the "
-                "release build ships."
+                "[red]DuplicateCleaner is BYO-only for cloud OAuth[/red] "
+                "(the public repo does not bundle a personal Microsoft client "
+                "ID to avoid shared-quota / shared-revocation risk). Register "
+                "your own App Registration at [cyan]https://portal.azure.com"
+                "[/cyan] (Personal Microsoft accounts, Public client, "
+                "Files.ReadWrite scope) and pass the JSON via "
+                "[cyan]--client-secret path/to/msal.json[/cyan]. "
+                "See docs/cloud-oauth-setup.md."
             )
             raise typer.Exit(1)
         return client_id, BUNDLED_ONEDRIVE_CLIENT_SECRET
