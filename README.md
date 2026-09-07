@@ -41,7 +41,6 @@ In development for v0.2:
 
 Later milestones:
 
-- Project directory tree aggregation — collapse two copies of the same repo to one tree-diff line *(coming in v0.4)*.
 - Cloud consolidation via `dc migrate` — copy files between clouds, verify by hash, then optionally trash on the source *(coming in v0.5)*.
 - Google Photos and iCloud Photos sources for unified photo metadata across every account *(coming in v0.6)*.
 - Perceptual image near-duplicate detection *(coming in v0.7)*.
@@ -69,11 +68,19 @@ Later milestones:
 
 ```shell
 brew install python@3.12 uv
-git clone <your-repo-url> ~/DuplicateCleaner && cd ~/DuplicateCleaner
+git clone https://github.com/saideep/DuplicateCleaner ~/DuplicateCleaner && cd ~/DuplicateCleaner
 uv sync
 ```
 
-For a full walk-through on a fresh Mac mini, see [docs/macmini-setup.md](docs/macmini-setup.md).
+**First-time user on a fresh Mac mini? Start here: [docs/first-run.md](docs/first-run.md).** Step-by-step from clone to first successful `--commit`.
+
+Deeper docs:
+- [docs/macmini-setup.md](docs/macmini-setup.md) — installation reference
+- [docs/cloud-oauth-setup.md](docs/cloud-oauth-setup.md) — BYO OAuth registration (bundled clients are placeholders in the current release)
+- [docs/organize.md](docs/organize.md) — organizer workflow
+- [docs/safety.md](docs/safety.md) — safety model + invariants
+- [docs/cli.md](docs/cli.md) — full CLI reference
+- [docs/config.md](docs/config.md) — every config key
 
 ## Quick start
 
@@ -174,7 +181,7 @@ MIT.
 - [x] **v0.1.1 — Archives, bundles, monitoring, clones.** Archive recursion, macOS bundle handling, `psutil`-based system monitoring, APFS clone detection, singleton report, `--discover` mode. Shipped.
 - [ ] **v0.2 — Cloud sources.** Google Drive and OneDrive Personal listings compared against local trees; OAuth 2.0 with bundled clients; multi-account support; trash-only cloud deletion with cross-source undo. **In progress.**
 - [ ] **v0.3 — Organizer.** Domain-aware `dc organize` (discover, review, apply) with PDF content classification, EXIF event clustering, cohesion preservation for albums, book series, git projects, and photo events, and an Unsorted safety net for uncertain classifications. **Next up.**
-- [ ] **v0.4 — Project-tree aggregation.** Directory rollup for backup-folder collapse.
+- [x] **v0.4 — Project-tree aggregation.** Directory rollup for backup-folder collapse. Two copies of the same git repo / npm project / Cargo crate now surface as a single tree-diff entry instead of thousands of per-file matches. Discards trash the whole directory atomically; undo restores it wholesale. Ships with the `--min-project-similarity` CLI flag (default 0.90). **Shipped.**
 - [ ] **v0.5 — Cloud consolidation (`dc migrate`).** Copy files between clouds, verify by hash, then optionally trash on the source.
 - [ ] **v0.6 — Google Photos and iCloud Photos.** Unified photo metadata across sources for the v0.3 organizer's event clustering.
 - [ ] **v0.7 — Image near-duplicate.** Perceptual hash comparator plus thumbnails in the report.

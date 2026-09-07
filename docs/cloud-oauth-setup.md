@@ -16,15 +16,25 @@ DuplicateCleaner uses OAuth 2.0 for Google and Microsoft. Each `dc auth add` cal
 
 You never paste a password into the CLI. The browser handles it.
 
-## Bundled OAuth clients (default)
+## Bundled OAuth clients
 
-DuplicateCleaner ships with pre-registered OAuth clients for Google and Microsoft. Zero setup — you run `dc auth add gdrive`, sign in, click accept, done. This is the same pattern used by rclone and gsutil.
+**Status as of the current release**: the bundled Google + Microsoft OAuth client IDs are placeholders (`BUNDLED_GDRIVE_CLIENT_ID_TO_REPLACE` and the Microsoft equivalent). Running `dc auth add gdrive` or `dc auth add onedrive` **without** `--client-secret` will fail with an actionable error pointing you at BYO. The bundled path becomes live once the project owner registers real OAuth clients under their Google / Microsoft accounts and ships them in a future release.
 
-You can override the bundled client with `--client-secret path.json` if you prefer to use your own OAuth app. See "Bring your own OAuth client" at the bottom of this page.
+**Until then, use BYO** — see "Bring your own OAuth client" below. It's a one-time 10-minute setup per provider and unlocks the full cloud scan / apply / undo pipeline.
+
+Once bundled clients are baked in, you'll be able to drop `--client-secret` and run `dc auth add gdrive` for zero-setup OAuth (the pattern rclone / gsutil use). Both paths — bundled and BYO — will continue to work.
 
 ## Google Drive
 
 ### Add a Google account
+
+**Today (bundled placeholder — use BYO)**:
+
+```shell
+dc auth add gdrive --client-secret ~/Downloads/client_secret_YOUR_ID.apps.googleusercontent.com.json
+```
+
+**Once bundled clients ship** (drop the flag):
 
 ```shell
 dc auth add gdrive
@@ -101,6 +111,14 @@ Reserved for v0.6. In v0.2 through v0.5 this command prints a "coming soon" noti
 ## OneDrive
 
 ### Add a OneDrive account
+
+**Today (bundled placeholder — use BYO)**:
+
+```shell
+dc auth add onedrive --client-secret ~/msal-client.json
+```
+
+**Once bundled clients ship** (drop the flag):
 
 ```shell
 dc auth add onedrive
