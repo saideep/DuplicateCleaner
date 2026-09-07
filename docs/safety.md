@@ -161,6 +161,45 @@ Two additions to the safety model, tracked in [AUDIT_LOG.md](AUDIT_LOG.md#invari
 - **Shared cloud files informational-only.** Any file the provider reports as owned by someone else is never proposed for deletion.
 - **Cloud discards go to cloud trash; undo restores via API.** No code path hard-deletes a cloud file. Undo dispatches per-entry by `source_id` and reverses the same API call.
 
+### Project tree aggregation (v0.4)
+
+When `dc scan` detects two or more copies of the same project directory — a git repo, npm package, Cargo crate, Go module, etc. — it collapses the thousands of per-file matches into a single `kind="tree"` group. The discard side becomes a **whole-directory** trash proposal.
+
+Detection heuristic: a directory qualifies as a "project root" when its child set contains any of `.git`, `package.json`, `Cargo.toml`, `pom.xml`, `pyproject.toml`, `Pipfile`, `go.mod`, `build.gradle`, `.sln`, or `Gemfile`. Similarity is Jaccard over the set of file-content hashes inside; two projects at or above `--min-project-similarity` (default `0.90`) are collapsed into one tree entry.
+
+#### Whole-directory discard, atomic
+
+`dc apply --commit` sends the entire discard directory to the macOS Trash via `send2trash` in one call. The mover never proposes a per-file discard for members inside a detected project — that would let the user split a cohesive unit in half. Cohesion is enforced structurally: the tree group carries directory-level metadata and the file-level exact-duplicate groups whose members are entirely contained inside a detected project root are removed from the report before `apply` sees it.
+
+Undo restores the directory wholesale via `shutil.move` from the Trash back to the recorded original location. The same H2 trash-containment rail and F12 excluded-root check that guard file-level restores apply to tree entries.
+
+#### Dirty git working trees are refused
+
+A project directory whose git working tree is dirty (`git status --porcelain` non-empty) is **never** proposed for a project-tree discard. Uncommitted changes represent work that has not been shipped anywhere else on disk; trashing the directory would permanently destroy that diff, even if every tracked file matches another project's tracked files byte-for-byte.
+
+The mover re-runs the dirty check immediately before the move as defense-in-depth: if the user made an edit between scan and apply, the whole run aborts with a clear error listing the offending project.
+
+#### Active-home safety envelope
+
+A tree discard is refused unless its target directory sits inside a declared `active_home`. This is stricter than the file-level check — a whole-directory move has a much larger blast radius than a single file, and the safety envelope is proportional. Without at least one `active_home` in the config, tree discards would fall back to the scan-root check alone, which is enough for individual files but insufficient for whole directories.
+
+#### Which side wins
+
+The keeper is chosen by a layered rule:
+
+1. If two members both have real `.git` directories, the one with the newer HEAD commit (`git log -1 --format=%ct`) wins.
+2. Otherwise, a member NOT inside a backup-marker ancestor (`backup`, `old`, `archive`, `bak`, `copy`) wins over one that is.
+3. Final tie-break: shallowest path; then lexicographic order for determinism.
+
+The report surfaces every scoring signal that fired so the keeper choice is auditable — same shape as file-level `dc scan` output.
+
+#### Summary invariants (v0.4)
+
+Two additions to the safety model, tracked in [AUDIT_LOG.md](AUDIT_LOG.md#invariants-do-not-weaken):
+
+- **Project-tree discards refuse dirty git repos.** A project directory whose `git status --porcelain` is non-empty is never proposed for a tree discard.
+- **Project trees move atomically.** The mover trashes the whole directory in one call; per-file splits are structurally impossible because the exact-duplicate groups covered by a tree aggregate are removed from the report.
+
 ### Organize safety (v0.3)
 
 `dc organize` inherits the whole safety envelope from `dc apply` and adds a small set of rules specific to moving files into a proposed folder tree. Behaviour is documented in [docs/organize.md](organize.md).

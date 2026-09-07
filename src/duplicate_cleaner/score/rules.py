@@ -10,6 +10,35 @@ from pathlib import Path
 from duplicate_cleaner.compare.exact import Group
 from duplicate_cleaner.config import Config
 
+# v0.4 project-tree scorer helpers — the tree-aggregation pass wraps its
+# per-member signal logic in these so ``score/rules.py`` stays the single
+# spelling of "which weight names exist".  Tokens mirror the existing
+# ``_MARKER_TOKENS`` list with the tree-specific "bak" alias added.
+_TREE_BACKUP_TOKENS: frozenset[str] = frozenset(
+    {
+        "backup",
+        "backups",
+        "old",
+        "older",
+        "archive",
+        "archives",
+        "bak",
+        "copy",
+        "copies",
+    }
+)
+
+
+def is_project_tree_backup_copy(project_root: Path) -> bool:
+    """True if any ancestor of ``project_root`` matches a backup token.
+
+    Backup tokens: ``backup``, ``old``, ``archive``, ``bak``, ``copy``.
+    Case-insensitive match on any path segment.  Callers pass the resolved
+    project root; the check is purely lexical so no filesystem probe is
+    triggered.
+    """
+    return any(part.lower() in _TREE_BACKUP_TOKENS for part in project_root.parts)
+
 _MARKER_TOKENS: frozenset[str] = frozenset(
     {
         "backup",

@@ -10,12 +10,32 @@ from pydantic import BaseModel, Field
 # v0.1.1: groups can now describe archive-whole and bundle roll-ups in
 # addition to exact-content duplicate sets. The mover keys on this to
 # decide what counts as a legal discard target — see ``apply/mover.py``.
-GroupKind = Literal["exact", "archive-whole"]
+#
+# v0.4: ``tree`` groups collapse two copies of the same project directory
+# into a single entry — the discard member's ``path`` is the *directory*
+# root, not any individual file, and the mover sends the whole directory
+# to Trash atomically.  See ``compare/tree.py``.
+GroupKind = Literal["exact", "archive-whole", "tree"]
 
 
 class ReportSignal(BaseModel):
     name: str
     contribution: float
+
+
+class TreeDiffEntry(BaseModel):
+    """One file that differs between two project-directory copies.
+
+    v0.4 project-tree aggregation.  Emitted per differing file inside a
+    ``kind="tree"`` group so the HTML report can show a per-file diff
+    without expanding a directory of thousands of identical members.  The
+    list of hashes is per-group-member positional (matches the surrounding
+    ``ReportGroup.members`` order) so a caller can identify which side is
+    missing / differs.
+    """
+
+    relative_path: str
+    hashes_per_member: list[str | None]
 
 
 class ReportMember(BaseModel):
@@ -56,6 +76,12 @@ class ReportGroup(BaseModel):
     hash: str
     reclaim_bytes: int
     members: list[ReportMember]
+    # v0.4 project-tree aggregation.  Populated only for ``kind="tree"``
+    # groups; ``None`` on every ``exact``/``archive-whole`` group so v0.1+
+    # reports round-trip unchanged.
+    identical_file_count: int | None = None
+    tree_diff: list[TreeDiffEntry] | None = None
+    similarity_pct: float | None = None
 
 
 class ArchiveSkipEntry(BaseModel):
@@ -146,13 +172,26 @@ class ManifestEntry(BaseModel):
     original_path: str
     size: int
     mtime: float
-    hash: str
+    # v0.1.0 manifests (pre-G4) did not stamp ``hash`` — undo falls back
+    # to a basename+size scan of the Trash and refuses on ambiguity.
+    # Default here preserves that backward-compat load path while still
+    # letting Pydantic type-check the field when present.
+    hash: str = ""
     trashed_at_path: str | None = None
     # v0.2 additions — see design doc §3.2.
     source_id: str = "local"
     cloud_file_id: str | None = None
     cloud_trash_id: str | None = None
     etag: str | None = None
+    # v0.4 project-tree aggregation.  When ``True``, ``original_path``
+    # points to a DIRECTORY (a project root), not a file, and undo restores
+    # the whole tree from Trash via ``shutil.move``.  ``identical_file_count``
+    # + ``project_tree_bytes`` are informational; the mover records them so
+    # ``dc undo`` can print an accurate "restored 342 files (2.1 GB)"
+    # summary without walking the recovered tree.
+    is_project_tree: bool = False
+    identical_file_count: int | None = None
+    project_tree_bytes: int | None = None
 
 
 class Manifest(BaseModel):

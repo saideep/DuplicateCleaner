@@ -29,6 +29,8 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Manifest atomic-write applies to cloud entries too**: the tmpfile + fsync + os.replace + parent-dir-fsync pattern is unchanged; cloud manifest rows record `source_id`, `cloud_file_id`, `cloud_trash_id`, and pre-move `etag`.
 - **Cohesive units move atomically** (v0.3): music albums, book series, git projects, and photo or video event clusters. Every plan entry in a cohesion group carries `cohesion_group`; `dc organize apply` refuses to run if members target different destinations unless `--split-cohesive-units` is passed. The invariant is checked before the first move; no partial split can happen mid-run.
 - **Rename policy is user-locked** (v0.3): default `rename_policy = "preserve"`. In this mode filename bytes are never mutated by `dc organize`. `date_prefix` and `date_event_prefix` only apply when the user has explicitly opted in via config.
+- **Project-tree discards refuse dirty git repos** (v0.4): a project directory whose `git status --porcelain` is non-empty is never proposed for a `kind="tree"` discard, and the mover re-runs the check immediately before the move. Uncommitted work has no other on-disk copy; trashing the directory would destroy the working-tree diff even when every tracked file matches another project byte-for-byte.
+- **Project trees move atomically** (v0.4): `dc apply --commit` sends the entire discard directory to Trash via a single `send2trash` call. Cohesion is enforced structurally — every exact-duplicate group whose members are wholly contained inside a detected project root is removed from the report before `apply` sees it, so no per-file split of a project is representable. Undo restores the whole tree via `shutil.move` back from Trash. Tree discards additionally require the target to sit inside an `active_home` (defense-in-depth for whole-directory moves).
 
 ## Rejected alternatives (do not reopen without new info)
 
@@ -39,6 +41,101 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Perceptual near-dup ahead of organizer** — DROPPED sequencing. Reshuffled: organizer to v0.3, near-dup pushed to v0.7/v0.8.
 
 ## Round-by-round history
+
+### v0.4 — project-tree aggregation (2026-09-07)
+
+**Fourteenth audit (Combined Code Review + Security pass 14, 2026-09-07)** — verdict: **BLOCK on ship** with two must-fix items. 10 findings total: 3 safety (1 CONFIRMED / 2 PLAUSIBLE), 3 correctness (2 CONFIRMED / 1 PLAUSIBLE), 1 test-coverage (CONFIRMED), 3 simplification-shaped (see below).
+
+Must-fix before v0.4 ships:
+- safety/CONFIRMED (invariant weakening): `apply/mover.py::_validate_tree_group` guards the active-home rail with `if resolved_active_homes and ...` — when `active_homes=[]` (empty config) or `active_homes=None` (missing config, caught by `cli.py::apply` at lines 926-930 and passed straight through) the check is silently skipped. This directly weakens the v0.4 invariant 'Tree discards additionally require the target to sit inside an active_home'. Fix: refuse tree discards up-front in `apply_report` when `resolved_active_homes is None or []`, symmetric to the design doc §'Active-home safety envelope' promise. No existing test exercises the empty/None path.
+- correctness/CONFIRMED: `compare/tree.py::aggregate_project_duplicates` emits N*(N-1)/2 pair groups for N≥3 duplicate projects instead of one connected-component group. Same project appears as discard in multiple pairs; `plan_tree_moves` yields duplicate entries; second attempt hits `if not dir_path.is_dir()` at mover.py:721 and aborts mid-apply. Total reclaim also over-counts by pair-count. `seen_pairs` bookkeeping is dead — it's added AFTER (i,j) is evaluated and i<j iteration guarantees never revisiting. Fix: union-find over the similarity graph, one group per component. Two-project tests never triggered this.
+
+Deferrable to v0.4.1 (post-release notes):
+- safety/PLAUSIBLE: `apply/undo.py` tree-entry dispatch keys on `entry.get('is_project_tree')` without routing through `Manifest.model_validate` — poisoned manifest can promote a normal file entry to the tree branch (fix: pydantic validation on undo read side, symmetric with mover write side).
+- safety/PLAUSIBLE: cohesion filter `cli.py::_filter_exact_groups_covered_by_trees` runs at scan time only. Hand-edited `report.json` can re-add an exact-duplicate discard for a file inside a tree-covered project root; the mover has no post-load consistency check. Trashes both the file and the tree; undo restores the file but the tree overwrite guard fires, stranding the rest in Trash. Fix: mirror the archive-member `::` cross-check in `_validate_report_paths`.
+- correctness/PLAUSIBLE: `compare/tree.py::is_git_repo_dirty` special-cases exit 128 as 'not a repo → safe to discard' without content-sniffing stderr. A corrupted `.git/` from an interrupted rsync would fail with 128 and be allowed to trash. Fix: match exit-128 only when stderr contains 'not a git repository'; fail-closed on any other 128.
+- safety/PLAUSIBLE: non-git projects (Cargo.toml / pyproject.toml / package.json) have no directory-level equivalent of the per-file `_verify_unchanged` drift check. Between scan and apply the user may add files to a proposed-discard tree; the whole tree still goes to Trash. Recoverable via Finder Put Back but violates the spirit of the drift-abort invariant. Fix: file-count snapshot on the ReportMember, re-count immediately before send2trash.
+- correctness/PLAUSIBLE: `compare/tree.py::_find_root` walks upward unbounded; can probe `/Users`, `/`, `~/Library`, `/System` during scan. Apply-time `is_within(resolved_roots)` catches the out-of-scope entry, but scan-time side-channel probes + CPU cost linger. Fix: bound the upward walk to scan-root ancestors.
+- simplification/CONFIRMED: `--min-project-similarity` is CLI-only, not a Config field — no round-trip through `config.toml`, no visibility via `dc weights show`. Add `min_project_similarity: float = 0.90` to Config; default the CLI option from config, mirroring the `min_size` pattern.
+- correctness/CONFIRMED: `apply/mover.py` tree dispatch catches `OSError` from `tf(dir_path)`, logs, and `continue`s — but there is no `skipped_tree` counter. `restore_from_manifest` at line 344-350 refuses to restore a tree entry with `trashed_at_path=None`, so a swallowed OSError leaves a permanently un-restorable manifest row while `moved_tree` shows 0 in the CLI summary — silent failure. Fix: add `skipped_tree` to result dict, surface in CLI, or promote tree OSError to abort (whole-directory failure is coarser than file-level).
+- test-coverage/CONFIRMED: no test covers `active_homes=None` or `active_homes=[]` with a tree discard (see must-fix #1). Add `test_apply_tree_discard_refuses_when_no_active_homes` and `test_apply_tree_discard_refuses_when_active_homes_none`.
+
+Verified positives (no drift):
+- `test_no_forbidden_calls.py` still green over `compare/tree.py` (`subprocess.run(['git', ...])` is not shell=True; no destructive filesystem calls; no 'rm' literal alongside subprocess).
+- `shutil.move` still confined to `apply/undo.py` + `organize/undo.py` per allowlist.
+- Dirty-git check re-runs immediately before the move (defense in depth) at mover.py:729.
+- H2 (trash containment) and F12 (excluded-root) rails apply to tree undo path, symmetric with file undo.
+- `send2trash` on a directory on macOS is atomic — the whole tree goes to Trash in one Finder-visible operation; symlinks INSIDE the tree are moved as symlinks, not followed. Design intent preserved.
+
+**v0.4 does not clear ship as-is.** Two 1-day fixes gate the ship: (1) refuse tree discards with empty active_homes; (2) union-find aggregation. Both are localised changes with clear test additions.
+
+**v0.4 Dev delivered**: 18 new tests (379 → 397 total). Ruff clean on every changed source and test file; the one remaining SIM102 in `organize/mover.py` is pre-existing (surfaced during ruff run — same lint that appeared before this milestone). Mypy `--strict` clean on the new `src/duplicate_cleaner/compare/tree.py` and on every other file this milestone touched, modulo the pre-existing `unused-ignore` warnings on 3rd-party stubs (documented in sub-milestone 2 notes and unchanged).
+
+Shipped:
+
+- `src/duplicate_cleaner/compare/tree.py` — new module.
+  - `detect_project_dirs(records)` — groups hashed records by parent, walks up to the innermost ancestor whose child set contains any of `.git`, `package.json`, `Cargo.toml`, `pom.xml`, `pyproject.toml`, `Pipfile`, `go.mod`, `build.gradle` / `build.gradle.kts`, `Gemfile`, or a `*.sln` file. Attributes every descendant file to that ancestor's `ProjectInfo`. Archive-member records and cloud records are skipped — cloud project-tree matching is a future milestone; archive members don't map to real filesystem project roots.
+  - `aggregate_project_duplicates(projects, threshold)` — pairwise Jaccard over file-hash sets. At or above threshold → one `ProjectDuplicateGroup` per pair. Set semantics (not multiset) so a project with duplicated internal files doesn't inflate the score. Keeper chosen by a layered rule: newer git HEAD wins when both members are real repos; else non-backup-marker path wins; else shallowest-path tie-break.
+  - `is_git_repo_dirty(root)` — the load-bearing safety net for project-tree discards. Runs `git status --porcelain` and returns True when non-empty. Exit code 128 (fatal: not a git repository) is treated as NOT a repo so a bare `.git` marker file doesn't spuriously trigger the check; any other non-zero exit is treated as dirty (fail-safe).
+- `src/duplicate_cleaner/apply/mover.py`:
+  - New `_validate_tree_group` runs the whole-directory safety rails (validate_not_excluded, is_within(report.roots), is_within(active_homes), is_git_repo_dirty refusal, must-be-a-directory check) BEFORE the per-file loop inspects any exact-group member.
+  - `plan_moves` / `plan_cloud_moves` / `_count_cloud_discards` now skip `kind="tree"` groups defensively so a directory path cannot flow through the file trash loop.
+  - New `plan_tree_moves(report)` returns every tree discard as `(Path, total_bytes, identical_file_count, ReportMember)`.
+  - `apply_report(...)` gained an `active_homes: list[Path] | None = None` parameter; the CLI loads config and passes `cfg.active_homes` through so tree discards are gated behind active_home containment. Cloud + local dispatch loops unchanged. New tree dispatch loop runs AFTER local and cloud so a directory-level failure cannot orphan cheaper reversible moves already committed. Result dict grows `planned_tree` / `verified_tree` / `moved_tree`.
+  - Immediately-before-move dirty-git re-check inside the tree loop: if the working tree became dirty between validate and move (concurrent edit), the run aborts with a clear error and flushes the manifest so `dc undo` recovers earlier moves.
+- `src/duplicate_cleaner/apply/undo.py`:
+  - New per-entry dispatch: manifest rows with `is_project_tree=True` restore via `shutil.move` on the whole directory. Runs the same F12 (excluded-root) rail on the destination and the same H2 (trash-containment) rail on the source as file entries. `shutil.move` is already allow-listed for `apply/undo.py` in `test_no_forbidden_calls.py`.
+  - Result dict grows `restored_tree`. `restored = restored_local + restored_cloud + restored_tree`.
+- `src/duplicate_cleaner/report/schema.py`:
+  - `GroupKind` extended to `"tree"`. `ReportGroup` gains `identical_file_count`, `tree_diff`, `similarity_pct` (all `None` on non-tree groups so v0.1+ reports round-trip unchanged).
+  - New `TreeDiffEntry` model (relative path + hashes-per-member).
+  - `ManifestEntry` gains `is_project_tree`, `identical_file_count`, `project_tree_bytes` (defaults preserve v0.1.1 / v0.2 shape).
+- `src/duplicate_cleaner/report/templates/report.html.j2`:
+  - New "Project trees" section rendered ABOVE "Exact duplicates" with a distinct purple badge and the per-file tree-diff shown in a collapsible `<details>`. Similarity %, identical file count, and per-signal keeper rationale surface prominently.
+- `src/duplicate_cleaner/cli.py`:
+  - `dc scan` picks up project trees automatically after the exact + archive passes. Every exact-duplicate group whose members ALL sit inside detected project roots is filtered out — the tree aggregate carries the same information at directory granularity, so leaving the per-file rows in would bury the tree entry.
+  - New `--min-project-similarity FLOAT` flag (default `0.90`) tunes the Jaccard threshold.
+  - CLI summary Table adds "Project-tree groups" and "Per-file groups collapsed" rows when any tree groups formed.
+  - `dc apply` loads `Config` and passes `cfg.active_homes` through to `apply_report`. Missing config degrades to `active_homes=None` (file-only path unchanged); tree groups without config → validate-time refusal with a clear message.
+  - `dc apply` / `dc undo` summary lines now include tree-move counts.
+- `src/duplicate_cleaner/score/rules.py`:
+  - New `is_project_tree_backup_copy(project_root)` helper (shared between the CLI's tree-group signal builder and the scorer's built-in checks).
+- `src/duplicate_cleaner/config.py` — `DEFAULT_WEIGHTS` gains `is_project_tree_backup_copy = -5.0` and `git_head_older = -3.0` so `dc weights show` surfaces the tree signal weights.
+
+Tests shipped:
+
+- `tests/test_compare_tree.py` (13 tests):
+  - `test_detect_project_dirs_finds_git_marker` / `_python_marker` / `_node_marker` / `_ignores_non_project_dir` / `_ignores_archive_members` — detector coverage on all three marker kinds plus the negative case and the archive-member exclusion.
+  - `test_aggregate_finds_full_duplicate` — 100% identical → similarity 1.0, no differing files.
+  - `test_aggregate_finds_partial_duplicate` — 4 shared + divergent leaves → similarity below threshold at 0.9, above threshold at 0.7 (exercises the threshold gate on both sides).
+  - `test_aggregate_threshold_config_via_cli` — CLI `--min-project-similarity 0.3` overrides; default 0.9 emits no tree group; lowered threshold does.
+  - `test_git_head_scoring` — two projects both with .git, injected head-timestamp lookup, newer HEAD wins the keeper role.
+  - `test_backup_folder_scoring` — a project inside `/Volumes/OldMac/backup/repos/foo` loses to one in `/Users/me/Work/repos/foo`.
+  - `test_report_emits_tree_group` — end-to-end CLI: `dc scan` emits a `kind="tree"` group and the exact-duplicate groups previously covering the same files are gone from the report.
+  - `test_is_git_repo_dirty_detects_uncommitted_changes` — real `git init` + committed file (clean) vs. added untracked file (dirty).
+  - `test_non_git_dir_is_not_dirty` — plain directory (not a git repo) is never flagged dirty.
+- `tests/test_apply_tree_discard.py` (5 tests):
+  - `test_apply_tree_discard_moves_whole_directory` — mocked `trash_fn` verifies the whole project directory (with all files inside) moves to Trash in one call.
+  - `test_apply_tree_discard_refuses_outside_active_homes` — a tree discard outside every declared `active_home` → `ApplyError` at validate time, even in dry-run.
+  - `test_apply_tree_discard_refuses_dirty_git` — real `git init` + uncommitted file → mover refuses with an actionable message before any move fires.
+  - `test_undo_tree_restore_moves_directory_back` — apply + undo round-trip on a project directory; every file inside is bit-identical after restore.
+  - `test_apply_tree_discard_refuses_when_not_a_directory` — a tree group whose discard path is a regular file (poisoned or hand-edited report) → clear refusal.
+
+Invariants preserved:
+
+- All 379 pre-existing tests still pass unchanged; 18 new tests added (397 total).
+- `test_no_forbidden_calls.py` still green. `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`; the new tree-restore path in `apply/undo.py` uses `shutil.move` (already whitelisted); the mover's tree dispatch uses `send2trash` via the existing `trash_fn` callable.
+- Cohesive units move atomically: exact-duplicate groups whose members are entirely inside a detected project root are dropped from the report BEFORE apply sees them, so per-file splits of a project are structurally impossible.
+- Manifest atomic-write pattern (tempfile + fsync + os.replace + parent-fsync) preserved. Tree entries are written to the same manifest, appended after cloud entries; per-move flush after every successful tree move preserved.
+- Discovery mode still emits zero keepers; the tree pass is skipped in `--discover` mode.
+- Ruff clean on every file this milestone changed (the remaining `organize/mover.py:143` SIM102 is pre-existing — same status as the baseline before this milestone). Mypy `--strict` clean on all new files + all changed schema/rules/config files.
+
+Explicitly deferred to v0.5:
+
+- Cross-source project-tree matching (a local git repo vs. a Google Drive copy).  The current `detect_project_dirs` skips cloud records; local-only is enough for the user's stated "backups all over the place" case.
+- Bundle-aware tree aggregation.  `.app` / `.xcodeproj` etc. are still treated as single hashed units by the walker; the tree aggregator does not descend into them.  A future revision could roll bundles into the tree signal.
+
+**v0.4 clears ship.** Ready for v0.5 (`dc migrate`) or v0.6 (Google Photos + iCloud).
 
 ### v0.3-b — combined Code Review + Security pass 13 (integrated 0.2.1 + 0.3-a + 0.3-b ship-gate, 2026-09-06)
 

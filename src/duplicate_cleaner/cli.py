@@ -44,6 +44,12 @@ from duplicate_cleaner.compare.archive import (
     scan_archive,
 )
 from duplicate_cleaner.compare.exact import group_by_hash
+from duplicate_cleaner.compare.tree import (
+    ProjectDuplicateGroup,
+    ProjectInfo,
+    aggregate_project_duplicates,
+    detect_project_dirs,
+)
 from duplicate_cleaner.config import (
     CONFIG_PATH,
     WEIGHTS_PATH,
@@ -66,9 +72,13 @@ from duplicate_cleaner.report.schema import (
     ReportMember,
     ReportSignal,
     SingletonEntry,
+    TreeDiffEntry,
 )
 from duplicate_cleaner.scan.walk import FileRecord, WalkStats
-from duplicate_cleaner.score.rules import score_groups
+from duplicate_cleaner.score.rules import (
+    is_project_tree_backup_copy,
+    score_groups,
+)
 from duplicate_cleaner.sources import LocalFileSystemSource
 from duplicate_cleaner.store import CACHE_DIR, Store
 from duplicate_cleaner.sys.apfs import get_clone_id
@@ -244,6 +254,132 @@ def _build_whole_archive_groups(
     return groups
 
 
+def _build_tree_report_groups(
+    tree_groups: list[ProjectDuplicateGroup],
+    projects: dict[Path, ProjectInfo],
+    weights: dict[str, float],
+) -> list[ReportGroup]:
+    """Convert every :class:`ProjectDuplicateGroup` into a :class:`ReportGroup`.
+
+    v0.4: each aggregate group produces one ``kind="tree"`` ReportGroup
+    whose members carry directory paths.  The keeper member gets
+    ``is_proposed_keeper=True``; every other member gets scored with the
+    two tree-specific signals (backup-marker ancestor, older git HEAD).
+    """
+    out: list[ReportGroup] = []
+    for i, tg in enumerate(tree_groups):
+        members: list[ReportMember] = []
+        for j, root in enumerate(tg.members):
+            proj = projects[root]
+            is_keeper = j == tg.proposed_keeper_index
+            signals: list[ReportSignal] = []
+            score = 0.0
+            if is_keeper and tg.keeper_reason:
+                signals.append(
+                    ReportSignal(name=f"keeper: {tg.keeper_reason}", contribution=0.0)
+                )
+            if not is_keeper:
+                if is_project_tree_backup_copy(root):
+                    w = weights.get("is_project_tree_backup_copy", -5.0)
+                    signals.append(
+                        ReportSignal(
+                            name="project tree under backup folder", contribution=w
+                        )
+                    )
+                    score += w
+                # ``git HEAD older`` fires when we can compare the keeper's
+                # HEAD to this member's HEAD and this one is older.
+                if tg.keeper_reason.startswith("newer git HEAD"):
+                    w = weights.get("git_head_older", -3.0)
+                    signals.append(
+                        ReportSignal(
+                            name="git HEAD older than keeper", contribution=w
+                        )
+                    )
+                    score += w
+                signals.append(
+                    ReportSignal(
+                        name=f"similarity {tg.similarity:.2%}",
+                        contribution=0.0,
+                    )
+                )
+            members.append(
+                ReportMember(
+                    path=root,
+                    size=proj.total_bytes,
+                    mtime=0.0,
+                    hash="",
+                    score=score,
+                    signals=signals,
+                    is_proposed_keeper=is_keeper,
+                    is_informational=False,
+                )
+            )
+        tree_diff_entries: list[TreeDiffEntry] = [
+            TreeDiffEntry(
+                relative_path=d.relative_path,
+                hashes_per_member=list(d.hashes_per_member),
+            )
+            for d in tg.differing_files
+        ]
+        out.append(
+            ReportGroup(
+                id=f"tree-{i:04d}",
+                kind="tree",
+                size=tg.total_bytes,
+                hash=f"tree-{i:04d}",
+                reclaim_bytes=tg.total_bytes,
+                members=members,
+                identical_file_count=tg.identical_files,
+                tree_diff=tree_diff_entries,
+                similarity_pct=tg.similarity * 100.0,
+            )
+        )
+    return out
+
+
+def _filter_exact_groups_covered_by_trees(
+    exact_groups: list[ReportGroup],
+    project_roots: list[Path],
+) -> tuple[list[ReportGroup], int]:
+    """Drop exact-duplicate groups whose members ALL sit inside detected projects.
+
+    v0.4: a project tree aggregate REPRESENTS all its members' duplicate
+    file matches.  Continuing to emit per-file exact groups for members
+    fully covered by aggregates buries the tree entry.  Returns the
+    filtered list plus a count of dropped groups so the CLI summary can
+    surface how many redundant rows were collapsed.
+    """
+    if not project_roots:
+        return exact_groups, 0
+    kept: list[ReportGroup] = []
+    dropped = 0
+    for g in exact_groups:
+        if g.kind != "exact":
+            kept.append(g)
+            continue
+        all_covered = True
+        for m in g.members:
+            mp = Path(m.path)
+            if not any(_lexical_contains(root, mp) for root in project_roots):
+                all_covered = False
+                break
+        if all_covered and g.members:
+            dropped += 1
+            continue
+        kept.append(g)
+    return kept, dropped
+
+
+def _lexical_contains(parent: Path, child: Path) -> bool:
+    """Purely-lexical containment check (no filesystem probe)."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 @app.command()
 def scan(
     roots: Annotated[
@@ -311,6 +447,17 @@ def scan(
             ),
         ),
     ] = 90.0,
+    min_project_similarity: Annotated[
+        float | None,
+        typer.Option(
+            "--min-project-similarity",
+            help=(
+                "Jaccard threshold above which two detected project "
+                "directories collapse to a single tree-aggregate group. "
+                "Overrides config.min_project_similarity (default 0.90)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Walk, hash, group, score, and write a report."""
     # v0.2 sub-milestone 5e: cross-source scan is enabled.  The 5b refusal
@@ -614,6 +761,52 @@ def scan(
             report_groups.append(ag)
             total_reclaim += ag.reclaim_bytes
 
+    # v0.4 project-tree aggregation: after exact + archive groups are built,
+    # collapse pairs of duplicate project directories into single "tree"
+    # groups.  Skipped in discover mode (aggregation is a keeper-proposing
+    # step and discover mode proposes zero keepers).  Any exact-duplicate
+    # group whose members ALL sit inside detected project roots is
+    # dropped from the report — the aggregate carries the same
+    # information at directory granularity.
+    tree_report_groups: list[ReportGroup] = []
+    exact_groups_covered_dropped = 0
+    project_roots_detected: list[Path] = []
+    if not discover:
+        projects = detect_project_dirs(all_hashed)
+        # K4 (audit pass 14): CLI flag overrides Config default so the
+        # value can be persisted in config.toml AND overridden per run.
+        effective_similarity = (
+            min_project_similarity
+            if min_project_similarity is not None
+            else cfg.min_project_similarity
+        )
+        aggregate = aggregate_project_duplicates(
+            projects, threshold=effective_similarity
+        )
+        if aggregate:
+            tree_report_groups = _build_tree_report_groups(
+                aggregate, projects, weights
+            )
+            # Union of every member root in every aggregate group — a
+            # per-file exact group whose members ALL sit inside one of
+            # these roots is redundant with the tree entry.
+            for tg in aggregate:
+                project_roots_detected.extend(tg.members)
+            report_groups, exact_groups_covered_dropped = (
+                _filter_exact_groups_covered_by_trees(
+                    report_groups, project_roots_detected
+                )
+            )
+            # Roll up reclaim: subtract dropped exact groups' reclaim from
+            # the running total (they no longer contribute), then add the
+            # tree groups' aggregate reclaim.  Since we removed them
+            # already we must not double-count; recompute total_reclaim
+            # from scratch.
+            total_reclaim = sum(rg.reclaim_bytes for rg in report_groups)
+            for trg in tree_report_groups:
+                report_groups.append(trg)
+                total_reclaim += trg.reclaim_bytes
+
     # Singletons — hashes that appear exactly once across the whole scan,
     # excluding archive members (which are informational by construction).
     hash_counts: dict[str, int] = {}
@@ -660,6 +853,12 @@ def scan(
     tbl.add_row("Files scanned", str(file_count))
     tbl.add_row("Bundles hashed", str(walk_stats.bundles_hashed))
     tbl.add_row("Duplicate groups", str(len(report_groups)))
+    if tree_report_groups:
+        tbl.add_row("Project-tree groups", str(len(tree_report_groups)))
+        tbl.add_row(
+            "Per-file groups collapsed",
+            str(exact_groups_covered_dropped),
+        )
     tbl.add_row("Unique files", str(len(singletons)))
     tbl.add_row("Skipped archives", str(len(archive_skips)))
     if not_yet_hashed:
@@ -724,12 +923,28 @@ def apply(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1) from e
 
+    # v0.4: project-tree discards are validated against active_homes as
+    # a defense-in-depth check — a whole-directory move has a much larger
+    # blast radius than a file move, so we require the target to sit
+    # inside a declared active home.  Loading config here means the
+    # apply path fails fast when active_homes is empty and a tree entry
+    # is present, without embedding config discovery inside the mover.
+    cfg_for_apply = None
+    active_homes_for_apply: list[Path] | None = None
+    try:
+        cfg_for_apply = load_config()
+    except FileNotFoundError:
+        cfg_for_apply = None
+    if cfg_for_apply is not None:
+        active_homes_for_apply = list(cfg_for_apply.active_homes)
+
     try:
         result = apply_report(
             report_json,
             commit=commit,
             registry=registry,
             sources=sources_map or None,
+            active_homes=active_homes_for_apply,
         )
     except ApplyError as e:
         console.print(f"[red]{e}[/red]")
@@ -760,15 +975,22 @@ def apply(
         # set is smaller than the planned set.
         moved_local = int(result.get("moved_local", result.get("moved", 0)))
         moved_cloud = int(result.get("moved_cloud", 0))
+        moved_tree = int(result.get("moved_tree", 0))
         skipped_cloud = int(result.get("skipped_cloud", 0))
+        skipped_tree = int(result.get("skipped_tree", 0))
         console.print(
             f"[green]Moved {moved_local} local file(s), {moved_cloud} cloud "
-            "file(s) to Trash.[/green]"
+            f"file(s), {moved_tree} project tree(s) to Trash.[/green]"
         )
         if skipped_cloud:
             console.print(
                 f"[yellow]Skipped {skipped_cloud} cloud file(s)[/yellow] "
                 "(source-not-found or permission errors — see logs)."
+            )
+        if skipped_tree:
+            console.print(
+                f"[yellow]Skipped {skipped_tree} project tree(s) due to "
+                "errors[/yellow] (see logs)."
             )
         console.print(f"Manifest: {result['manifest_path']}")
 
@@ -1162,10 +1384,12 @@ def undo(
         raise typer.Exit(1) from e
     restored_local = int(result.get("restored_local", result.get("restored", 0)))
     restored_cloud = int(result.get("restored_cloud", 0))
+    restored_tree = int(result.get("restored_tree", 0))
     skipped_cloud = int(result.get("skipped_cloud", 0))
     total = int(result.get("total", 0))
     console.print(
-        f"Restored {restored_local} local, {restored_cloud} cloud file(s) "
+        f"Restored {restored_local} local, {restored_cloud} cloud, "
+        f"{restored_tree} project tree(s) "
         f"(of {total} manifest entries)."
     )
     if skipped_cloud:

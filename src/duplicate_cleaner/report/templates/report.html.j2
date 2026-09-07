@@ -37,6 +37,13 @@
   .badge.discard { background: #c62828; }
   .badge.info    { background: #ef6c00; }
   .badge.recon   { background: #1565c0; margin-left: 0.3em; }
+  .badge.tree    { background: #6a1b9a; margin-left: 0.3em; }
+  .tree-group    { border-left: 5px solid #6a1b9a; }
+  .tree-meta     { background: #f3e5f5; padding: 0.6em 0.9em; border-radius: 4px;
+                   margin: 0.5em 0 0.9em 0; font-size: 0.9em; }
+  .tree-diff     { margin-top: 0.5em; font-size: 0.85em; color: #444; }
+  .tree-diff table { margin-top: 0.3em; }
+  .tree-diff td, .tree-diff th { font-size: 0.8em; }
   footer { margin-top: 3em; font-size: 0.85em; color: #888; }
   code { background: #f2f2f4; padding: 0.05em 0.35em; border-radius: 3px; }
 </style>
@@ -72,9 +79,83 @@
   </div>
 </section>
 
+{% set tree_groups = report.groups | selectattr('kind', 'equalto', 'tree') | list %}
+{% if tree_groups %}
+<h2>Project trees ({{ tree_groups | length }})</h2>
+<p>Two or more directories detected as copies of the same project. Trashing the
+   discard side reclaims the whole tree at once — the mover sends the entire
+   directory to the Trash atomically.</p>
+
+{% for g in tree_groups %}
+<div class="group tree-group">
+  <h3><span class="badge tree">TREE</span> Group {{ g.id }}</h3>
+  <div class="tree-meta">
+    <strong>{{ (g.similarity_pct or 0) | round(1) }}%</strong> similarity ·
+    <strong>{{ g.identical_file_count or 0 }}</strong> identical files ·
+    reclaim <strong>{{ g.reclaim_bytes | human_bytes }}</strong>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:64px;"></th>
+        <th>Project directory</th>
+        <th style="width:90px;">Total</th>
+        <th style="width:70px;">Score</th>
+        <th>Signals</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for m in g.members %}
+      <tr class="{% if m.is_proposed_keeper %}keeper{% endif %}">
+        <td>
+          {% if m.is_proposed_keeper %}
+            <span class="badge keep">KEEP</span>
+          {% else %}
+            <span class="badge discard">TRASH TREE</span>
+          {% endif %}
+        </td>
+        <td class="path"><span class="path-text">{{ m.path }}/</span></td>
+        <td>{{ m.size | human_bytes }}</td>
+        <td class="score">{{ m.score | signed }}</td>
+        <td class="signals">
+          <ul>
+            {% for s in m.signals %}
+              <li>{{ s.name }}{% if s.contribution != 0 %}: {{ s.contribution | signed }}{% endif %}</li>
+            {% endfor %}
+          </ul>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if g.tree_diff %}
+  <details class="tree-diff">
+    <summary>{{ g.tree_diff | length }} differing file(s) shown</summary>
+    <table>
+      <thead>
+        <tr>
+          <th>Relative path</th>
+          {% for m in g.members %}<th>{{ m.path.name }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+      {% for d in g.tree_diff %}
+        <tr>
+          <td class="path">{{ d.relative_path }}</td>
+          {% for h in d.hashes_per_member %}<td class="path">{% if h %}{{ h[:12] }}…{% else %}<em>missing</em>{% endif %}</td>{% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
 <h2>Exact duplicates</h2>
 
-{% for g in report.groups %}
+{% for g in report.groups if g.kind != 'tree' %}
 <div class="group">
   <h3>Group {{ g.id }} — {{ g.hash[:16] }}…</h3>
   <div class="meta">

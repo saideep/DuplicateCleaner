@@ -95,6 +95,12 @@ class Config(BaseModel):
     min_event_photos: int = 5
     enforce_dedup_ordering: bool = False
 
+    # v0.4 project-tree aggregation — Jaccard threshold above which two
+    # detected project directories collapse to one ``kind="tree"`` group.
+    # ``dc scan --min-project-similarity`` overrides per-invocation; the
+    # config value is the default when the flag is omitted.
+    min_project_similarity: float = 0.90
+
     @field_validator("max_workers")
     @classmethod
     def _validate_max_workers(cls, v: int) -> int:
@@ -179,6 +185,11 @@ max_archive_depth = 2
 # min_free_disk_gb — refuse to scan if free space on the cache volume is
 # below this threshold. Default: 5 GB.
 # min_free_disk_gb = 5
+
+# v0.4 project-tree aggregation — Jaccard threshold above which two
+# detected project directories collapse into one tree-aggregate group.
+# `dc scan --min-project-similarity` overrides this default per run.
+min_project_similarity = 0.90
 """
 
 
@@ -206,6 +217,16 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     # (see audit pass 12 + 13 — dead field).
     "cloud_when_local_exists": -3.0,
     "is_shared_file": 0.0,
+    # v0.4 project-tree aggregation signals — applied per-member on
+    # ``kind="tree"`` groups.  ``is_project_tree_backup_copy`` fires when
+    # the project directory sits under a backup-marker ancestor (``old``,
+    # ``backup``, ``archive``, ``bak``, ...).  ``git_head_older`` fires
+    # when the project has a git repo whose HEAD commit is older than at
+    # least one aggregate peer's HEAD.  Both push the member toward
+    # discard, with the git signal expressly weaker than the folder-name
+    # signal — a live repo inside an ``old/`` folder is still a backup.
+    "is_project_tree_backup_copy": -5.0,
+    "git_head_older": -3.0,
 }
 
 

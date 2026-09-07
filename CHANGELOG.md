@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file. Format: Kee
 
 ## [Unreleased]
 
+### v0.4 — Project-tree aggregation (2026-09-07)
+
+Two copies of the same project directory — git repo, npm package, Cargo crate, Go module, etc. — now collapse to a single tree-diff entry in the report instead of surfacing as thousands of per-file matches. Discards trash the whole directory atomically; undo restores it wholesale.
+
+Added:
+
+- `dc scan` picks up project directories automatically. A directory qualifies when its child set contains any of `.git`, `package.json`, `Cargo.toml`, `pom.xml`, `pyproject.toml`, `Pipfile`, `go.mod`, `build.gradle`, `Gemfile`, or a `*.sln` file. Pairs of detected projects with Jaccard similarity at or above `--min-project-similarity` (default `0.90`) collapse to a single `kind="tree"` group.
+- HTML report renders a distinct "Project trees" section above "Exact duplicates" with a purple badge, similarity %, identical-file count, and a collapsible per-file tree-diff.
+- `dc apply --commit` sends the entire discard directory to Trash via `send2trash` in one call. `dc undo` restores the whole tree via `shutil.move` back from Trash.
+- New scoring weights `is_project_tree_backup_copy` (-5) and `git_head_older` (-3) surface in `dc weights show`.
+
+Safety additions:
+
+- Project-tree discards refuse dirty git repos. `git status --porcelain` non-empty → validate-time refusal with an actionable message. Re-checked immediately before the move as defense-in-depth against concurrent edits.
+- Project-tree discards require the target to sit inside a declared `active_home`. A whole-directory move has a much larger blast radius than a file move; the safety envelope is proportional.
+- Exact-duplicate groups whose members are entirely contained inside a detected project root are removed from the report before `apply` sees them. Structural cohesion enforcement — no per-file split of a project is representable in a plan file.
+
+Two new invariants added to [AUDIT_LOG.md](docs/AUDIT_LOG.md#invariants-do-not-weaken):
+
+- Project-tree discards refuse dirty git repos.
+- Project trees move atomically.
+
+Tests: 379 → 397 (13 new in `tests/test_compare_tree.py`, 5 new in `tests/test_apply_tree_discard.py`).
+
 ### v0.3 — Organizer (planned)
 
 Design contract: [docs/design/v0.3-organizer.md](docs/design/v0.3-organizer.md). User-facing docs: [docs/organize.md](docs/organize.md), [docs/cli.md](docs/cli.md), [docs/config.md](docs/config.md), [docs/safety.md](docs/safety.md).

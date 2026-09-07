@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import blake3  # type: ignore[import-untyped]
+from pydantic import ValidationError
 
 from duplicate_cleaner.auth.accounts import AccountsRegistry
 from duplicate_cleaner.compare.archive import ARCHIVE_SEP
@@ -22,6 +23,7 @@ from duplicate_cleaner.paths import (
     validate_not_excluded,
     validate_scan_root_candidate,
 )
+from duplicate_cleaner.report.schema import Manifest
 from duplicate_cleaner.sources.base import (
     SourceAuthError,
     SourceError,
@@ -260,8 +262,25 @@ def restore_from_manifest(
         else known_trash_dirs()
     )
 
-    data = json.loads(manifest_path.read_text())
-    entries: list[dict[str, Any]] = data.get("entries", [])
+    raw_text = manifest_path.read_text()
+    data = json.loads(raw_text)
+    # K3 (audit pass 14): route the manifest through
+    # ``Manifest.model_validate_json`` so tree-specific fields (and every
+    # other field on ``ManifestEntry``) are type-checked before dispatch.
+    # A poisoned manifest whose ``is_project_tree`` value is not a bool,
+    # or whose ``project_tree_bytes`` is a string, is rejected here rather
+    # than sneaking into the tree branch as a truthy ``.get()`` result.
+    # The mover is symmetric — it writes every row via
+    # ``ManifestEntry.model_dump()`` — so this closes the write/read gap.
+    try:
+        validated = Manifest.model_validate_json(raw_text)
+    except ValidationError as e:
+        raise UndoError(
+            f"Refuse to restore: manifest failed schema validation — {e}"
+        ) from e
+    # Keep the dict-of-Any shape for the existing entry loop; the pydantic
+    # model above proved the JSON is well-formed at every declared field.
+    entries: list[dict[str, Any]] = [e.model_dump() for e in validated.entries]
 
     # G1: some manifests may carry a ``roots`` array (added in v0.1.1 for
     # future report/manifest linkage). If it is present, validate each entry
@@ -315,9 +334,81 @@ def restore_from_manifest(
 
     restored_local = 0
     restored_cloud = 0
+    restored_tree = 0
     skipped_cloud = 0
     errors: list[str] = []
     for entry in entries:
+        # v0.4 project-tree dispatch — a whole directory that was
+        # send2trash'd during apply.  Runs the same F12 exclusion rail on
+        # the destination (``original_path``) and the same H2 trash
+        # containment rail on the source (``trashed_at_path``).  The undo
+        # is a single ``shutil.move`` on the directory root.
+        if entry.get("is_project_tree"):
+            original_dir_raw = entry.get("original_path")
+            if not isinstance(original_dir_raw, str):
+                errors.append(
+                    "Refuse to restore project-tree entry: original_path missing."
+                )
+                continue
+            original_dir = Path(original_dir_raw)
+            resolved_original = resolve_for_check(original_dir)
+            try:
+                validate_not_excluded(resolved_original)
+            except ValueError as e:
+                errors.append(
+                    "Refuse to restore project-tree into excluded location "
+                    f"{original_dir}: {e}"
+                )
+                continue
+            trashed_at_raw = entry.get("trashed_at_path")
+            if not isinstance(trashed_at_raw, str) or not trashed_at_raw:
+                errors.append(
+                    f"Cannot locate trashed project-tree for {original_dir}: "
+                    "trashed_at_path missing.  Manually restore via Finder "
+                    "Put Back from the Trash."
+                )
+                continue
+            src_dir = Path(trashed_at_raw)
+            if not src_dir.exists():
+                errors.append(
+                    f"Trashed project-tree missing at {src_dir}; unable to "
+                    "restore.  Check the Trash or Time Machine."
+                )
+                continue
+            # K3 (audit pass 14): a manifest row flagged ``is_project_tree``
+            # whose Trash source is not actually a directory is a poisoned /
+            # hand-edited row.  Refuse rather than dispatching a directory
+            # code path against a regular file — belt-and-braces on top of
+            # the pydantic type check above.
+            if not src_dir.is_dir():
+                errors.append(
+                    "Refuse to restore project-tree: "
+                    f"{src_dir} is not a directory (poisoned manifest?)."
+                )
+                continue
+            if not any(is_within(resolve_for_check(src_dir), root) for root in trash_roots):
+                errors.append(
+                    f"Refuse to restore project-tree: {src_dir} is not "
+                    "inside a known Trash directory "
+                    f"({[str(r) for r in trash_roots]})"
+                )
+                continue
+            if original_dir.exists():
+                errors.append(
+                    "Original project-tree already exists, refusing to "
+                    f"overwrite: {original_dir}"
+                )
+                continue
+            original_dir.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(src_dir), str(original_dir))
+            except OSError as exc:
+                errors.append(
+                    f"Restore failed for project-tree {original_dir}: {exc}"
+                )
+                continue
+            restored_tree += 1
+            continue
         # v0.2 sub-phase 5b: dispatch by source_id BEFORE any local-path
         # validation.  Cloud entries never touch resolve_for_check or the
         # trash containment checks — Alt-C treats their ``original_path``
@@ -528,9 +619,10 @@ def restore_from_manifest(
     # error out (in ``errors``).  A v0.1.1-shaped local-only manifest still
     # returns ``cloud_deferred=0`` and ``restored=restored_local``.
     return {
-        "restored": restored_local + restored_cloud,
+        "restored": restored_local + restored_cloud + restored_tree,
         "restored_local": restored_local,
         "restored_cloud": restored_cloud,
+        "restored_tree": restored_tree,
         "skipped_cloud": skipped_cloud,
         "errors": errors,
         "total": len(entries),

@@ -15,6 +15,7 @@ from duplicate_cleaner.compare.archive import (
     ARCHIVE_SEP,
     is_virtual_archive_path,
 )
+from duplicate_cleaner.compare.tree import is_git_repo_dirty
 from duplicate_cleaner.paths import (
     is_within,
     resolve_for_check,
@@ -26,6 +27,7 @@ from duplicate_cleaner.report.schema import (
     Manifest,
     ManifestEntry,
     Report,
+    ReportGroup,
     ReportMember,
 )
 from duplicate_cleaner.scan.walk import FileRecord
@@ -58,9 +60,89 @@ def load_report(json_path: Path) -> Report:
     return Report.model_validate(data)
 
 
+def _validate_tree_group(
+    group: ReportGroup,
+    resolved_roots: list[Path],
+    resolved_active_homes: list[Path] | None,
+) -> None:
+    """Enforce project-tree safety rails on one ``kind="tree"`` group.
+
+    v0.4: tree groups discard whole DIRECTORIES.  Each discard member's
+    resolved directory MUST:
+
+    * pass ``validate_not_excluded`` (never inside ``/System``, ``~/Library``,
+      etc.),
+    * sit inside at least one recorded scan root (same as file discards),
+    * sit inside at least one ``active_home`` (defense-in-depth — a tree
+      discard is much larger than a file discard and the safety envelope
+      is proportional).  ``apply_report`` refuses up-front when
+      ``active_homes`` is empty/None, so a non-empty resolved list is a
+      caller invariant here.  We re-assert it so a future refactor cannot
+      quietly weaken the rail.
+
+    Additionally, refuses any discard whose git working tree is dirty
+    (``git status --porcelain`` non-empty) — uncommitted work has not
+    been shipped anywhere and cannot be reconstructed from another
+    directory just because the tracked file set matches.
+    """
+    # K1 (audit pass 14 ship-blocker): fail closed on the active-home rail.
+    # A missing / empty active_homes list is a caller bug, not a licence to
+    # skip the check — the earlier ``if resolved_active_homes and ...``
+    # silently degraded to no-op when config was absent.  ``apply_report``
+    # is now the single choke-point that refuses tree groups without
+    # active_homes; this asserts the invariant locally so future callers
+    # cannot bypass it.
+    if not resolved_active_homes:
+        raise ApplyError(
+            "Refusing project-tree discard: no active_homes configured. "
+            "Whole-directory discards require an active-home safety "
+            "envelope.  Set active_homes in "
+            "~/.config/duplicate_cleaner/config.toml before applying tree "
+            "groups."
+        )
+    for m in group.members:
+        if m.is_proposed_keeper or m.is_informational:
+            continue
+        path = Path(m.path)
+        resolved = resolve_for_check(path)
+        try:
+            validate_not_excluded(resolved)
+        except ValueError as e:
+            raise ApplyError(
+                f"Refusing to touch project-tree path from report: {e}"
+            ) from e
+        if not resolved.is_dir():
+            raise ApplyError(
+                f"Refusing project-tree discard: {resolved} is not a directory. "
+                "Tree groups must reference the project root, not a file inside it."
+            )
+        if not any(is_within(resolved, r) for r in resolved_roots):
+            raise ApplyError(
+                "Refusing to touch project-tree path outside the recorded "
+                f"scan roots: {resolved} "
+                f"(roots: {[str(r) for r in resolved_roots]})"
+            )
+        if not any(is_within(resolved, h) for h in resolved_active_homes):
+            raise ApplyError(
+                "Refusing project-tree discard: "
+                f"{resolved} is not inside any active home "
+                f"({[str(h) for h in resolved_active_homes]}). "
+                "Whole-directory discards require an active-home safety "
+                "envelope."
+            )
+        if is_git_repo_dirty(resolved):
+            raise ApplyError(
+                "Refusing project-tree discard: "
+                f"{resolved} contains a git repo with uncommitted changes. "
+                "Commit or stash the working tree first, or drop this "
+                "member from the report."
+            )
+
+
 def _validate_report_paths(
     report: Report,
     registry: AccountsRegistry | None = None,
+    active_homes: list[Path] | None = None,
 ) -> list[Path]:
     """Reject any discard path that is excluded or outside the recorded roots.
 
@@ -116,7 +198,18 @@ def _validate_report_paths(
     # accounts.toml per member.
     reg: AccountsRegistry = registry if registry is not None else AccountsRegistry()
     authorized: set[str] = {"local"} | {e.id for e in reg.load()}
+    resolved_active_homes: list[Path] | None = (
+        [resolve_for_check(h) for h in active_homes] if active_homes else None
+    )
     for g in report.groups:
+        if g.kind == "tree":
+            # v0.4: project-tree discards are directory paths.  Route them
+            # through their dedicated validator BEFORE the per-file loop
+            # inspects individual members — the file-level rails would
+            # reject a directory as "not a virtual archive path" without
+            # catching the important dirty-git / active-home rules.
+            _validate_tree_group(g, resolved_roots, resolved_active_homes)
+            continue
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
                 continue
@@ -175,6 +268,11 @@ def plan_moves(report: Report) -> list[tuple[Path, int, float, str]]:
     """
     moves: list[tuple[Path, int, float, str]] = []
     for g in report.groups:
+        # v0.4: project-tree groups dispatch through ``plan_tree_moves``;
+        # their members are directory paths, not files, and cannot flow
+        # through the local file trash loop.
+        if g.kind == "tree":
+            continue
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
                 continue
@@ -182,6 +280,26 @@ def plan_moves(report: Report) -> list[tuple[Path, int, float, str]]:
                 continue
             moves.append((Path(m.path), m.size, m.mtime, m.hash))
     return moves
+
+
+def plan_tree_moves(report: Report) -> list[tuple[Path, int, int, ReportMember]]:
+    """Return [(project_root, total_bytes, identical_file_count, member), ...] for tree discards.
+
+    v0.4: one entry per non-keeper member of every ``kind="tree"`` group.
+    ``total_bytes`` is the aggregate size of the project directory (stamped
+    on the ReportMember at scan time so we don't re-walk the tree during
+    apply).  ``identical_file_count`` mirrors the group-level count for
+    the manifest.
+    """
+    out: list[tuple[Path, int, int, ReportMember]] = []
+    for g in report.groups:
+        if g.kind != "tree":
+            continue
+        for m in g.members:
+            if m.is_proposed_keeper or m.is_informational:
+                continue
+            out.append((Path(m.path), m.size, g.identical_file_count or 0, m))
+    return out
 
 
 def _count_cloud_discards(report: Report) -> int:
@@ -194,6 +312,8 @@ def _count_cloud_discards(report: Report) -> int:
     """
     n = 0
     for g in report.groups:
+        if g.kind == "tree":
+            continue
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
                 continue
@@ -213,6 +333,8 @@ def plan_cloud_moves(report: Report) -> list[ReportMember]:
     """
     out: list[ReportMember] = []
     for g in report.groups:
+        if g.kind == "tree":
+            continue
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
                 continue
@@ -302,6 +424,7 @@ def apply_report(
     trash_fn: TrashFn | None = None,
     registry: AccountsRegistry | None = None,
     sources: dict[str, Source] | None = None,
+    active_homes: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Verify then move discarded files to Trash. Dry-run unless commit=True.
 
@@ -324,14 +447,28 @@ def apply_report(
       apply continues.  Same as ``OSError`` on local ``send2trash``.
     """
     report = load_report(json_path)
+    # K1 (audit pass 14 ship-blocker): tree groups require active_homes.
+    # Refuse up-front — before any per-member rail runs — so the caller
+    # gets one clean actionable error instead of a per-member replay.
+    # ``_validate_tree_group`` re-asserts the invariant locally as
+    # defense in depth.
+    has_tree_group = any(g.kind == "tree" for g in report.groups)
+    if has_tree_group and not active_homes:
+        raise ApplyError(
+            "Refusing to apply: report contains project-tree discards but "
+            "no active_homes are configured. Set active_homes in "
+            "~/.config/duplicate_cleaner/config.toml before applying tree "
+            "groups."
+        )
     # Enforce exclusions and root containment against paths from the report
     # BEFORE anything else — a poisoned report must not cause side effects.
     # v0.2 sub-phase 5b: cloud entries flow through the cloud rails (Alt-C
     # dispatch on ``source_id``); local entries flow through the v0.1.1 rails.
-    _validate_report_paths(report, registry=registry)
+    _validate_report_paths(report, registry=registry, active_homes=active_homes)
 
     moves = plan_moves(report)
     cloud_moves = plan_cloud_moves(report)
+    tree_moves = plan_tree_moves(report)
 
     # v0.2 sub-phase 5c: local-only mode is signalled by ``sources=None``.
     # A cloud entry in the report is a hard refusal — the mover cannot
@@ -381,18 +518,21 @@ def apply_report(
             verified.append((path, size, mtime, h))
 
     result: dict[str, Any] = {
-        "planned": len(moves) + len(cloud_moves),
+        "planned": len(moves) + len(cloud_moves) + len(tree_moves),
         "planned_local": len(moves),
         "planned_cloud": len(cloud_moves),
-        "verified": len(verified) + len(cloud_moves),
+        "planned_tree": len(tree_moves),
+        "verified": len(verified) + len(cloud_moves) + len(tree_moves),
         "verified_local": len(verified),
         "verified_cloud": len(cloud_moves),
+        "verified_tree": len(tree_moves),
         "changed_or_missing": errors,
         "committed": False,
         "manifest_path": None,
         "moved": 0,
         "moved_local": 0,
         "moved_cloud": 0,
+        "moved_tree": 0,
         # v0.2 sub-phase 5c: cloud dispatch is wired.  When ``sources`` is
         # provided every cloud entry is dispatched (or logged as an error);
         # ``cloud_deferred`` stays for backcompat with the 5b result-dict
@@ -404,6 +544,11 @@ def apply_report(
         # ``moved_cloud`` counts successful dispatches; ``skipped_cloud`` is
         # every log-and-continue path in the cloud dispatch loop.
         "skipped_cloud": 0,
+        # K6 (audit pass 14): project-tree discards whose send2trash raises
+        # a non-fatal ``OSError`` (log-and-continue) are counted here so
+        # the CLI can surface a "Skipped N project tree(s)" line — mirrors
+        # the ``skipped_cloud`` shape.  Zero on dry-run.
+        "skipped_tree": 0,
     }
 
     if not commit:
@@ -452,6 +597,22 @@ def apply_report(
                 cloud_file_id=m.cloud_file_id,
                 cloud_trash_id=None,
                 etag=m.etag,
+            ).model_dump()
+        )
+    # v0.4 project-tree entries.  Directory paths, not files; the mover
+    # sends the whole directory to Trash and undo restores it wholesale.
+    tree_entries_start = len(entries)
+    for path, total_bytes, ident_count, member in tree_moves:
+        entries.append(
+            ManifestEntry(
+                original_path=str(path),
+                size=int(total_bytes),
+                mtime=member.mtime,
+                hash=member.hash,
+                trashed_at_path=None,
+                is_project_tree=True,
+                identical_file_count=int(ident_count),
+                project_tree_bytes=int(total_bytes),
             ).model_dump()
         )
 
@@ -584,12 +745,54 @@ def apply_report(
         # G6 (cloud mirror): flush after every successful move.
         _flush_manifest()
 
+    # v0.4 project-tree dispatch loop.  Each tree discard is a directory
+    # path sent whole to Trash via the same trash_fn.  Order is AFTER
+    # local and cloud files so a directory-level failure cannot orphan
+    # cheaper reversible moves that already succeeded.
+    moved_tree = 0
+    skipped_tree = 0
+    for k, (dir_path, _bytes, _ident, _member) in enumerate(tree_moves):
+        i = tree_entries_start + k
+        if not dir_path.is_dir():
+            _flush_manifest()
+            raise ApplyError(
+                f"Aborted mid-apply: project-tree {dir_path} disappeared "
+                "between validate and move. "
+                f"Manifest at {manifest_path} reflects reality "
+                f"({moved_local + moved_cloud + moved_tree} file(s) moved so far)."
+            )
+        if is_git_repo_dirty(dir_path):
+            _flush_manifest()
+            raise ApplyError(
+                f"Aborted mid-apply: project-tree {dir_path} became dirty "
+                "between validate and move (uncommitted changes present). "
+                f"Manifest at {manifest_path} reflects reality "
+                f"({moved_local + moved_cloud + moved_tree} file(s) moved so far)."
+            )
+        try:
+            dest = tf(dir_path)
+        except OSError as e:
+            # K6 (audit pass 14): count log-and-continue tree failures so
+            # the CLI can surface them.  Without this counter the manifest
+            # row for the failed tree keeps ``trashed_at_path=None`` (undo
+            # already refuses to restore that shape) while ``moved_tree``
+            # under-reports — silent failure.
+            log.error("Trash move failed for project tree %s: %s", dir_path, e)
+            skipped_tree += 1
+            continue
+        if dest is not None:
+            entries[i]["trashed_at_path"] = str(dest)
+        moved_tree += 1
+        _flush_manifest()
+
     _flush_manifest()
 
     result["manifest_path"] = str(manifest_path)
-    result["moved"] = moved_local + moved_cloud
+    result["moved"] = moved_local + moved_cloud + moved_tree
     result["moved_local"] = moved_local
     result["moved_cloud"] = moved_cloud
+    result["moved_tree"] = moved_tree
     result["skipped_cloud"] = skipped_cloud
+    result["skipped_tree"] = skipped_tree
     result["committed"] = True
     return result
