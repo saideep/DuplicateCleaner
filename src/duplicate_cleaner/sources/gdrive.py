@@ -30,6 +30,7 @@ from duplicate_cleaner.sources.base import (
     SourcePermissionError,
     SourceRateLimitError,
     TrashedLocation,
+    UploadResult,
 )
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,59 @@ _GOOGLE_NATIVE_MIME_PREFIX = "application/vnd.google-apps."
 # is interpolated into a Drive REST URL — googleapiclient does not escape
 # fileId for us and a poisoned id would target the wrong Drive object.
 _GDRIVE_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+
+# v0.5-a upload path validator.  Google Drive's REST create endpoint takes
+# a folder chain via ``parents`` — we still parse the caller-supplied
+# ``dest_path`` string here so a poisoned or hand-edited plan cannot smuggle
+# ``../`` traversal or absolute paths into the folder-resolution logic.  The
+# same rules apply as the OneDrive validator: POSIX-style, no leading ``/``,
+# no ``..`` segment, no empty segment (``foo//bar`` is rejected).  The final
+# leaf becomes the file name; every leading segment becomes a folder name.
+_GDRIVE_UPLOAD_PATH_SEGMENTS: re.Pattern[str] = re.compile(r"^[^/\x00]+$")
+
+# Small-vs-resumable threshold: Google's ``files.create`` accepts a simple
+# ``MediaIoBaseUpload(resumable=False)`` up to a few MB and switches to a
+# resumable session past that.  We mirror that at 5 MB — well below the
+# 5 GB single-request cap but past the point where a resume-on-failure
+# hop starts paying for itself.  Kept module-level so tests can monkeypatch
+# it and exercise both branches without a 5 MB fixture.
+_GDRIVE_SMALL_UPLOAD_THRESHOLD_BYTES: int = 5 * 1024 * 1024
+_GDRIVE_UPLOAD_CHUNK_SIZE_BYTES: int = 8 * 1024 * 1024
+
+
+def _validate_gdrive_upload_path(dest_path: str) -> tuple[list[str], str]:
+    """Split ``dest_path`` into ``(folder_segments, filename)``.
+
+    Rejects absolute paths, ``..`` traversal, and empty segments BEFORE any
+    Drive folder is created or the file is opened for upload.  Symmetric
+    with the OneDrive upload-path validator so a plan.json produced against
+    one provider cannot be silently retargeted at the other.
+    """
+    if not dest_path:
+        raise SourceError("Google Drive upload dest_path must not be empty.")
+    if dest_path.startswith("/"):
+        raise SourceError(
+            f"Google Drive upload dest_path {dest_path!r} must be relative "
+            "(no leading '/')."
+        )
+    segments = dest_path.split("/")
+    for seg in segments:
+        if not seg:
+            raise SourceError(
+                f"Google Drive upload dest_path {dest_path!r} has an empty "
+                "segment (double slash or trailing slash)."
+            )
+        if seg in {".", ".."}:
+            raise SourceError(
+                f"Google Drive upload dest_path {dest_path!r} contains a "
+                "traversal segment ('.' or '..')."
+            )
+        if not _GDRIVE_UPLOAD_PATH_SEGMENTS.match(seg):
+            raise SourceError(
+                f"Google Drive upload dest_path {dest_path!r} contains an "
+                f"invalid segment {seg!r}."
+            )
+    return segments[:-1], segments[-1]
 
 
 def _validate_cloud_file_id(cloud_file_id: str) -> None:
@@ -468,6 +522,180 @@ class GoogleDriveSource:
                 f"now={current_etag!r} — the file changed on the provider "
                 "since scan.  Rescan and retry."
             )
+
+
+    def upload(
+        self,
+        dest_path: str,
+        byte_stream: Iterator[bytes],
+        expected_size: int,
+    ) -> UploadResult:
+        """Create a new file at ``dest_path`` with contents from ``byte_stream``.
+
+        v0.5-a: Google Drive write half of the migrate protocol.
+
+        - Rejects the call when ``is_read_only_scan`` is True — every
+          migrate destination must be constructed with the flag off.
+        - Validates ``dest_path`` shape (no absolute, no ``..``, no empty
+          segments) BEFORE any folder is created.
+        - Resolves the folder chain (creating missing folders under My
+          Drive root) via a small ``files.create(mimeType=folder)`` loop.
+          Existing folders match by ``name`` + ``parents`` so a rerun of
+          the same plan does not duplicate the folder tree.
+        - Small files (< 5 MB) upload in one shot via ``resumable=False``.
+          Larger files use ``resumable=True`` with 8 MB chunks so a
+          network hiccup mid-upload picks up where it left off.
+        - After upload, re-fetches the newly-created file to read the
+          canonical ``md5Checksum`` + ``modifiedTime`` so the returned
+          :class:`UploadResult` carries the destination-side digest and
+          the composite etag v0.5-b's verify step will diff against.
+
+        Retries piggy-back on the existing ``_drive_call`` tenacity helper
+        (429 + 5xx backoff, same as list/move/restore).
+        """
+        if self.is_read_only_scan:
+            raise SourcePermissionError(
+                f"GoogleDriveSource(id={self.id!r}) is read-only during scan; "
+                "construct with is_read_only_scan=False to enable uploading."
+            )
+        folder_segments, filename = _validate_gdrive_upload_path(dest_path)
+        parent_id = self._resolve_or_create_folder_chain(folder_segments)
+
+        # Lazy imports so unit tests can patch/skip real googleapiclient.
+        from googleapiclient.http import (
+            MediaIoBaseUpload,  # type: ignore[import-not-found,import-untyped]
+        )
+
+        # Buffer the stream into a BytesIO — MediaIoBaseUpload needs a
+        # seekable file-like object for both simple and resumable paths.
+        # We stream chunks in so the caller does not have to.  Peak memory
+        # is bounded by the source file's size; migrate's copy loop keeps
+        # the destination side one file at a time.
+        buf = io.BytesIO()
+        for chunk in byte_stream:
+            if chunk:
+                buf.write(chunk)
+        buf.seek(0)
+
+        resumable = expected_size >= _GDRIVE_SMALL_UPLOAD_THRESHOLD_BYTES
+        media = MediaIoBaseUpload(
+            buf,
+            mimetype="application/octet-stream",
+            resumable=resumable,
+            chunksize=_GDRIVE_UPLOAD_CHUNK_SIZE_BYTES if resumable else -1,
+        )
+        body: dict[str, Any] = {"name": filename}
+        if parent_id:
+            body["parents"] = [parent_id]
+        try:
+            created = _drive_call(
+                self.service.files().create(
+                    body=body,
+                    media_body=media,
+                    fields="id",
+                ).execute
+            )
+        except Exception as exc:
+            _raise_mapped(exc)
+            raise
+        new_id = str(created.get("id", ""))
+        if not new_id:
+            raise SourceError(
+                f"Google Drive upload of {dest_path!r} returned no file id."
+            )
+        # Re-fetch for the canonical checksum + modifiedTime.  Same shape as
+        # ``list_files``'s composite etag so v0.5-b's verify step can diff
+        # against ``UploadResult.etag`` without a second round-trip.
+        try:
+            fetched = _drive_call(
+                self.service.files().get(
+                    fileId=new_id,
+                    fields="id,md5Checksum,modifiedTime",
+                ).execute
+            )
+        except Exception as exc:
+            _raise_mapped(exc)
+            raise
+        md5 = str(fetched.get("md5Checksum") or "")
+        modified = str(fetched.get("modifiedTime") or "")
+        if not md5:
+            raise SourceError(
+                f"Google Drive upload of {dest_path!r} completed but the "
+                "re-fetched item has no md5Checksum (Google-native export?)."
+            )
+        return UploadResult(
+            cloud_file_id=new_id,
+            etag=f"{new_id}:{modified}",
+            uploaded_hash_algo="md5",
+            uploaded_hash=md5,
+        )
+
+    def _resolve_or_create_folder_chain(
+        self, folder_segments: list[str]
+    ) -> str | None:
+        """Walk the folder chain under My Drive root, creating any missing links.
+
+        Each segment is looked up by ``name = <seg> and mimeType =
+        application/vnd.google-apps.folder and '<parent>' in parents and
+        trashed = false``.  On miss we ``files.create`` a fresh folder.
+        Returns the terminal folder id (or ``None`` when ``folder_segments``
+        is empty — the caller then uploads at root).
+        """
+        parent: str | None = None
+        for seg in folder_segments:
+            # First, look up an existing folder with the target name under
+            # this parent.  ``q`` is Google's query DSL — the parent clause
+            # is bound to the current ``parent`` (or ``root`` when None).
+            parent_clause = f"'{parent}' in parents" if parent else "'root' in parents"
+            # Escape single quotes in the folder name for Google Drive's ``q``
+            # query.  Backslash-escape per Google Drive Files.list docs.
+            escaped = seg.replace("\\", "\\\\").replace("'", "\\'")
+            q = (
+                f"name = '{escaped}' and "
+                "mimeType = 'application/vnd.google-apps.folder' and "
+                f"{parent_clause} and trashed = false"
+            )
+            try:
+                resp = _drive_call(
+                    self.service.files().list(
+                        q=q,
+                        fields="files(id,name,parents)",
+                        pageSize=1,
+                        spaces="drive",
+                    ).execute
+                )
+            except Exception as exc:
+                _raise_mapped(exc)
+                raise
+            found = resp.get("files") if isinstance(resp, dict) else None
+            if isinstance(found, list) and found:
+                candidate = found[0]
+                if isinstance(candidate, dict) and candidate.get("id"):
+                    parent = str(candidate["id"])
+                    continue
+            # Miss — create the folder under the current parent.
+            create_body: dict[str, Any] = {
+                "name": seg,
+                "mimeType": "application/vnd.google-apps.folder",
+            }
+            if parent:
+                create_body["parents"] = [parent]
+            try:
+                created = _drive_call(
+                    self.service.files().create(
+                        body=create_body, fields="id"
+                    ).execute
+                )
+            except Exception as exc:
+                _raise_mapped(exc)
+                raise
+            new_id = created.get("id") if isinstance(created, dict) else None
+            if not isinstance(new_id, str) or not new_id:
+                raise SourceError(
+                    f"Google Drive folder create for {seg!r} returned no id."
+                )
+            parent = new_id
+        return parent
 
 
 def _parse_rfc3339(value: str) -> float:

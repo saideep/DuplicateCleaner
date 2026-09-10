@@ -2078,6 +2078,132 @@ def organize_undo(
         console.print(f"  [yellow]skip[/yellow]: {err}")
 
 
+# --------------------------------------------------------------------------- #
+# v0.5-a — `dc migrate plan` (cloud-to-cloud consolidation, planner half).    #
+#                                                                             #
+# copy / verify / cleanup / undo land in v0.5-b.  The planner here is         #
+# read-only: it enumerates the source, consults the destination for skip     #
+# decisions, and writes a plan JSON + HTML.  BYO OAuth remains the only     #
+# supported auth path.                                                        #
+# --------------------------------------------------------------------------- #
+
+migrate_app = typer.Typer(help="Cloud-to-cloud file consolidation.")
+app.add_typer(migrate_app, name="migrate")
+
+
+@migrate_app.command("plan")
+def migrate_plan(
+    from_: Annotated[
+        str,
+        typer.Option(
+            "--from",
+            help="Source account_id (e.g. 'gdrive:personal').",
+        ),
+    ],
+    to: Annotated[
+        str,
+        typer.Option(
+            "--to",
+            help="Destination account_id (e.g. 'onedrive:main').",
+        ),
+    ],
+    report: Annotated[
+        Path,
+        typer.Option(
+            "--report",
+            help="Output directory for migration-plan.html + migration-plan.json.",
+        ),
+    ],
+    filter_glob: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--filter",
+            help=(
+                "Include-only glob (repeatable). Example: --filter '**/*.pdf'."
+            ),
+        ),
+    ] = None,
+    exclude_glob: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude",
+            help="Exclude glob (repeatable).",
+        ),
+    ] = None,
+    include_shared: Annotated[
+        bool,
+        typer.Option(
+            "--include-shared",
+            help=(
+                "v0.5-a: NOT YET SUPPORTED — shared cloud files remain "
+                "informational-only.  Flag reserved for a future opt-in."
+            ),
+        ),
+    ] = False,
+    dest_size_limit_gb: Annotated[
+        float | None,
+        typer.Option(
+            "--dest-size-limit-gb",
+            help=(
+                "Override destination per-file cap (GB). Default: provider "
+                "limit (Google Drive 5 TB, OneDrive Personal 250 GB)."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Read-only pass: enumerate --from, plan copies to --to, write a plan."""
+    from duplicate_cleaner.migrate import (
+        MigrationFilter,
+        plan_migration,
+        render_migration_plan,
+    )
+
+    if include_shared:
+        console.print(
+            "[yellow]Warning[/yellow]: --include-shared is not yet supported "
+            "in v0.5-a; shared cloud files will still be deferred."
+        )
+
+    # Build source + dest sources using the same read-only construction
+    # pattern as `dc scan`.  The destination is consulted read-only at
+    # planning time; v0.5-b will construct it with is_read_only_scan=False
+    # for the actual copy step.
+    try:
+        built = _build_scan_sources([from_, to])
+    except typer.BadParameter as e:
+        console.print(f"[red]Refusing to plan[/red]: {e}")
+        raise typer.Exit(2) from e
+    if len(built) != 2:
+        console.print(
+            f"[red]Refusing to plan[/red]: could not construct source + "
+            f"destination (from={from_!r}, to={to!r})."
+        )
+        raise typer.Exit(2)
+    src_source, dst_source = built[0], built[1]
+
+    filt = MigrationFilter(
+        include_globs=list(filter_glob or []),
+        exclude_globs=list(exclude_glob or []),
+        exclude_shared=not include_shared,
+    )
+    plan = plan_migration(
+        src_source,
+        dst_source,
+        filter_=filt,
+        dest_size_limit_gb=dest_size_limit_gb,
+    )
+    html_path, json_path = render_migration_plan(plan, report)
+    counts = plan.counts_by_action
+    tbl = Table(title=f"Migration plan: {from_} -> {to}")
+    tbl.add_column("Action")
+    tbl.add_column("Count", justify="right")
+    for name in ("copy", "skip", "defer", "error"):
+        tbl.add_row(name, str(counts.get(name, 0)))
+    tbl.add_row("Plan JSON", str(json_path))
+    tbl.add_row("Plan HTML", str(html_path))
+    console.print(tbl)
+
+
 def _google_credentials_from_token(data: dict[str, object]) -> object:
     """Build a google.oauth2 Credentials object from a stored token blob."""
     from google.oauth2.credentials import Credentials  # type: ignore[import-not-found]

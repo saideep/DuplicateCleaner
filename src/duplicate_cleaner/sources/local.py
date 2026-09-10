@@ -13,7 +13,7 @@ from typing import ClassVar
 
 from duplicate_cleaner.apply.trash import default_trash_fn as _default_local_trash_fn
 from duplicate_cleaner.scan.walk import FileRecord, WalkStats, iter_files
-from duplicate_cleaner.sources.base import SourceMetadata, TrashedLocation
+from duplicate_cleaner.sources.base import SourceMetadata, TrashedLocation, UploadResult
 
 TrashFn = Callable[[Path], Path | None]
 
@@ -126,6 +126,26 @@ class LocalFileSystemSource:
     def get_metadata(self, record: FileRecord) -> SourceMetadata:
         """Return an empty SourceMetadata — local files carry no cloud fields."""
         return SourceMetadata()
+
+    def upload(
+        self,
+        dest_path: str,
+        byte_stream: Iterator[bytes],
+        expected_size: int,
+    ) -> UploadResult:
+        """v0.5-a stretch goal: local upload is deferred.
+
+        Migrations from cloud sources into a local directory are technically
+        useful (pull down before deletion) but land in v0.6+ alongside the
+        photo-library work.  For now the migrate planner only proposes
+        cloud-to-cloud destinations; a plan that names local as its ``--to``
+        target should surface at planner time, not here.
+        """
+        _ = (dest_path, byte_stream, expected_size)
+        raise NotImplementedError(
+            "Migration to local disk is not supported in v0.5; use "
+            "cloud-to-cloud only."
+        )
 
     def check_drift(self, record: FileRecord) -> None:
         """Verify the file on disk still matches ``record.size`` and ``record.mtime``.

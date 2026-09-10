@@ -12,6 +12,7 @@ from duplicate_cleaner.sources.base import (
     SourcePermissionError,
     SourceRateLimitError,
     TrashedLocation,
+    UploadResult,
 )
 from duplicate_cleaner.sources.gdrive import GoogleDriveSource
 from duplicate_cleaner.sources.local import LocalFileSystemSource
@@ -31,4 +32,5 @@ __all__ = [
     "SourcePermissionError",
     "SourceRateLimitError",
     "TrashedLocation",
+    "UploadResult",
 ]

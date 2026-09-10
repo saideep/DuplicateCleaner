@@ -44,6 +44,7 @@ from duplicate_cleaner.sources.base import (
     SourcePermissionError,
     SourceRateLimitError,
     TrashedLocation,
+    UploadResult,
 )
 
 log = logging.getLogger(__name__)
@@ -58,6 +59,54 @@ _DELTA_URL = f"{GRAPH_ROOT}/me/drive/root/delta"
 # a physical account and any deviation should surface loudly.  The 120-char
 # upper bound is well past the ~60 char real-world maximum.
 _ONEDRIVE_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9!]{1,120}$")
+
+# v0.5-a upload path validator.  Graph's ``PUT /me/drive/root:/{path}:/content``
+# and ``createUploadSession`` both take the destination as a POSIX-style
+# path fragment; per-segment shape check refuses absolute paths, ``..``
+# traversal, and empty segments BEFORE URL interpolation.  Symmetric with
+# the Google Drive validator so a plan.json produced against one provider
+# cannot be silently retargeted at the other.
+_ONEDRIVE_UPLOAD_PATH_RE: re.Pattern[str] = re.compile(r"^[^/\x00]+$")
+
+# Graph's simple PUT endpoint caps at 4 MB; larger files require an
+# upload-session with 10 MB chunk PUTs.  Kept module-level so tests can
+# monkeypatch the threshold and exercise both branches without a real
+# 4 MB fixture.
+_ONEDRIVE_SMALL_UPLOAD_THRESHOLD_BYTES: int = 4 * 1024 * 1024
+_ONEDRIVE_UPLOAD_CHUNK_SIZE_BYTES: int = 10 * 1024 * 1024
+
+
+def _validate_onedrive_upload_path(dest_path: str) -> str:
+    """Return ``dest_path`` after per-segment shape validation.
+
+    Rejects absolute paths, ``..`` traversal, and empty segments BEFORE
+    any HTTP call is issued.  On success returns the input unchanged so
+    the caller can interpolate it into ``/me/drive/root:/{path}:/…``.
+    """
+    if not dest_path:
+        raise SourceError("OneDrive upload dest_path must not be empty.")
+    if dest_path.startswith("/"):
+        raise SourceError(
+            f"OneDrive upload dest_path {dest_path!r} must be relative "
+            "(no leading '/')."
+        )
+    for seg in dest_path.split("/"):
+        if not seg:
+            raise SourceError(
+                f"OneDrive upload dest_path {dest_path!r} has an empty "
+                "segment (double slash or trailing slash)."
+            )
+        if seg in {".", ".."}:
+            raise SourceError(
+                f"OneDrive upload dest_path {dest_path!r} contains a "
+                "traversal segment ('.' or '..')."
+            )
+        if not _ONEDRIVE_UPLOAD_PATH_RE.match(seg):
+            raise SourceError(
+                f"OneDrive upload dest_path {dest_path!r} contains an "
+                f"invalid segment {seg!r}."
+            )
+    return dest_path
 # Note: source-side lower bound stays at 1 to keep the mock-ID unit tests
 # working; the AUTHORITATIVE 20-char minimum is enforced at the report
 # boundary via `paths.validate_cloud_entry` (external-input attack surface).
@@ -711,6 +760,248 @@ class OneDriveSource:
             f"now={current_composite!r} — the file changed on the provider "
             "since scan.  Rescan and retry."
         )
+
+
+    def upload(
+        self,
+        dest_path: str,
+        byte_stream: Iterator[bytes],
+        expected_size: int,
+    ) -> UploadResult:
+        """Create a new file at ``dest_path`` with contents from ``byte_stream``.
+
+        v0.5-a: OneDrive write half of the migrate protocol.
+
+        - Rejects the call when ``is_read_only_scan`` is True (defense-in-
+          depth tripwire — every migrate destination must be built with
+          the flag off).
+        - Validates ``dest_path`` shape (no absolute, no ``..``, no empty
+          segments) BEFORE any HTTP call.
+        - Small files (≤ 4 MB) upload via ``PUT /me/drive/root:/{path}:/
+          content``.  Larger files open a session via ``POST /me/drive/
+          root:/{path}:/createUploadSession`` and stream 10 MB chunks
+          through the returned ``uploadUrl`` with ``Content-Range``.  The
+          upload session is an unauthenticated one-shot URL — we send
+          chunks through a fresh unauth client so the bearer token never
+          lands on the session URL (which may itself be on Azure CDN).
+        - After the upload, re-fetches the driveItem's metadata to read
+          the canonical ``file.hashes.sha256Hash`` + ``lastModifiedDateTime``
+          so the returned :class:`UploadResult` carries the destination-
+          side digest and the composite etag that v0.5-b's verify step
+          will diff against.
+
+        Retries piggy-back on the existing ``_graph_call`` tenacity
+        helper (429 + 5xx backoff, same as list/move/restore).
+        """
+        if self.is_read_only_scan:
+            raise SourcePermissionError(
+                f"OneDriveSource(id={self.id!r}) is read-only during scan; "
+                "construct with is_read_only_scan=False to enable uploading."
+            )
+        validated = _validate_onedrive_upload_path(dest_path)
+        # URL-encode each path segment individually so ``+``, ``#``, and
+        # UTF-8 folder names round-trip through Graph correctly.  ``:`` is
+        # the drive-root/path boundary and MUST stay literal in the URL —
+        # hence per-segment quote + ``/`` rejoin.
+        quoted_segments = "/".join(
+            urllib.parse.quote(seg, safe="") for seg in validated.split("/")
+        )
+        if expected_size <= _ONEDRIVE_SMALL_UPLOAD_THRESHOLD_BYTES:
+            new_item = self._upload_small(quoted_segments, byte_stream)
+        else:
+            new_item = self._upload_large(
+                quoted_segments, byte_stream, expected_size
+            )
+        new_id = str(new_item.get("id", "")) if isinstance(new_item, dict) else ""
+        if not new_id:
+            raise SourceError(
+                f"OneDrive upload of {dest_path!r} returned no item id."
+            )
+        # Re-fetch canonical hash + modifiedTime.  ``$select`` trims the
+        # payload; Graph populates ``file.hashes.sha256Hash`` on Personal
+        # drives.  Business tenants may return ``quickXorHash`` only — v0.5-a
+        # migration is Personal-scoped and surfaces that as an error.
+        fetched_url = (
+            f"{GRAPH_ROOT}/me/drive/items/{urllib.parse.quote(new_id, safe='')}"
+            "?$select=id,file,hashes,lastModifiedDateTime"
+        )
+        try:
+            resp = _graph_call(lambda: self._get(fetched_url))
+        except Exception as exc:
+            _raise_mapped(exc)
+            raise
+        try:
+            body = resp.json()
+        except Exception as exc:
+            raise SourceError(
+                f"{dest_path!r}: upload re-fetch got non-JSON response ({exc})"
+            ) from exc
+        if not isinstance(body, dict):
+            raise SourceError(
+                f"{dest_path!r}: upload re-fetch response is not a JSON object."
+            )
+        file_block = body.get("file")
+        hashes = (
+            file_block.get("hashes") if isinstance(file_block, dict) else None
+        )
+        sha256_raw = (
+            hashes.get("sha256Hash") if isinstance(hashes, dict) else None
+        )
+        if not isinstance(sha256_raw, str) or not sha256_raw:
+            raise SourceError(
+                f"OneDrive upload of {dest_path!r} completed but the re-"
+                "fetched driveItem carries no sha256Hash — Business tenant "
+                "quickXorHash items are out of scope for v0.5-a."
+            )
+        modified = str(body.get("lastModifiedDateTime") or "")
+        return UploadResult(
+            cloud_file_id=new_id,
+            etag=f"{new_id}:{modified}",
+            uploaded_hash_algo="sha256",
+            uploaded_hash=sha256_raw.lower(),
+        )
+
+    def _upload_small(
+        self, quoted_dest: str, byte_stream: Iterator[bytes]
+    ) -> Any:
+        """Small-file upload via ``PUT /me/drive/root:/{path}:/content``.
+
+        Buffers the (≤ 4 MB) stream, PUTs the whole payload in one call,
+        and returns the parsed JSON body (a driveItem shape carrying
+        ``id`` + ``file.hashes.*``).
+        """
+        buf = bytearray()
+        for chunk in byte_stream:
+            if chunk:
+                buf.extend(chunk)
+        url = f"{GRAPH_ROOT}/me/drive/root:/{quoted_dest}:/content"
+
+        def _put() -> Any:
+            resp = self.client.put(url, content=bytes(buf))
+            resp.raise_for_status()
+            return resp
+
+        try:
+            resp = _graph_call(_put)
+        except Exception as exc:
+            _raise_mapped(exc)
+            raise
+        try:
+            return resp.json()
+        except Exception as exc:
+            raise SourceError(
+                f"OneDrive small-upload of {quoted_dest!r} got non-JSON "
+                f"response: {exc}"
+            ) from exc
+
+    def _upload_large(
+        self,
+        quoted_dest: str,
+        byte_stream: Iterator[bytes],
+        expected_size: int,
+    ) -> Any:
+        """Large-file upload via ``createUploadSession`` + chunked PUTs.
+
+        Opens a session on Graph, then streams 10 MB chunks to the session's
+        ``uploadUrl`` (a pre-signed, un-authed URL — bearer token is NOT
+        forwarded).  The terminal chunk's response carries the final
+        driveItem shape.
+        """
+        session_url = (
+            f"{GRAPH_ROOT}/me/drive/root:/{quoted_dest}:/createUploadSession"
+        )
+
+        def _create_session() -> Any:
+            resp = self.client.post(
+                session_url,
+                json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+            )
+            resp.raise_for_status()
+            return resp
+
+        try:
+            session_resp = _graph_call(_create_session)
+        except Exception as exc:
+            _raise_mapped(exc)
+            raise
+        try:
+            session_body = session_resp.json()
+        except Exception as exc:
+            raise SourceError(
+                f"OneDrive createUploadSession for {quoted_dest!r} got non-"
+                f"JSON response: {exc}"
+            ) from exc
+        upload_url = (
+            session_body.get("uploadUrl")
+            if isinstance(session_body, dict)
+            else None
+        )
+        if not isinstance(upload_url, str) or not upload_url:
+            raise SourceError(
+                f"OneDrive createUploadSession for {quoted_dest!r} returned "
+                "no uploadUrl."
+            )
+        # Fresh unauth client — the session URL is pre-signed; Graph
+        # rejects bearer-attached requests to the session and the URL may
+        # forward to Azure blob storage.
+        unauth = _build_unauth_http_client()
+        final_body: Any = None
+        try:
+            offset = 0
+            pending = bytearray()
+            eof = False
+            iterator = iter(byte_stream)
+            while not eof or pending:
+                # Refill ``pending`` until we have a full chunk (or hit EOF).
+                while (
+                    len(pending) < _ONEDRIVE_UPLOAD_CHUNK_SIZE_BYTES and not eof
+                ):
+                    try:
+                        piece = next(iterator)
+                    except StopIteration:
+                        eof = True
+                        break
+                    if piece:
+                        pending.extend(piece)
+                if not pending:
+                    break
+                chunk_size = min(
+                    _ONEDRIVE_UPLOAD_CHUNK_SIZE_BYTES, len(pending)
+                )
+                chunk = bytes(pending[:chunk_size])
+                del pending[:chunk_size]
+                end_offset = offset + chunk_size - 1
+                headers = {
+                    "Content-Length": str(chunk_size),
+                    "Content-Range": (
+                        f"bytes {offset}-{end_offset}/{expected_size}"
+                    ),
+                }
+                resp = unauth.put(upload_url, content=chunk, headers=headers)
+                if resp.status_code not in (200, 201, 202):
+                    raise SourceError(
+                        f"OneDrive upload session PUT failed at offset {offset}"
+                        f" (status {resp.status_code}) for {quoted_dest!r}."
+                    )
+                offset += chunk_size
+                if resp.status_code in (200, 201):
+                    # Terminal chunk — body is the finished driveItem.
+                    try:
+                        final_body = resp.json()
+                    except Exception as exc:
+                        raise SourceError(
+                            f"OneDrive upload session final PUT for "
+                            f"{quoted_dest!r} got non-JSON response: {exc}"
+                        ) from exc
+                    break
+        finally:
+            unauth.close()
+        if final_body is None:
+            raise SourceError(
+                f"OneDrive upload session for {quoted_dest!r} finished "
+                "without a terminal 200/201 driveItem response."
+            )
+        return final_body
 
 
 def _join_parent_and_name(parent_path: str, name: str) -> str:

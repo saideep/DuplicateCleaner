@@ -42,6 +42,79 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 
 ## Round-by-round history
 
+### v0.5-a — cloud-to-cloud migration (planner half, 2026-09-10)
+
+First half of `dc migrate` per the v0.5 milestone plan.  v0.5-b will add the actual copy loop, per-file verify, source-trash cleanup, and undo — this milestone delivers the write protocol on `Source` and the read-only planner that decides what to copy.  All 422 tests pass (405 pre-existing + 17 new); `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`; ruff clean; mypy `--strict` clean on every new file modulo the pre-existing `unused-ignore` warnings on 3rd-party stubs (documented in sub-milestone 2 notes).
+
+Shipped:
+
+- `src/duplicate_cleaner/sources/base.py` — new `UploadResult` dataclass (`cloud_file_id`, `etag`, `uploaded_hash_algo`, `uploaded_hash`).  `Source.upload(dest_path, byte_stream, expected_size)` added to the protocol with a default `NotImplementedError` so structural sources without an implementation surface loudly rather than silently skip.
+- `src/duplicate_cleaner/sources/local.py::LocalFileSystemSource.upload` — deferred stretch goal: raises `NotImplementedError("Migration to local disk is not supported in v0.5; use cloud-to-cloud only.")`.  v0.6+ will wire local as a migration destination alongside the photo-library work.
+- `src/duplicate_cleaner/sources/gdrive.py::GoogleDriveSource.upload`:
+  - `_validate_gdrive_upload_path` refuses absolute paths, `..` traversal, and empty segments BEFORE any Drive API call.
+  - Folder chain resolved via `files.list(q="name = ... and mimeType = folder and 'parent' in parents")`; missing links are created via `files.create(mimeType=vnd.google-apps.folder)`.
+  - Small files (< 5 MB) upload via `MediaIoBaseUpload(resumable=False)`; larger files use `resumable=True` with 8 MB chunks so a mid-upload TCP RST resumes cleanly.
+  - Post-upload re-fetch via `files.get(fields="id,md5Checksum,modifiedTime")` yields the canonical MD5 + composite etag.
+  - Retry piggy-backs on the existing `_drive_call` tenacity helper (429 + 5xx backoff).
+- `src/duplicate_cleaner/sources/onedrive.py::OneDriveSource.upload`:
+  - `_validate_onedrive_upload_path` refuses absolute paths, `..` traversal, and empty segments BEFORE URL interpolation.
+  - Small files (≤ 4 MB) upload via `PUT /me/drive/root:/{path}:/content` on the primary Graph client.
+  - Larger files open a session via `POST /me/drive/root:/{path}:/createUploadSession` and stream 10 MB chunks to the returned `uploadUrl` through a **fresh unauth client** — the session URL is pre-signed and may forward to Azure blob storage; bearer token must not leak.  `Content-Range` headers pin each chunk to its byte range.
+  - Terminal chunk (200/201 response) carries the finished driveItem; a re-fetch via `GET /me/drive/items/{id}?$select=id,file,hashes,lastModifiedDateTime` pulls the canonical `sha256Hash` (lower-cased in `UploadResult` for algo-tag consistency with `list_files`).
+  - Retry piggy-backs on the existing `_graph_call` tenacity helper.
+- `src/duplicate_cleaner/migrate/` — new package (`plan.py`, `planner.py`, `render.py`, `__init__.py`, `templates/migration-plan.html.j2`).
+  - `MigrationPlan` (Pydantic) — `plan_version="0.5.0"`, `source_id`, `dest_id`, `generated_ts`, `entries: list[MigrationEntry]`, `filter_summary: str`.
+  - `MigrationEntry` — `source_file_id`, `source_path`, `source_etag`, `source_size`, `source_hash` (algo-tagged), `source_mime`, `dest_expected_path`, `action` (copy / skip / defer / error), `reason`, `size_limit_hit`.
+  - `MigrationFilter` — `include_globs`, `exclude_globs`, `min_size`, `max_size`, `exclude_shared=True`, `exclude_google_native=True`.
+  - `plan_migration(source, dest, *, filter_, dest_size_limit_gb)` — enumerates the source, builds an in-memory `(dest_rel_path -> (size, foreign_hash))` skip index over the destination, and classifies each source file per the design contract.  Skip decisions compare size + algo-matched hash (cross-algo needs a reconcile download, deferred to v0.5-b's copy step).
+  - `render_migration_plan(plan, out_dir)` — writes `migration-plan.html` + `migration-plan.json`; plan round-trips through `MigrationPlan.model_validate_json`.
+- `src/duplicate_cleaner/cli.py` — new `migrate_app` sub-typer with `dc migrate plan --from --to --report [--filter] [--exclude] [--include-shared] [--dest-size-limit-gb]`.  Builds source + dest sources via `_build_scan_sources` (both `is_read_only_scan=True` — planner cannot upload).  Prints a per-action counts table plus HTML + JSON paths.  Copy / verify / cleanup / undo NOT yet wired — deferred to v0.5-b.
+- `docs/migrate.md` — new user doc: overview, sub-command map (marks copy / verify / cleanup / undo as deferred to v0.5-b), example planning session, safety recap.
+- `README.md` roadmap line for v0.5 updated to mark v0.5-a as shipped and link the new doc; the CLI cheat-sheet gets a `dc migrate plan` row.
+- `CHANGELOG.md` — new `[Unreleased] v0.5-a` entry above the v0.4 block.
+
+Tests shipped:
+
+- `tests/test_migrate_plan.py` (7 tests):
+  - `test_plan_enumerates_source_files` — 3 source records → 3 plan entries.
+  - `test_plan_defers_shared_files` — `is_shared=True` → `action="defer"` with a "shared" reason.
+  - `test_plan_defers_google_native` — `mime_type = application/vnd.google-apps.document` → `action="defer"`.
+  - `test_plan_marks_dest_hit_as_skip` — matching size + `md5:...` hash on the dest → `action="skip"`.
+  - `test_plan_marks_over_size_limit_as_error` — file > 250 GB with OneDrive dest → `action="error"`, `size_limit_hit=True`.
+  - `test_plan_respects_include_globs` — `include_globs=["*.pdf"]` filters non-PDFs.
+  - `test_plan_produces_valid_json_and_html` — `render_migration_plan` writes both artifacts; JSON round-trips through Pydantic.
+- `tests/test_source_upload_contract.py` (10 tests):
+  - `test_local_upload_raises_not_implemented` — `LocalFileSystemSource.upload` raises with a "v0.5" message.
+  - `test_gdrive_upload_calls_files_create_with_parents` — asserts folder-create then file-create with `parents=[folder_id]`.
+  - `test_gdrive_upload_returns_md5_hash` — re-fetch populates `UploadResult.uploaded_hash_algo="md5"` and etag composite.
+  - `test_gdrive_upload_requires_write_scope` — `is_read_only_scan=True` → `SourcePermissionError`.
+  - `test_onedrive_upload_small_file_via_put` — small upload path uses `PUT /content`.
+  - `test_onedrive_upload_large_file_via_session` — large upload path uses `createUploadSession` + chunked PUT with `Content-Range: bytes X-Y/N` header shape verified.
+  - `test_onedrive_upload_returns_sha256` — re-fetch populates `uploaded_hash_algo="sha256"` (lower-cased).
+  - `test_onedrive_upload_requires_write_scope` — `is_read_only_scan=True` → `SourcePermissionError`.
+  - `test_upload_rejects_absolute_dest_path` — `/absolute/foo` fails shape gate on both providers BEFORE any HTTP call fires (side_effect=AssertionError on the client mock proves the shape gate runs first).
+  - `test_upload_rejects_traversal_dest_path` — `../evil/foo` same shape.
+
+Invariants preserved (all AUDIT_LOG items above):
+
+- All 405 pre-existing tests still pass unchanged; 17 new tests added (422 total).
+- `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`.
+- BYO OAuth only — no bundled client id in the public repo.  `_TO_REPLACE` sentinel still fires on the placeholder.
+- Cloud `Path` never `.resolve()`d in the planner or upload paths.
+- Shared cloud files are deferred, never in a copy plan.
+- Google-native docs are deferred, never in a copy plan.
+- Every `Source.upload` implementation raises `SourcePermissionError` when constructed with `is_read_only_scan=True` — defense-in-depth tripwire.
+- Every `Source.upload` implementation validates the dest path shape BEFORE any HTTP call (absolute-path and `..`-traversal refusal locked in by tests).
+- Ruff clean on every new file.  Mypy `--strict` clean on every new file modulo the pre-existing `unused-ignore` warnings on 3rd-party stubs.
+
+Explicitly deferred to v0.5-b:
+
+- `dc migrate copy PLAN.json [--commit]` — the actual copy loop using `Source.read_bytes` + `Source.upload`.
+- `dc migrate verify PLAN.json` — post-copy destination-side digest comparison against source hash (or freshly-computed BLAKE3 for cross-algo pairs).
+- `dc migrate cleanup PLAN.json --manifest M.json` — trash source originals ONLY after successful verify.
+- `dc migrate undo MANIFEST.json` — restore source originals from cloud trash.
+- `LocalFileSystemSource.upload` (v0.6+ alongside the photo-library work).
+
 ### v0.4 — project-tree aggregation (2026-09-07)
 
 **Fourteenth audit (Combined Code Review + Security pass 14, 2026-09-07)** — verdict: **BLOCK on ship** with two must-fix items. 10 findings total: 3 safety (1 CONFIRMED / 2 PLAUSIBLE), 3 correctness (2 CONFIRMED / 1 PLAUSIBLE), 1 test-coverage (CONFIRMED), 3 simplification-shaped (see below).

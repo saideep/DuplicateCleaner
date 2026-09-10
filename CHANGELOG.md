@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file. Format: Kee
 
 ## [Unreleased]
 
+### v0.5-a — Cloud consolidation planner (2026-09-10)
+
+First half of `dc migrate`. Adds the `Source.upload` write protocol and the read-only migration planner. Copy / verify / cleanup / undo land in v0.5-b.
+
+Added:
+
+- `Source.upload(dest_path, byte_stream, expected_size) -> UploadResult` on the protocol. Every source that supports being a migrate destination must implement it. `LocalFileSystemSource.upload` raises `NotImplementedError` (stretch goal deferred to v0.6+). `GoogleDriveSource.upload` chunks through the `files().create` endpoint (single-shot below 5 MB, resumable session with 8 MB chunks above), resolves or creates the folder chain, and re-fetches `md5Checksum` + `modifiedTime` so `UploadResult` carries the destination-side digest and composite etag. `OneDriveSource.upload` uses `PUT /me/drive/root:/{path}:/content` for files ≤ 4 MB and `createUploadSession` + 10 MB chunked PUTs (with `Content-Range`) for larger files; re-fetches `file.hashes.sha256Hash`.
+- `src/duplicate_cleaner/migrate/` package with `plan.py` (Pydantic `MigrationPlan` / `MigrationEntry` / `MigrationFilter`), `planner.py` (`plan_migration`), `render.py` (JSON + HTML), and `templates/migration-plan.html.j2`.
+- `dc migrate plan --from A --to B --report DIR` CLI sub-command with `--filter` / `--exclude` / `--dest-size-limit-gb` knobs.
+- New user doc `docs/migrate.md`.
+
+Safety additions:
+
+- Every `Source.upload` implementation validates the destination path shape (no absolute, no `..` traversal, no empty segments) BEFORE any network call.
+- Every `Source.upload` implementation raises `SourcePermissionError` when the source is constructed with `is_read_only_scan=True`. `dc migrate plan` constructs both source and destination read-only; the tripwire ensures a planner bug cannot write to the destination.
+- Shared cloud files stay informational-only: the planner emits `action="defer"` for them and never proposes a `copy`.
+- Google-native docs (`application/vnd.google-apps.*`) are deferred: no downloadable bytes.
+- Destination per-file cap enforced at plan time. Google Drive 5 TB, OneDrive Personal 250 GB. Files over the cap surface as `action="error"` with `size_limit_hit=True` so users see them loudly instead of silently.
+
+Tests: 405 → 422 (7 new in `tests/test_migrate_plan.py`, 10 new in `tests/test_source_upload_contract.py`).
+
 ### v0.4 — Project-tree aggregation (2026-09-07)
 
 Two copies of the same project directory — git repo, npm package, Cargo crate, Go module, etc. — now collapse to a single tree-diff entry in the report instead of surfacing as thousands of per-file matches. Discards trash the whole directory atomically; undo restores it wholesale.

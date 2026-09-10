@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DuplicateCleaner Migration Plan — {{ plan.generated_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         margin: 2em; color: #222; }
+  header { border-bottom: 2px solid #444; padding-bottom: 1em; margin-bottom: 2em; }
+  header h1 { margin: 0 0 0.3em; }
+  .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1em; margin: 1em 0; }
+  .summary .card { background: #f7f7f9; padding: 1em; border-radius: 6px; }
+  .summary .card .n { font-size: 1.8em; font-weight: 600; }
+  .section { border: 1px solid #ddd; border-radius: 6px; margin-bottom: 1.5em; padding: 1em; }
+  .section h3 { margin: 0 0 0.5em 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-size: 1em; color: #444; }
+  .section .meta { color: #666; font-size: 0.9em; margin-bottom: 0.75em; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 0.4em 0.6em; text-align: left; border-bottom: 1px solid #eee;
+           vertical-align: top; }
+  th { background: #fafafa; font-weight: 600; font-size: 0.8em;
+       text-transform: uppercase; color: #666; letter-spacing: 0.03em; }
+  tr.copy   { }
+  tr.skip   { background: #eef7ff; }
+  tr.defer  { background: #fff8e1; }
+  tr.error  { background: #ffebee; }
+  .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 0.85em; word-break: break-all; }
+  .size { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 0.85em; text-align: right; white-space: nowrap; }
+  .badge { display: inline-block; padding: 0.1em 0.55em; border-radius: 3px;
+           font-size: 0.72em; font-weight: 700; letter-spacing: 0.04em; color: white; }
+  .badge.copy  { background: #2e7d32; }
+  .badge.skip  { background: #0277bd; }
+  .badge.defer { background: #ef6c00; }
+  .badge.error { background: #c62828; }
+  footer { margin-top: 3em; font-size: 0.85em; color: #888; }
+  code { background: #f2f2f4; padding: 0.05em 0.35em; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>DuplicateCleaner Migration Plan</h1>
+  <p>Generated {{ plan.generated_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC.
+     Source <code>{{ plan.source_id }}</code> &rarr; destination
+     <code>{{ plan.dest_id }}</code>.  Plan version
+     <code>{{ plan.plan_version }}</code>.</p>
+  <p style="background:#e8f4fd;border:1px solid #90caf9;border-radius:4px;
+            padding:0.6em 1em;">
+    <strong>Planning only</strong> &mdash; this plan is read-only.  Nothing
+    has been copied yet.  Review, edit <code>migration-plan.json</code>
+    if needed, then run <code>dc migrate copy plan.json --commit</code>
+    (available in v0.5-b).
+  </p>
+  <p><strong>Filter:</strong> <code>{{ plan.filter_summary }}</code></p>
+</header>
+
+{% set counts = plan.counts_by_action %}
+<section class="summary">
+  <div class="card">
+    <div class="n">{{ counts.get('copy', 0) }}</div>
+    <div>to copy</div>
+  </div>
+  <div class="card">
+    <div class="n">{{ counts.get('skip', 0) }}</div>
+    <div>already at destination</div>
+  </div>
+  <div class="card">
+    <div class="n">{{ counts.get('defer', 0) }}</div>
+    <div>deferred (shared / native)</div>
+  </div>
+  <div class="card">
+    <div class="n">{{ counts.get('error', 0) }}</div>
+    <div>errors (over size limit)</div>
+  </div>
+</section>
+
+{% for section in [('error', 'Errors'), ('defer', 'Deferred entries'), ('copy', 'Files to copy'), ('skip', 'Already at destination')] %}
+{% set kind = section[0] %}
+{% set title = section[1] %}
+{% set rows = plan.entries | selectattr('action', 'equalto', kind) | list %}
+{% if rows %}
+<div class="section">
+  <h3><span class="badge {{ kind }}">{{ kind | upper }}</span>
+      {{ title }} &middot; {{ rows | length }} entr{% if rows|length != 1 %}ies{% else %}y{% endif %}</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Source</th>
+        <th>Destination path</th>
+        <th class="size">Size</th>
+        <th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for e in rows %}
+      <tr class="{{ kind }}">
+        <td class="path">{{ e.source_path }}</td>
+        <td class="path">{{ e.dest_expected_path }}</td>
+        <td class="size">{{ e.source_size | human_bytes }}</td>
+        <td>{{ e.reason }}{% if e.size_limit_hit %} <strong>[size limit]</strong>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endfor %}
+
+<footer>
+  DuplicateCleaner &middot; migration schema {{ plan.plan_version }} &middot;
+  edit <code>migration-plan.json</code> to change any proposed action,
+  then <code>dc migrate copy plan.json --commit</code> (available in
+  v0.5-b).
+</footer>
+
+</body>
+</html>
