@@ -276,6 +276,20 @@ def execute_migration(
     resume_done_by_path: dict[str, MigrationManifestEntry] = {}
     if resume_from is not None:
         prior = _load_manifest(resume_from)
+        # Audit pass 15 finding #2 (BLOCK): a resume manifest MUST belong to
+        # the same plan. Silently accepting a mismatched manifest would carry
+        # forward verified=True + dest_cloud_file_id from a DIFFERENT
+        # destination account — cleanup then trashes the source with no live
+        # destination copy behind it (latent DATA-INTEGRITY).
+        if prior.plan_source_id != plan.source_id or prior.plan_dest_id != plan.dest_id:
+            raise MigrationError(
+                f"Refuse to resume: manifest {resume_from} was written for "
+                f"a different plan (source={prior.plan_source_id!r}, "
+                f"dest={prior.plan_dest_id!r}) but the current plan is "
+                f"(source={plan.source_id!r}, dest={plan.dest_id!r}). "
+                "Start a fresh run without --resume-from or use the manifest "
+                "that matches this plan."
+            )
         for e in prior.entries:
             if e.state == "done":
                 resume_done_by_path[e.source_path] = e

@@ -78,11 +78,11 @@ Two new invariants added to [AUDIT_LOG.md](docs/AUDIT_LOG.md#invariants-do-not-w
 
 Tests: 379 → 397 (13 new in `tests/test_compare_tree.py`, 5 new in `tests/test_apply_tree_discard.py`).
 
-### v0.3 — Organizer (planned)
+### v0.3 — Organizer (2026-09-06)
 
-Design contract: [docs/design/v0.3-organizer.md](docs/design/v0.3-organizer.md). User-facing docs: [docs/organize.md](docs/organize.md), [docs/cli.md](docs/cli.md), [docs/config.md](docs/config.md), [docs/safety.md](docs/safety.md).
+Shipped end-to-end: `dc organize discover → review → apply → undo`. Design contract: [docs/design/v0.3-organizer.md](docs/design/v0.3-organizer.md). User-facing docs: [docs/organize.md](docs/organize.md), [docs/cli.md](docs/cli.md), [docs/config.md](docs/config.md), [docs/safety.md](docs/safety.md).
 
-Planned surface for the milestone:
+Surface delivered in the milestone:
 
 - **`dc organize` command group with three sub-commands.** `discover` extracts signals and writes a plan JSON plus an HTML view; `review` opens a Rich-based TUI for editing the plan; `apply` creates target folders and moves files with a dry-run default. `undo` reverses a run from its manifest.
 - **Nine-domain taxonomy tuned to the user's data.** `HR/Payslips/`, `HR/OfferLetters/`, `HR/Tax/`, `Personal/IDs/`, `Personal/Insurance/`, `Personal/Legal/`, `Finances/Receipts/`, `Finances/Statements/`, `Finances/Invoices/`, `Finances/Investments/`, `Photos/`, `Videos/`, `Work/`, `Projects/`, `Media/Music/`, `Media/Books/`, `Unsorted/`. Every rule surfaces the exact signals that fired so the classification is auditable.
@@ -109,15 +109,20 @@ New Python dependencies planned for the milestone:
 - `[ocr]` optional-extra: `pytesseract` (requires system `tesseract`).
 - `[mime]` optional-extra: `python-magic` (stdlib `mimetypes` is the primary path).
 
-Sub-milestones (0.3-a → 0.3-b + 0.3-c → 0.3-d + 0.3-e → 0.3-f → 0.3-g): discovery + rules + TUI, then apply + undo, then PDF classifier, then event clustering, then cohesion enforcement, then HTML view, then cross-source. Cross-source (v0.3-g) depends on v0.2 landing first.
+Sub-milestones (0.3-a → 0.3-b + 0.3-c → 0.3-d + 0.3-e → 0.3-f → 0.3-g): discovery + rules + TUI, then apply + undo, then PDF classifier, then event clustering, then cohesion enforcement, then HTML view, then cross-source. Sub-milestones 0.3-a and 0.3-b shipped 2026-09-06; the classifier and event clustering landed alongside. Interactive HTML review (0.3-f) is the last remaining sub-milestone and is tracked under the v0.3-f roadmap line in the README.
 
-### In progress (v0.2 — cloud sources)
+### v0.2 — cloud sources (2026-09-05)
+
+Shipped end-to-end. Google Drive and OneDrive Personal accounts scan alongside local trees. BYO OAuth 2.0 (bundled clients rejected per the 2026-09-07 "Rejected alternatives" decision in [AUDIT_LOG.md](docs/AUDIT_LOG.md#rejected-alternatives-do-not-reopen-without-new-info) — the repo is public). Multi-account labels. Trash-only cloud deletion with cross-source undo. Cross-source scoring (`cloud_when_local_exists = -3`, local always wins). Pre-trash etag drift check.
+
+Sub-milestone landing history (kept for audit trail):
 
 - **Sub-phase 1 — source abstraction refactor.** Introduces `src/duplicate_cleaner/sources/` with the `Source` protocol, shared dataclasses, and exception hierarchy in `sources/base.py`. `LocalFileSystemSource` in `sources/local.py` wraps the existing walker and mover code with zero behaviour change. `FileRecord` gains six optional cloud-related fields (all defaulted so existing constructions work unchanged). Mover and undo dispatch by `source_id`; local-only reports remain byte-identical to v0.1.1. Exit gate: all existing tests pass unchanged; no new tests required. **Shipped.**
 - **Sub-phase 2 — `GoogleDriveSource` (read-only).** OAuth 2.0 + PKCE localhost flow, bundled Google Drive client id (placeholder gated by `_TO_REPLACE` sentinel), token storage under `~/.config/duplicate_cleaner/tokens/`. `GoogleDriveSource` streams file metadata via `files.list`, marks shared-with-me items informational-only, and rejects trash calls during scan with a runtime tripwire. **Shipped.**
 - **Sub-phase 3 — Google Drive trash + restore.** `GoogleDriveSource.move_to_trash` (`files.update(trashed=True)`) and `restore_from_trash` (`files.update(trashed=False)`), tenacity retry on 429/5xx, `SourceNotFoundError` / `SourcePermissionError` / `SourceRateLimitError` / `SourceAuthError` type hierarchy in `sources/base.py`. Audit-follow-ups B1–B13 landed alongside. **Shipped.**
 - **Sub-phase 4 — `OneDriveSource` (read + trash + restore).** New `sources/onedrive.py` targeting OneDrive Personal via Microsoft Graph. Uses raw `httpx` + `msal` (no `msgraph-sdk`). Enumerates via `GET /me/drive/root/delta`, filters `deleted` items, folders, and items missing `file.hashes.sha256Hash`. `remoteItem` presence marks the record `is_shared=True`. Foreign hash format `sha256:<hex-lower>`. Trash via `DELETE /me/drive/items/{id}` (moves to Recycle Bin, keeps id). Restore via `POST /me/drive/items/{id}/restore`; when Graph returns 501 or `notSupported` (documented Personal quirk) `SourceError` fires with an actionable message pointing the user at `https://onedrive.live.com/?id=recyclebin`. Bundled Microsoft client id gated by the same `_TO_REPLACE` sentinel as the Google branch (B1 mirror). `dc auth add onedrive`, `dc auth test onedrive:<label>`, `dc auth remove onedrive:<label>` wired through the shared OAuth infrastructure. **Shipped.**
-- Sub-phase 5 — cross-source scoring, report, apply integration — pending.
+- **Sub-phase 5 — cross-source scoring, report, apply integration.** `cloud_when_local_exists = -3` fires uniformly on every cloud sibling when any non-informational local peer exists. `is_shared` + `is_singleton_across_sources` set `is_informational=True` in the same layer as archive / hardlink / APFS markers. Mover dispatches on `source_id`; cloud entries route to `Source.move_to_trash`, local entries route to `send2trash`. Undo dispatches by `source_id` to the correct `Source.restore_from_trash`. **Shipped.**
+- **v0.2.1 — Cross-algo hash reconciliation.** Local BLAKE3 vs Drive MD5 vs OneDrive SHA-256 now correctly form cross-source duplicate groups end-to-end. Cache lookup → budget check (`max_cloud_download_mb`) → same-algo bucket shortcut → download-and-hash for cross-algo pairs, gated so a single scan cannot silently download all your cloud bytes. **Shipped.**
 
 Design contract: [docs/design/v0.2-cloud-sources.md](docs/design/v0.2-cloud-sources.md). User-facing docs: [docs/cloud-oauth-setup.md](docs/cloud-oauth-setup.md), [docs/cli.md](docs/cli.md).
 

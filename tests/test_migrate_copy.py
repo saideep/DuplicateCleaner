@@ -212,6 +212,47 @@ def test_copy_drift_aborts_run(tmp_path: Path) -> None:
     dst.upload.assert_not_called()
 
 
+def test_copy_resume_from_manifest_refuses_mismatched_plan(
+    tmp_path: Path,
+) -> None:
+    """Audit pass 15 blocker #2: --resume-from must belong to the same plan.
+
+    Silently accepting a manifest from a different source/dest combination
+    would carry forward verified=True + dest_cloud_file_id from the wrong
+    destination — cleanup would then trash the source with no live dest
+    behind it.
+    """
+    from duplicate_cleaner.migrate.mover import _plan_entry_to_manifest_entry
+
+    plan = _make_plan(_copy_entry("a.pdf"))
+    plan_path = _write_plan(tmp_path, plan)
+    manifest_path = tmp_path / "manifest.json"
+
+    # Prior manifest belongs to a DIFFERENT plan (different dest).
+    prior = MigrationManifest(
+        plan_source_id="gdrive:src",
+        plan_dest_id="gdrive:OTHER_DEST",
+    )
+    prior.entries.append(
+        _plan_entry_to_manifest_entry(_copy_entry("a.pdf").model_dump())
+        .model_copy(update={"state": "done"})
+    )
+    resume_path = tmp_path / "prior.json"
+    resume_path.write_text(prior.model_dump_json())
+
+    src = _FakeSource("gdrive:src")
+    dst = _FakeSource("gdrive:dst")
+    with pytest.raises(MigrationError, match="different plan"):
+        execute_migration(
+            plan_path,
+            manifest_path,
+            commit=True,
+            sources_by_id={"gdrive:src": src, "gdrive:dst": dst},
+            resume_from=resume_path,
+        )
+    dst.upload.assert_not_called()
+
+
 def test_copy_resume_from_manifest_skips_done(tmp_path: Path) -> None:
     """Entries flagged state='done' in --resume-from are skipped."""
     entry_a = _copy_entry("a.pdf")

@@ -93,12 +93,25 @@ def undo_migration(
         # user-visible "undo" reverses cleanup + copy in the reverse order
         # the copy loop wrote them.
         if entry.cleanup_done:
+            # Audit pass 15 finding #1 (BLOCK): reject cleanup_done rows
+            # with a null/empty source_cloud_trash_id. Silently falling back
+            # to source_file_id would let a poisoned manifest coerce
+            # restore_from_trash into un-trashing a file another client
+            # intentionally trashed. Mirrors apply/undo.py's null-trash-id
+            # rejection (v0.2 sub-phase 5d invariant).
+            if not entry.source_cloud_trash_id:
+                errors.append(
+                    f"Refuse to restore source for {entry.source_path}: "
+                    f"cleanup_done=True but source_cloud_trash_id is null — "
+                    "manifest is corrupt or hand-edited; nothing to un-trash."
+                )
+                _flush_manifest(manifest, manifest_path)
+                continue
             loc = TrashedLocation(
                 source_id=entry.source_id,
                 original_path=entry.source_path,
                 cloud_file_id=entry.source_file_id,
-                cloud_trash_id=entry.source_cloud_trash_id
-                or entry.source_file_id,
+                cloud_trash_id=entry.source_cloud_trash_id,
             )
             try:
                 src_source.restore_from_trash(loc)

@@ -66,6 +66,28 @@ class _FakeSource:
         self.restore_from_trash = MagicMock(return_value=None)
 
 
+def test_undo_refuses_cleanup_entry_with_null_source_cloud_trash_id(
+    tmp_path: Path,
+) -> None:
+    """Audit pass 15 blocker #1: cleanup_done=True with null trash id → skip
+    with per-entry error. Silently falling back to source_file_id would
+    coerce restore_from_trash into un-trashing an unrelated file."""
+    entry = _entry("a.pdf", cleanup_done=True)
+    entry = entry.model_copy(update={"source_cloud_trash_id": None})
+    manifest_path = _write_manifest(tmp_path, [entry])
+    src = _FakeSource("gdrive:src")
+    dst = _FakeSource("gdrive:dst")
+    result = undo_migration(
+        manifest_path,
+        sources_by_id={"gdrive:src": src, "gdrive:dst": dst},
+    )
+    src.restore_from_trash.assert_not_called()
+    assert any(
+        "source_cloud_trash_id is null" in e or "cleanup_done=True" in e
+        for e in result.errors
+    ), f"expected null-trash-id error, got {result.errors}"
+
+
 def test_undo_reverses_copy_by_trashing_dest(tmp_path: Path) -> None:
     """A done entry (no cleanup) → destination trashed on undo."""
     manifest_path = _write_manifest(tmp_path, [_entry("a.pdf")])
