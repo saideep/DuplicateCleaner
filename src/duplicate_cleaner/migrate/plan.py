@@ -28,6 +28,17 @@ ONEDRIVE_MAX_FILE_SIZE_BYTES: int = 250 * 1024 * 1024 * 1024  # 250 GB
 
 MigrationAction = Literal["copy", "skip", "defer", "error"]
 
+# v0.5-b execute-side states.  ``pending`` is the freshly-materialised entry
+# awaiting an upload; ``done`` follows a successful copy + post-upload hash
+# match; ``skipped`` covers plan actions that never touch bytes (defer,
+# skip, plan-error) plus resume-time skips; ``error`` marks a failed upload
+# or a hash-mismatch that trashed the botched destination copy.
+MigrationEntryState = Literal["pending", "done", "skipped", "error"]
+
+# Bumped whenever the manifest schema changes shape.  Consumers key off
+# this so a future v0.5-c can refuse to load a stale manifest cleanly.
+MIGRATE_MANIFEST_VERSION = "0.5.0"
+
 
 class MigrationFilter(BaseModel):
     """Input to :func:`plan_migration` — filters + safety knobs.
@@ -105,6 +116,82 @@ class MigrationPlan(BaseModel):
         out: dict[str, int] = {}
         for e in self.entries:
             out[e.action] = out.get(e.action, 0) + 1
+        return out
+
+
+class MigrationManifestEntry(BaseModel):
+    """One row in a ``dc migrate copy`` run manifest.
+
+    Mirrors :class:`MigrationEntry` for the input plan half, then extends
+    with the execute-side fields ``dc migrate cleanup`` and ``dc migrate
+    undo`` key off:
+
+    - ``state`` = ``pending`` at manifest-write time, flipped to ``done`` on
+      a successful copy + hash match, ``skipped`` when the plan action is
+      ``defer`` / ``skip`` / plan-time ``error`` (or when
+      ``--resume-from`` finds the entry already done), and ``error`` when
+      the copy failed mid-run (upload rejected, hash mismatch, drift, etc.).
+    - ``dest_cloud_file_id`` / ``dest_etag`` / ``uploaded_hash`` /
+      ``uploaded_hash_algo`` — populated on a ``done`` entry from the
+      destination's post-upload re-fetch.  ``verify_migration`` diffs
+      ``dest_etag`` against the current cloud etag as a fast pre-check.
+    - ``verified`` starts ``False``; the copy loop flips it to ``True`` on
+      a byte-level hash match at upload time.  ``verify_migration`` may
+      also demote it back to ``False`` when a post-copy verify hash
+      mismatch surfaces.  ``verified_ts`` stamps the last successful verify.
+    - ``cleanup_done`` / ``source_cloud_trash_id`` — populated by
+      ``cleanup_source_after_migration`` when the source's original is
+      trashed.  ``undo_migration`` reads both to reverse the cleanup.
+    - ``error_message`` retains the last failure reason so a run log stays
+      self-contained even after the CLI process exits.
+    """
+
+    source_id: str
+    source_file_id: str | None = None
+    source_path: str
+    source_etag: str | None = None
+    source_size: int
+    source_hash: str | None = None
+    source_mime: str | None = None
+    dest_expected_path: str
+    action: MigrationAction
+    state: MigrationEntryState = "pending"
+    reason: str = ""
+    size_limit_hit: bool = False
+    dest_cloud_file_id: str | None = None
+    dest_etag: str | None = None
+    uploaded_hash_algo: str | None = None
+    uploaded_hash: str | None = None
+    verified: bool = False
+    verified_ts: float | None = None
+    cleanup_done: bool = False
+    source_cloud_trash_id: str | None = None
+    error_message: str | None = None
+
+
+class MigrationManifest(BaseModel):
+    """Top-level envelope for the ``dc migrate copy`` run manifest.
+
+    Written BEFORE the first upload fires so a crash mid-run leaves a
+    replayable artifact.  ``manifest_version`` stamps the schema so a
+    later ``dc migrate verify`` / ``cleanup`` / ``undo`` can refuse a
+    stale shape rather than silently mis-key.
+    """
+
+    manifest_version: Literal["0.5.0"] = "0.5.0"
+    plan_source_id: str
+    plan_dest_id: str
+    created_ts: float = Field(default_factory=lambda: datetime.now(UTC).timestamp())
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    plan_path: str = ""
+    entries: list[MigrationManifestEntry] = Field(default_factory=list)
+
+    @property
+    def counts_by_state(self) -> dict[str, int]:
+        """Return ``{state: count}`` for CLI + summary rendering."""
+        out: dict[str, int] = {}
+        for e in self.entries:
+            out[e.state] = out.get(e.state, 0) + 1
         return out
 
 

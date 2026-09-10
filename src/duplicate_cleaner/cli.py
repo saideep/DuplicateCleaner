@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -2202,6 +2203,315 @@ def migrate_plan(
     tbl.add_row("Plan JSON", str(json_path))
     tbl.add_row("Plan HTML", str(html_path))
     console.print(tbl)
+
+
+# --------------------------------------------------------------------------- #
+# v0.5-b — `dc migrate copy | verify | cleanup | undo`.                       #
+# --------------------------------------------------------------------------- #
+
+MIGRATE_RUNS_DIR = (
+    Path.home() / ".local" / "share" / "duplicate_cleaner" / "migrate-runs"
+)
+
+
+def _build_migrate_sources(
+    source_ids: list[str],
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Construct the write-enabled ``source_id -> Source`` map for migrate.
+
+    Mirrors :func:`_build_sources_for_apply` but keyed on an explicit id
+    list (from the plan/manifest's ``source_id`` + ``dest_id``) so we don't
+    build sources for accounts the current run does not touch.  Every
+    source is constructed with ``is_read_only_scan=False`` — the same
+    tripwire the migrate mover / cleanup / undo modules re-check as
+    defense-in-depth.
+    """
+    if not source_ids:
+        return {}
+    tokens = TokenStore()
+    registry = AccountsRegistry()
+    by_id: dict[str, AccountEntry] = {e.id: e for e in registry.load()}
+    out: dict[str, Any] = {}
+    for sid in source_ids:
+        entry = by_id.get(sid)
+        if entry is None:
+            raise typer.BadParameter(
+                f"source {sid!r} not registered — run "
+                f"`dc auth add {sid.split(':', 1)[0]} <label>`"
+            )
+        data = tokens.load(sid)
+        if data is None:
+            raise typer.BadParameter(
+                f"source {sid!r} has no stored token — re-run "
+                "`dc auth add --force` for the account"
+            )
+        kind = str(data.get("type", entry.type))
+        if kind == "gdrive":
+            out[sid] = _build_gdrive_source(
+                sid, data, force_refresh=force_refresh
+            )
+        elif kind == "onedrive":
+            out[sid] = _build_onedrive_source(
+                sid, data, force_refresh=force_refresh
+            )
+        else:
+            raise typer.BadParameter(f"Unknown source type: {kind!r}")
+    return out
+
+
+def _default_migrate_manifest_path() -> Path:
+    """Return a ``migrate-runs/<utc-timestamp>/manifest.json`` under HOME."""
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return MIGRATE_RUNS_DIR / ts / "manifest.json"
+
+
+@migrate_app.command("copy")
+def migrate_copy(
+    plan_path: Annotated[
+        Path,
+        typer.Argument(help="Path to migration-plan.json from `dc migrate plan`."),
+    ],
+    commit: Annotated[
+        bool,
+        typer.Option(
+            "--commit",
+            help="Actually upload copies. Dry-run without this flag.",
+        ),
+    ] = False,
+    max_bandwidth_mbps: Annotated[
+        float | None,
+        typer.Option(
+            "--max-bandwidth-mbps",
+            help="Cap effective upload bandwidth (Mbps). Default unlimited.",
+        ),
+    ] = None,
+    resume_from: Annotated[
+        Path | None,
+        typer.Option(
+            "--resume-from",
+            help=(
+                "Path to a prior migration manifest.  Entries with "
+                "state='done' are marked skipped in this run so a resume "
+                "does not re-upload."
+            ),
+        ),
+    ] = None,
+    out_manifest: Annotated[
+        Path | None,
+        typer.Option(
+            "--out-manifest",
+            help=(
+                "Where to write the migration manifest.  Default "
+                "~/.local/share/duplicate_cleaner/migrate-runs/<utc>/manifest.json."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Execute the copy actions in the plan — dry-run unless --commit is passed."""
+    from duplicate_cleaner.migrate.mover import (
+        MigrationError as _MigrationError,
+    )
+    from duplicate_cleaner.migrate.mover import (
+        execute_migration,
+    )
+    from duplicate_cleaner.migrate.plan import MigrationPlan
+
+    plan = MigrationPlan.model_validate_json(plan_path.read_text())
+    manifest_path = out_manifest or _default_migrate_manifest_path()
+    try:
+        sources_map = _build_migrate_sources([plan.source_id, plan.dest_id])
+    except typer.BadParameter as e:
+        console.print(f"[red]Refusing to copy[/red]: {e}")
+        raise typer.Exit(2) from e
+    try:
+        result = execute_migration(
+            plan_path,
+            manifest_path,
+            commit=commit,
+            sources_by_id=sources_map,
+            resume_from=resume_from,
+            max_bandwidth_mbps=max_bandwidth_mbps,
+        )
+    except _MigrationError as e:
+        console.print(f"[red]Migration aborted[/red]: {e}")
+        raise typer.Exit(1) from e
+
+    tbl = Table(title="Migration copy result")
+    tbl.add_column("Metric")
+    tbl.add_column("Value", justify="right")
+    tbl.add_row("Planned entries", str(result.planned))
+    tbl.add_row("Copied", str(result.copied))
+    tbl.add_row("Skipped", str(result.skipped))
+    tbl.add_row("Deferred", str(result.deferred))
+    tbl.add_row("Errored", str(result.errored))
+    tbl.add_row("Committed", "yes" if result.committed else "no (dry-run)")
+    if result.manifest_path:
+        tbl.add_row("Manifest", str(result.manifest_path))
+    console.print(tbl)
+    if result.errors:
+        console.print(
+            f"[yellow]{len(result.errors)} error(s):[/yellow]"
+        )
+        for msg in result.errors[:20]:
+            console.print(f"  • {msg}")
+    if not commit:
+        console.print(
+            "[cyan]DRY-RUN[/cyan]: pass [bold]--commit[/bold] to upload."
+        )
+
+
+@migrate_app.command("verify")
+def migrate_verify(
+    manifest_path: Annotated[
+        Path,
+        typer.Argument(help="Path to migration manifest.json to verify."),
+    ],
+    full: Annotated[
+        bool,
+        typer.Option(
+            "--full",
+            help=(
+                "Stream destination bytes through BLAKE3 for a strict "
+                "byte-level check. Slower but catches provider-side bit-flips."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Re-check every done manifest entry against destination-side metadata."""
+    from duplicate_cleaner.migrate.mover import _load_manifest
+    from duplicate_cleaner.migrate.verify import (
+        VerifyError as _VerifyError,
+    )
+    from duplicate_cleaner.migrate.verify import (
+        verify_migration,
+    )
+
+    manifest = _load_manifest(manifest_path)
+    try:
+        sources_map = _build_migrate_sources(
+            [manifest.plan_source_id, manifest.plan_dest_id]
+        )
+    except typer.BadParameter as e:
+        console.print(f"[red]Refusing to verify[/red]: {e}")
+        raise typer.Exit(2) from e
+    try:
+        result = verify_migration(
+            manifest_path,
+            sources_by_id=sources_map,
+            full=full,
+        )
+    except _VerifyError as e:
+        console.print(f"[red]Verify aborted[/red]: {e}")
+        raise typer.Exit(1) from e
+    tbl = Table(title="Migration verify result")
+    tbl.add_column("Metric")
+    tbl.add_column("Value", justify="right")
+    tbl.add_row("Done entries", str(result.total_done))
+    tbl.add_row("Verified", str(result.verified))
+    tbl.add_row("Drifted", str(result.drifted))
+    tbl.add_row("Missing on dest", str(result.missing))
+    tbl.add_row("Errored", str(result.errored))
+    console.print(tbl)
+    if result.errors:
+        console.print(f"[yellow]{len(result.errors)} error(s):[/yellow]")
+        for msg in result.errors[:20]:
+            console.print(f"  • {msg}")
+
+
+@migrate_app.command("cleanup")
+def migrate_cleanup(
+    manifest_path: Annotated[
+        Path,
+        typer.Argument(help="Path to migration manifest.json to clean up."),
+    ],
+    commit: Annotated[
+        bool,
+        typer.Option(
+            "--commit",
+            help="Actually trash source originals. Dry-run without this flag.",
+        ),
+    ] = False,
+) -> None:
+    """Trash source originals for verified done entries. Dry-run by default."""
+    from duplicate_cleaner.migrate.cleanup import (
+        CleanupError as _CleanupError,
+    )
+    from duplicate_cleaner.migrate.cleanup import (
+        cleanup_source_after_migration,
+    )
+    from duplicate_cleaner.migrate.mover import _load_manifest
+
+    manifest = _load_manifest(manifest_path)
+    try:
+        sources_map = _build_migrate_sources([manifest.plan_source_id])
+    except typer.BadParameter as e:
+        console.print(f"[red]Refusing to clean up[/red]: {e}")
+        raise typer.Exit(2) from e
+    try:
+        result = cleanup_source_after_migration(
+            manifest_path,
+            commit=commit,
+            sources_by_id=sources_map,
+        )
+    except _CleanupError as e:
+        console.print(f"[red]Refusing to clean up[/red]: {e}")
+        raise typer.Exit(2) from e
+    tbl = Table(title="Migration cleanup result")
+    tbl.add_column("Metric")
+    tbl.add_column("Value", justify="right")
+    tbl.add_row("Planned trash", str(result.planned))
+    tbl.add_row("Trashed", str(result.trashed))
+    tbl.add_row("Skipped", str(result.skipped))
+    tbl.add_row("Committed", "yes" if result.committed else "no (dry-run)")
+    console.print(tbl)
+    if result.errors:
+        console.print(f"[yellow]{len(result.errors)} error(s):[/yellow]")
+        for msg in result.errors[:20]:
+            console.print(f"  • {msg}")
+
+
+@migrate_app.command("undo")
+def migrate_undo(
+    manifest_path: Annotated[
+        Path,
+        typer.Argument(help="Path to migration manifest.json to reverse."),
+    ],
+) -> None:
+    """Restore source originals and trash destination copies from a migration run."""
+    from duplicate_cleaner.migrate.mover import _load_manifest
+    from duplicate_cleaner.migrate.undo import (
+        UndoMigrationError as _UndoMigrationError,
+    )
+    from duplicate_cleaner.migrate.undo import (
+        undo_migration,
+    )
+
+    manifest = _load_manifest(manifest_path)
+    try:
+        sources_map = _build_migrate_sources(
+            [manifest.plan_source_id, manifest.plan_dest_id]
+        )
+    except typer.BadParameter as e:
+        console.print(f"[red]Refusing to undo[/red]: {e}")
+        raise typer.Exit(2) from e
+    try:
+        result = undo_migration(manifest_path, sources_by_id=sources_map)
+    except _UndoMigrationError as e:
+        console.print(f"[red]Undo aborted[/red]: {e}")
+        raise typer.Exit(1) from e
+    tbl = Table(title="Migration undo result")
+    tbl.add_column("Metric")
+    tbl.add_column("Value", justify="right")
+    tbl.add_row("Manifest entries", str(result.total))
+    tbl.add_row("Source originals restored", str(result.restored_source))
+    tbl.add_row("Dest copies trashed", str(result.trashed_dest))
+    console.print(tbl)
+    if result.errors:
+        console.print(f"[yellow]{len(result.errors)} error(s):[/yellow]")
+        for msg in result.errors[:20]:
+            console.print(f"  • {msg}")
 
 
 def _google_credentials_from_token(data: dict[str, object]) -> object:

@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file. Format: Kee
 
 ## [Unreleased]
 
+### v0.5-b — Cloud consolidation execution (2026-09-10)
+
+Second half of `dc migrate` — the copy / verify / cleanup / undo pipeline. v0.5-a shipped the planner + `Source.upload` protocol; v0.5-b turns the plan into actual uploads with the same safety envelope the dedup mover carries.
+
+Added:
+
+- `src/duplicate_cleaner/migrate/mover.py::execute_migration(plan_path, manifest_path, *, commit, sources_by_id, resume_from, max_bandwidth_mbps)` — the copy loop. Dry-run by default; `--commit` gates uploads. Per-entry: drift-check → `source.read_bytes` → optional bandwidth throttle → `dest.upload` → post-upload hash verify → atomic manifest flush. Same-algo hash mismatch trashes the destination BEFORE the manifest advances so the source stays untouched. Cross-algo pairs (md5 gdrive → sha256 onedrive) are optimistically accepted at copy time; `dc migrate verify --full` canonicalises via BLAKE3 for the strict check.
+- `src/duplicate_cleaner/migrate/verify.py::verify_migration(manifest_path, *, sources_by_id, full)` — re-checks every done manifest entry. Default mode: metadata-only via `Source.check_drift`. `--full` mode: streams the destination bytes through BLAKE3.
+- `src/duplicate_cleaner/migrate/cleanup.py::cleanup_source_after_migration(manifest_path, *, commit, sources_by_id)` — trashes source originals for done + verified entries. Refuses up-front (before any `move_to_trash` call fires) if any done entry has `verified=False` or `verified_ts=None`, pointing the user at `dc migrate verify`.
+- `src/duplicate_cleaner/migrate/undo.py::undo_migration(manifest_path, *, sources_by_id)` — reverses cleanup + copy: source originals restored via `restore_from_trash`, destination copies trashed via `move_to_trash`. Entries with `state="pending"` / `"skipped"` / `"error"` are untouched.
+- Four new CLI sub-commands: `dc migrate copy PLAN.json [--commit] [--max-bandwidth-mbps N] [--resume-from MANIFEST] [--out-manifest PATH]`, `dc migrate verify MANIFEST.json [--full]`, `dc migrate cleanup MANIFEST.json [--commit]`, `dc migrate undo MANIFEST.json`.
+
+Safety additions (two new invariants tracked in [AUDIT_LOG.md](docs/AUDIT_LOG.md#invariants-do-not-weaken)):
+
+- **Migration post-upload hash verify — mismatch trashes destination before source is touched.** Same-algo pairs compare directly at copy time. Cross-algo pairs are optimistically accepted; the mismatch surface moves to `dc migrate verify --full`. Either way, a same-algo mismatch at copy time trashes the botched destination copy immediately.
+- **Cleanup refuses without verify.** `dc migrate cleanup` raises `CleanupError` up-front if any done entry has `verified=False` OR `verified_ts=None`. The check fires before any source `move_to_trash` call.
+
+Preserved invariants:
+
+- Dry-run default on `copy` / `cleanup`.
+- Atomic manifest write (tempfile + fsync + `os.replace` + parent-dir fsync) BEFORE the first upload, re-flushed after every per-entry state change.
+- Drift check via etag runs BEFORE every upload; mismatch aborts the whole run.
+- `is_read_only_scan` tripwire fires before any HTTP call in `copy` / `cleanup` / `undo`.
+- BYO OAuth only.
+- Cloud paths never `.resolve()`d.
+- Cloud discards go to cloud trash; undo restores via the same API.
+
+Tests: 422 → 445 (11 new in `tests/test_migrate_copy.py`, 4 new in `tests/test_migrate_verify.py`, 4 new in `tests/test_migrate_cleanup.py`, 4 new in `tests/test_migrate_undo.py`).
+
 ### v0.5-a — Cloud consolidation planner (2026-09-10)
 
 First half of `dc migrate`. Adds the `Source.upload` write protocol and the read-only migration planner. Copy / verify / cleanup / undo land in v0.5-b.

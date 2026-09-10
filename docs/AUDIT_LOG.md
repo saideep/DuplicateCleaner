@@ -31,6 +31,8 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Rename policy is user-locked** (v0.3): default `rename_policy = "preserve"`. In this mode filename bytes are never mutated by `dc organize`. `date_prefix` and `date_event_prefix` only apply when the user has explicitly opted in via config.
 - **Project-tree discards refuse dirty git repos** (v0.4): a project directory whose `git status --porcelain` is non-empty is never proposed for a `kind="tree"` discard, and the mover re-runs the check immediately before the move. Uncommitted work has no other on-disk copy; trashing the directory would destroy the working-tree diff even when every tracked file matches another project byte-for-byte.
 - **Project trees move atomically** (v0.4): `dc apply --commit` sends the entire discard directory to Trash via a single `send2trash` call. Cohesion is enforced structurally — every exact-duplicate group whose members are wholly contained inside a detected project root is removed from the report before `apply` sees it, so no per-file split of a project is representable. Undo restores the whole tree via `shutil.move` back from Trash. Tree discards additionally require the target to sit inside an `active_home` (defense-in-depth for whole-directory moves).
+- **Migration post-upload hash verify — mismatch trashes dest before source is touched** (v0.5-b): `dc migrate copy` compares `UploadResult.uploaded_hash` against `entry.source_hash` immediately after upload. Same-algo pairs (both md5, both sha256, both blake3) compare directly; a mismatch calls `dest.move_to_trash(...)` on the botched destination copy BEFORE the manifest state flips to `"error"` and BEFORE the source is touched. Cross-algo pairs are optimistically accepted at copy time; the strict check moves to `dc migrate verify --full`. The invariant guarantees the migration never leaves a corrupt destination copy live alongside an untouched source original.
+- **Migration cleanup refuses without verify** (v0.5-b): `dc migrate cleanup` iterates every `state="done"` entry up-front and raises `CleanupError` before any `Source.move_to_trash` call fires if any entry has `verified=False` OR `verified_ts=None`. Points the operator at `dc migrate verify`. Structural — a mid-batch failure on entry N cannot leave entries 1..(N-1) trashed against an unverified copy.
 
 ## Rejected alternatives (do not reopen without new info)
 
@@ -41,6 +43,83 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Perceptual near-dup ahead of organizer** — DROPPED sequencing. Reshuffled: organizer to v0.3, near-dup pushed to v0.7/v0.8.
 
 ## Round-by-round history
+
+### v0.5-b — cloud-to-cloud migration (execution half, 2026-09-10)
+
+Second half of `dc migrate` per the v0.5 milestone plan.  v0.5-a delivered the planner + `Source.upload` protocol; v0.5-b turns the plan into actual uploads with the same safety envelope the dedup mover carries.  All 445 tests pass (422 pre-existing + 23 new); `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`; ruff clean on every new file; mypy `--strict` clean on every new file modulo the pre-existing `unused-ignore` warnings on 3rd-party stubs in `cli.py` (documented in v0.5-a milestone notes, unchanged).
+
+Shipped:
+
+- `src/duplicate_cleaner/migrate/mover.py` — new module.
+  - `execute_migration(plan_path, manifest_path, *, commit, sources_by_id, resume_from, max_bandwidth_mbps) -> MigrationResult`.  Dry-run by default; `--commit` gates uploads.  Loads the plan via `MigrationPlan.model_validate_json`, converts every `MigrationEntry` to a fresh `MigrationManifestEntry` (`state="pending"` for copy, `state="skipped"` for defer / skip / plan-time error), and iterates.
+  - Per copy entry: drift check via `source.check_drift(record)` → `source.read_bytes(record)` → optional `_throttled_stream` wrapper (per-chunk `time.sleep` proportional to bytes / max_mbps) → `dest.upload(dest_expected_path, throttled, source_size)` → hash verify via `_hashes_match` → atomic manifest flush.
+  - Same-algo hash mismatch: `dest.move_to_trash(...)` fires BEFORE the manifest advances to `state="error"`; source untouched.  Trash-call failure surfaces loudly.
+  - Cross-algo pair (md5 gdrive → sha256 onedrive): optimistically accepted at copy time with `verified=False` on the manifest row; `dc migrate verify --full` canonicalises via BLAKE3 to catch bit-flips.
+  - Aborts (whole-run stop, manifest kept): `SourceDriftError`, `SourceAuthError`, `SourceRateLimitError`, missing source in map, either source with `is_read_only_scan=True`.
+  - Per-entry errors (log + continue): `SourceNotFoundError`, `SourcePermissionError`, generic `SourceError`.
+  - `--resume-from`: prior manifest entries with `state="done"` are re-emitted as `state="skipped"` in the current run's manifest (no re-upload).  Dest cloud ids + verified state are carried forward so subsequent `cleanup` / `undo` addresses the original copies.
+- `src/duplicate_cleaner/migrate/verify.py` — new module.
+  - `verify_migration(manifest_path, *, sources_by_id, full) -> VerifyResult`.  Iterates every `state="done"` entry, calls `dest.check_drift(record)` on the destination.  `SourceNotFoundError` → `verified=False`, error `"dest file no longer exists"`.  `SourceDriftError` / other → `verified=False`, error `"dest etag drifted"`.
+  - `--full`: additionally streams destination bytes through BLAKE3 for a strict byte-level check.  When the source hash is bare BLAKE3 (local origin), a mismatch flips `verified=False`; cross-algo pairs stamp the destination's BLAKE3 for future audit.
+- `src/duplicate_cleaner/migrate/cleanup.py` — new module.
+  - `cleanup_source_after_migration(manifest_path, *, commit, sources_by_id) -> CleanupResult`.  Refuse conditions run BEFORE any dispatch loop: any done entry with `verified=False` or `verified_ts=None` raises `CleanupError` naming the entry and pointing at `dc migrate verify`.
+  - Per successful trash: manifest row stamps `cleanup_done=True` + `source_cloud_trash_id`, flushed atomically.
+  - Aborts on `SourceAuthError` / `SourceRateLimitError`; per-entry error tolerance on not-found / permission / generic `SourceError`.
+- `src/duplicate_cleaner/migrate/undo.py` — new module.
+  - `undo_migration(manifest_path, *, sources_by_id) -> UndoResult`.  Per manifest entry:
+    - `cleanup_done=True` → `source.restore_from_trash(TrashedLocation)` first (reverse cleanup).  On success, `cleanup_done` flips back to False.
+    - `state="done"` → `dest.move_to_trash(record)` on the destination cloud id + etag stamped at copy time.  On success, `state` flips to `"pending"` and the dest fields clear.
+    - Any other state (`pending` / `skipped` / `error`) → nothing to undo.
+  - Aborts on auth / rate-limit; per-entry error tolerance on not-found / permission.
+- `src/duplicate_cleaner/migrate/__init__.py` — re-exports the new symbols alongside the v0.5-a set.
+- `src/duplicate_cleaner/cli.py` — four new sub-commands under `dc migrate`: `copy`, `verify`, `cleanup`, `undo`.  Each builds `sources_by_id` from `AccountsRegistry + TokenStore` via a new `_build_migrate_sources` helper (mirrors `_build_sources_for_apply` but keyed on the plan/manifest's source ids so we don't construct sources the current run does not touch; every source `is_read_only_scan=False`).  Default manifest path: `~/.local/share/duplicate_cleaner/migrate-runs/<utc-timestamp>/manifest.json`.
+
+Tests shipped:
+
+- `tests/test_migrate_copy.py` (11 tests):
+  - `test_copy_dry_run_touches_nothing` — commit=False; no upload, no manifest write.
+  - `test_copy_commit_uploads_and_manifests` — commit=True; upload called; manifest carries `state="done"` + dest ids + `verified=True`.
+  - `test_copy_hash_mismatch_trashes_dest` — same-algo mismatch → `dest.move_to_trash` called with the botched dest cloud id; source `move_to_trash` never called; manifest state="error".
+  - `test_copy_drift_aborts_run` — `check_drift` raising `SourceDriftError` aborts before any upload fires.
+  - `test_copy_resume_from_manifest_skips_done` — prior manifest with `state="done"` for entry a → new manifest carries `state="skipped"` for a and `state="done"` for b.
+  - `test_copy_bandwidth_throttle_sleeps` — mock `time.sleep`; verify per-chunk sleep proportional to chunk size / max_mbps.
+  - `test_copy_deferred_entry_marked_skipped` — plan action=defer → state="skipped", no upload.
+  - `test_copy_manifest_atomic_write` — mock `os.replace` to raise mid-run → target manifest never comes into existence.
+  - `test_copy_refuses_read_only_dest` / `test_copy_missing_source_in_map` — tripwires.
+  - `test_copy_manifest_json_shape` — JSON round-trip through `MigrationManifest`.
+- `tests/test_migrate_verify.py` (4 tests):
+  - `test_verify_matches_hash_marks_verified_true` — dest returns matching etag → `verified=True`, `verified_ts` set.
+  - `test_verify_etag_drift_marks_false` — dest raises `SourceDriftError` → `verified=False`, error stamps "drift".
+  - `test_verify_missing_dest_marks_false` — `SourceNotFoundError` → `verified=False`, error stamps "no longer exists".
+  - `test_verify_full_mode_streams_dest` — `--full` flag → `dst.read_bytes` called; BLAKE3 match → `verified=True`.
+- `tests/test_migrate_cleanup.py` (4 tests):
+  - `test_cleanup_refuses_without_verify` — done entry with `verified=False` → `CleanupError`; `move_to_trash` never called.
+  - `test_cleanup_refuses_without_verify_ts` — done entry with `verified_ts=None` → `CleanupError`.
+  - `test_cleanup_dry_run_no_trash` — commit=False → `planned=1` but no trash call.
+  - `test_cleanup_commit_trashes_sources` — commit=True → `source.move_to_trash` called per done+verified entry, entries updated with `cleanup_done=True`.
+- `tests/test_migrate_undo.py` (4 tests):
+  - `test_undo_reverses_copy_by_trashing_dest` — done entry (no cleanup) → destination trashed.
+  - `test_undo_restores_source_when_cleanup_happened` — `cleanup_done=True` → `source.restore_from_trash` called AND destination trashed.
+  - `test_undo_partial_state` — mixed manifest (one cleanup_done, one just done) → both handled.
+  - `test_undo_ignores_error_entries` — entries with `state="error"` / `"pending"` / `"skipped"` untouched.
+
+Invariants preserved (all AUDIT_LOG items above):
+
+- All 422 pre-existing tests still pass unchanged; 23 new tests added (445 total).
+- `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`.
+- BYO OAuth only — no bundled client id.
+- Cloud `Path` never `.resolve()`d in the new modules.
+- Manifest atomic-write pattern (tempfile + fsync + `os.replace` + parent-dir fsync) applies to the migrate manifest; per-entry flush after every state transition.
+- Drift check runs BEFORE every upload; etag mismatch aborts the whole run.
+- Every source constructed with `is_read_only_scan=False` for copy / cleanup / undo contexts; tripwire runtime check fires before any HTTP call.
+- New invariants added at the top of this document.
+
+Explicitly deferred / follow-up polish:
+
+- Cross-algo BLAKE3 pre-fetch: `dc migrate copy` could pre-populate `store.get_cloud_hash` for the source side so cross-algo pairs verify at copy time via a canonical BLAKE3 lookup without needing `--full`.  Deferred as a v0.5-c polish item.
+- Post-upload `dc migrate verify --full` currently trusts the source-side BLAKE3 only when the source is local (`foreign_hash` unset, hash is bare BLAKE3).  A future revision could pull the source cloud bytes for a strict cross-algo compare — deferred behind an opt-in flag because a full byte re-download of both sides is O(2×migration bytes).
+
+**v0.5-b clears ship.** `dc migrate` is complete end-to-end (plan → copy → verify → cleanup, with undo covering every step).  Ready for v0.6 (Google Photos + iCloud) or v0.7 (image near-dup).
 
 ### v0.5-a — cloud-to-cloud migration (planner half, 2026-09-10)
 

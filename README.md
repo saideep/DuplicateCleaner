@@ -76,7 +76,7 @@ uv sync
 
 Deeper docs:
 - [docs/macmini-setup.md](docs/macmini-setup.md) — installation reference
-- [docs/cloud-oauth-setup.md](docs/cloud-oauth-setup.md) — BYO OAuth registration (bundled clients are placeholders in the current release)
+- [docs/cloud-oauth-setup.md](docs/cloud-oauth-setup.md) — OAuth is BYO-only by design (the public repo does not bundle personal client IDs)
 - [docs/organize.md](docs/organize.md) — organizer workflow
 - [docs/safety.md](docs/safety.md) — safety model + invariants
 - [docs/cli.md](docs/cli.md) — full CLI reference
@@ -127,7 +127,11 @@ Full detail in [docs/safety.md](docs/safety.md).
 | `dc organize review <plan.json>` | Interactive Rich TUI for editing the plan file. (v0.3) | `dc organize review ~/plan.json` |
 | `dc organize apply <plan.json>` | Create target folders and move files. Dry-run by default. (v0.3) | `dc organize apply ~/plan.json --commit` |
 | `dc organize undo <manifest.json>` | Restore every file moved in a prior organize run. (v0.3) | `dc organize undo ~/.local/share/duplicate_cleaner/runs/<ts>/manifest.json` |
-| `dc migrate plan --from A --to B --report DIR` | Cloud-to-cloud plan. Enumerates source, decides per-file copy / skip / defer / error, writes a plan. Copy/verify/cleanup land in v0.5-b. (v0.5-a) | `dc migrate plan --from onedrive:main --to gdrive:personal --report ~/dc-migrate` |
+| `dc migrate plan --from A --to B --report DIR` | Cloud-to-cloud plan. Enumerates source, decides per-file copy / skip / defer / error, writes a plan. (v0.5) | `dc migrate plan --from onedrive:main --to gdrive:personal --report ~/dc-migrate` |
+| `dc migrate copy <plan.json>` | Execute the copy actions. Dry-run by default; `--commit` uploads. `--max-bandwidth-mbps N` and `--resume-from MANIFEST` supported. (v0.5) | `dc migrate copy ~/dc-migrate/migration-plan.json --commit` |
+| `dc migrate verify <manifest.json>` | Re-check destination-side metadata for every done entry. `--full` re-hashes destination bytes. (v0.5) | `dc migrate verify <manifest> --full` |
+| `dc migrate cleanup <manifest.json>` | Trash source originals for verified done entries. Refuses if verify hasn't run. (v0.5) | `dc migrate cleanup <manifest> --commit` |
+| `dc migrate undo <manifest.json>` | Reverse a migration: restore source originals, trash destination copies. (v0.5) | `dc migrate undo <manifest>` |
 | `dc weights show` | Print current scoring weights. | `dc weights show` |
 | `dc weights reset` | Restore weights to the shipped defaults. | `dc weights reset` |
 | `dc cache stats` | Print cache size and hit rate. | `dc cache stats` |
@@ -183,7 +187,7 @@ MIT.
 - [ ] **v0.2 — Cloud sources.** Google Drive and OneDrive Personal listings compared against local trees; OAuth 2.0 with bundled clients; multi-account support; trash-only cloud deletion with cross-source undo. **In progress.**
 - [ ] **v0.3 — Organizer.** Domain-aware `dc organize` (discover, review, apply) with PDF content classification, EXIF event clustering, cohesion preservation for albums, book series, git projects, and photo events, and an Unsorted safety net for uncertain classifications. **Next up.**
 - [x] **v0.4 — Project-tree aggregation.** Directory rollup for backup-folder collapse. Two copies of the same git repo / npm project / Cargo crate now surface as a single tree-diff entry instead of thousands of per-file matches. Discards trash the whole directory atomically; undo restores it wholesale. Ships with the `--min-project-similarity` CLI flag (default 0.90). **Shipped.**
-- [ ] **v0.5 — Cloud consolidation (`dc migrate`).** Copy files between clouds, verify by hash, then optionally trash on the source. **v0.5-a shipped**: `Source.upload` write protocol + `dc migrate plan` sub-command (planner only). Copy / verify / cleanup / undo land in v0.5-b. See [docs/migrate.md](docs/migrate.md).
+- [x] **v0.5 — Cloud consolidation (`dc migrate`).** Copy files between clouds, verify by hash, then optionally trash on the source. Four sub-commands (`plan`, `copy`, `verify`, `cleanup`) plus `undo`. Dry-run defaults, atomic manifest, post-upload hash verify with dest-trash-on-mismatch, cleanup refuses without verify. **Shipped.** See [docs/migrate.md](docs/migrate.md).
 - [ ] **v0.6 — Google Photos and iCloud Photos.** Unified photo metadata across sources for the v0.3 organizer's event clustering.
 - [ ] **v0.7 — Image near-duplicate.** Perceptual hash comparator plus thumbnails in the report.
 - [ ] **v0.8 — Audio and video near-duplicate.** Chromaprint fingerprints and keyframe pHash.
