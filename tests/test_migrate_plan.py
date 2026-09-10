@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
+
 from duplicate_cleaner.migrate.plan import (
     MIGRATE_PLAN_VERSION,
     ONEDRIVE_MAX_FILE_SIZE_BYTES,
@@ -238,6 +240,22 @@ def test_plan_respects_include_globs() -> None:
         "gdrive:personal:/a.pdf",
         "gdrive:personal:/c.pdf",
     }
+
+
+def test_plan_refuses_self_copy() -> None:
+    """Audit pass 15 finding #5: plan_migration refuses when source.id == dest.id.
+
+    Same-account migration cannot cross an ownership boundary and would
+    burn quota on a self-copy.  ``plan_migration`` raises ``ValueError``
+    up-front — the fake sources' ``list_files`` never fires.
+    """
+    src = _FakeSource(
+        "gdrive:personal",
+        [_rec("gdrive:personal", "a.pdf", cloud_file_id="A" * 22)],
+    )
+    dst = _FakeSource("gdrive:personal", [])
+    with pytest.raises(ValueError, match="same-account"):
+        plan_migration(src, dst)
 
 
 def test_plan_produces_valid_json_and_html(tmp_path: Path) -> None:

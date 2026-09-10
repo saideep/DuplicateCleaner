@@ -100,7 +100,7 @@ def undo_migration(
             # intentionally trashed. Mirrors apply/undo.py's null-trash-id
             # rejection (v0.2 sub-phase 5d invariant).
             if not entry.source_cloud_trash_id:
-                errors.append(
+                result.errors.append(
                     f"Refuse to restore source for {entry.source_path}: "
                     f"cleanup_done=True but source_cloud_trash_id is null — "
                     "manifest is corrupt or hand-edited; nothing to un-trash."

@@ -74,7 +74,7 @@ dc migrate plan --from gdrive:personal --to onedrive:main \
 ## Manifest states (what each row means after copy)
 
 - **pending** — the copy loop enqueued this entry but never got to it (crash mid-run). Recoverable via re-running `dc migrate copy --resume-from` against the same plan.
-- **done** — uploaded + hash verified (same-algo pairs) or optimistically accepted (cross-algo pairs; the destination's canonical BLAKE3 lands via `dc migrate verify --full`).
+- **done** — uploaded. Same-algo pairs land with `verified=True` on the copy-time hash match. Cross-algo pairs land with `verified=False` — the copy loop stamps a canonical `source_blake3` on the row so `dc migrate verify --full` can do a real byte-level compare against `dest_blake3` and promote the entry to `verified=True`.
 - **skipped** — non-copy plan action (defer / skip / plan-time error) OR a resume-time skip (prior manifest already marked this entry done).
 - **error** — the copy failed. `error_message` on the row names the cause: upload rejection, hash mismatch, drift, permission. A hash mismatch trashes the botched destination before flipping the state so the invariant "cloud discards go to cloud trash" holds even on the failure path.
 
@@ -85,7 +85,7 @@ Every invariant from `docs/AUDIT_LOG.md` is preserved:
 - **Dry-run default.** `dc migrate copy` / `cleanup` refuse to fire without `--commit`.
 - **Atomic manifest.** Every state transition is flushed via tempfile + fsync + `os.replace` + parent-dir fsync BEFORE the next entry is touched. A crash mid-run leaves a replayable artifact.
 - **Drift check before every upload.** Same semantics as the dedup mover — etag mismatch aborts the whole run.
-- **Post-upload hash verify.** Same-algo (both md5, both sha256, both blake3) → strict compare; mismatch trashes the destination and marks the entry `state="error"` BEFORE the source is touched. Cross-algo pairs (md5 gdrive → sha256 onedrive) are optimistically accepted at copy time; `dc migrate verify --full` canonicalises via BLAKE3 for the strict check.
+- **Post-upload hash verify.** Same-algo (both md5, both sha256, both blake3) → strict compare; mismatch trashes the destination and marks the entry `state="error"` BEFORE the source is touched. Cross-algo pairs (md5 gdrive → sha256 onedrive) are optimistically accepted at copy time with `verified=False`, but the copy loop tees the outgoing byte stream through BLAKE3 and stamps `source_blake3` on the manifest row. `dc migrate verify --full` then streams the destination through BLAKE3 as well, stamps `dest_blake3`, and compares the two — a real byte-level check even when the providers disagree on hash algo. Any mismatch demotes the entry to `verified=False` and cleanup refuses to trash the source.
 - **Cleanup refuses without verify.** Any `state="done"` entry with `verified=False` OR `verified_ts=None` raises `CleanupError` up-front, before any `move_to_trash` call fires. Points the operator at `dc migrate verify` for the fix.
 - **BYO OAuth only.** No bundled client id in the public repo.
 - **Cloud paths never `.resolve()`d.** Every source path in the manifest is opaque display data on cloud entries.

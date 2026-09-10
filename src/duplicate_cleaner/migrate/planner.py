@@ -56,7 +56,17 @@ def plan_migration(
     Any file whose size exceeds the per-file limit surfaces as
     ``action="error"`` with ``size_limit_hit=True`` so the plan reader can
     triage them separately from copy-eligible entries.
+
+    Refuses self-copy (``source.id == dest.id``) — same-account migration
+    never moves bytes across an ownership boundary and every downstream
+    tripwire assumes distinct ids.  Enforced here (planner) plus mirrored
+    in :func:`execute_migration` for defense-in-depth.
     """
+    if source.id == dest.id:
+        raise ValueError(
+            f"source_id and dest_id must differ; migration cannot be "
+            f"same-account (both are {source.id!r})."
+        )
     filt = filter_ if filter_ is not None else MigrationFilter()
     # Resolve the destination per-file cap.  The CLI hands us a GB float
     # (or None); we translate to bytes here.  A provider-derived default

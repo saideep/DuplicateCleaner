@@ -33,6 +33,8 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Project trees move atomically** (v0.4): `dc apply --commit` sends the entire discard directory to Trash via a single `send2trash` call. Cohesion is enforced structurally — every exact-duplicate group whose members are wholly contained inside a detected project root is removed from the report before `apply` sees it, so no per-file split of a project is representable. Undo restores the whole tree via `shutil.move` back from Trash. Tree discards additionally require the target to sit inside an `active_home` (defense-in-depth for whole-directory moves).
 - **Migration post-upload hash verify — mismatch trashes dest before source is touched** (v0.5-b): `dc migrate copy` compares `UploadResult.uploaded_hash` against `entry.source_hash` immediately after upload. Same-algo pairs (both md5, both sha256, both blake3) compare directly; a mismatch calls `dest.move_to_trash(...)` on the botched destination copy BEFORE the manifest state flips to `"error"` and BEFORE the source is touched. Cross-algo pairs are optimistically accepted at copy time; the strict check moves to `dc migrate verify --full`. The invariant guarantees the migration never leaves a corrupt destination copy live alongside an untouched source original.
 - **Migration cleanup refuses without verify** (v0.5-b): `dc migrate cleanup` iterates every `state="done"` entry up-front and raises `CleanupError` before any `Source.move_to_trash` call fires if any entry has `verified=False` OR `verified_ts=None`. Points the operator at `dc migrate verify`. Structural — a mid-batch failure on entry N cannot leave entries 1..(N-1) trashed against an unverified copy.
+- **Cross-algo copies persist a canonical BLAKE3 for strict verify** (v0.5-c): `dc migrate copy` tees the outgoing byte stream through BLAKE3 and stamps `source_blake3` on every successful manifest entry. `dc migrate verify --full` then streams the destination through BLAKE3 to compute `dest_blake3` and compares the two — a real byte-level integrity check even for cross-algo pairs (md5 gdrive → sha256 onedrive). Before v0.5-c, `--full` on a cross-algo pair only streamed the destination and discarded the result; the entry was flipped to `verified=True` on the strength of the etag check alone. Same-algo pairs still take the fast path (compared at copy time via `_hashes_match`); cross-algo pairs are the ones this invariant protects.
+- **Self-copy refusal** (v0.5-c): `plan_migration` raises `ValueError` and `execute_migration` raises `MigrationError` when `source_id == dest_id`. Same-account migration cannot cross an ownership boundary, would burn quota on a duplicate upload, and violates the assumption every downstream tripwire makes about distinct ids.
 
 ## Rejected alternatives (do not reopen without new info)
 
@@ -43,6 +45,53 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Perceptual near-dup ahead of organizer** — DROPPED sequencing. Reshuffled: organizer to v0.3, near-dup pushed to v0.7/v0.8.
 
 ## Round-by-round history
+
+### v0.5-c — migrate hardening bundle closing pass-15 deferrables (2026-09-10)
+
+Closes the six deferrable findings from audit pass 15 plus the two already-fixed blockers (undo cleanup_done null trash-id rejection, mover resume plan-mismatch guard).  All 455 tests pass (447 pre-existing + 8 new); `test_no_forbidden_calls.py` still green; ruff clean on every changed file; mypy `--strict` clean on the migrate package (pre-existing 3rd-party unused-ignore warnings in `cli.py` unchanged).
+
+Shipped:
+
+- `src/duplicate_cleaner/migrate/plan.py` — `MigrationManifestEntry` gains two new optional fields: `source_blake3: str | None = None` (stamped by the copy loop from a BLAKE3 tee over the outgoing byte stream) and `dest_blake3: str | None = None` (stamped by `verify --full` from a stream over the destination bytes).  Both default to `None` so legacy 0.5.0 manifests parse unchanged; manifest schema version stays `"0.5.0"` because the addition is additive.
+- `src/duplicate_cleaner/migrate/mover.py` — new helper `_blake3_tee(stream, hasher)` yields the stream unmodified while feeding each chunk into a caller-owned hasher.  `execute_migration` wraps the throttled source stream with the tee before handing it to `dst_source.upload(...)`, and stamps `source_blake3 = hasher.hexdigest()` on every successful entry alongside the existing dest ids.  Self-copy check (audit finding #5) added directly after the plan load: `plan.source_id == plan.dest_id` raises `MigrationError` before the pre-flight source lookup.
+- `src/duplicate_cleaner/migrate/planner.py` — `plan_migration` refuses `source.id == dest.id` with a `ValueError` before any `list_files()` call fires.  Mirrors the mover's guard for defense-in-depth so the plan artifact can never carry a self-copy shape.
+- `src/duplicate_cleaner/migrate/verify.py` — three related changes:
+  - Audit finding #4: `except Exception:` on the drift-check dispatch narrowed to `except SourceError:` (which covers `SourceDriftError` via inheritance).  A `KeyError` from a mis-shaped Graph response or `ValueError` from a bad etag parse now propagates and aborts the pass instead of silently flipping the entry to `verified=False` + `"dest etag drifted"`.
+  - Audit findings #3 / #8: `--full` mode now always persists `dest_blake3` (real cross-algo audit trail) and, when the entry carries `source_blake3` (post-v0.5-c copies), compares the two — a real byte-level compare on cross-algo pairs.  A mismatch demotes `verified=False` and stamps an error message naming both truncated hex digests.  The legacy bare-BLAKE3 comparison (local source origin) still fires when `source_blake3` is missing.  The dead "cache the destination BLAKE3 for a later audit" comment removed — `dest_blake3` is now a real persisted field, so the comment matched no code.
+- `docs/migrate.md` — safety recap + "manifest states" section updated to accurately describe what `verify --full` does for cross-algo pairs (real byte-level compare via `source_blake3` + `dest_blake3`, not aspirational).
+- New invariants added at the top of this document: "Cross-algo copies persist a canonical BLAKE3 for strict verify" + "Self-copy refusal".
+
+Tests shipped (all 8 net-new):
+
+- `tests/test_migrate_copy.py`:
+  - `test_copy_hash_mismatch_trashes_dest` — extended (audit finding #6): now asserts the ORDER of the trash call vs. the manifest state flip by reading the on-disk manifest inside a `dst.move_to_trash` side_effect and confirming the entry state is still `"pending"` at that instant.  Locks in "trash BEFORE manifest advance" as a structural test.
+  - `test_copy_refuses_self_copy` (audit finding #5) — `source_id == dest_id` raises `MigrationError` up-front, no upload fires.
+  - `test_copy_persists_source_blake3` (audit findings #3 / #7) — after a successful copy, `entry.source_blake3` equals `blake3.blake3(b"helloworld").hexdigest()` (the concatenation of the fake source's chunk stream).  Required updating `_FakeSource.upload` to consume the passed byte stream via a side_effect, matching real cloud uploads (which always drain the stream to build their wire request).
+  - `test_copy_cross_algo_marks_unverified_at_copy_time` (audit finding #7) — cross-algo pair (source md5 → uploaded sha256) ends `state="done"`, `verified=False`, `verified_ts=None`, `source_blake3` populated (64 hex chars) so a later `verify --full` has ground truth.  Destination never trashed.
+- `tests/test_migrate_verify.py`:
+  - `test_verify_full_mode_streams_dest` — extended: additionally asserts `dest_blake3` is now persisted on the happy path.
+  - `test_verify_propagates_unexpected_exceptions` (audit finding #4) — `check_drift` raising `KeyError` propagates unwrapped, and the manifest is NOT flipped to `verified=False`.
+  - `test_verify_full_cross_algo_matches_hashes` (audit finding #3) — cross-algo entry with matching `source_blake3 == dest_blake3` → `verified=True`.
+  - `test_verify_full_cross_algo_mismatch_marks_false` (audit finding #3) — `source_blake3 != dest_blake3` → `verified=False`, error message contains `"BLAKE3 mismatch"`.
+- `tests/test_migrate_plan.py`:
+  - `test_plan_refuses_self_copy` (audit finding #5) — `plan_migration(src, src)` raises `ValueError` before any `list_files()` call.
+- `tests/test_migrate_cleanup.py`:
+  - `test_cleanup_refuses_when_verified_false_after_cross_algo_copy` (audit finding #7) — simulates the manifest state a cross-algo copy leaves (`state="done"`, `verified=False`, `source_blake3` stamped) and asserts `cleanup_source_after_migration` raises `CleanupError` up-front.  Locks in the "cleanup refuses without verify" invariant against the cross-algo path.
+
+Also included: a NameError fix in `src/duplicate_cleaner/migrate/undo.py:103` — the pass-15 blocker fix used a bare `errors.append(...)` where `result.errors.append(...)` was intended.  The v0.5-b test `test_undo_refuses_cleanup_entry_with_null_source_cloud_trash_id` was failing at HEAD; now green.
+
+Invariants preserved (all AUDIT_LOG items above):
+
+- All 447 pre-existing tests still pass unchanged; 8 new tests added (455 total).
+- `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`.
+- BYO OAuth only — no bundled client id.
+- Cloud `Path` never `.resolve()`d in the new modules.
+- Manifest atomic-write pattern unchanged; the new `source_blake3` / `dest_blake3` fields are additive with `None` defaults, so legacy manifests round-trip cleanly through Pydantic.
+- Drift check runs BEFORE every upload; etag mismatch aborts the whole run.
+- Post-upload hash verify + trash-before-manifest-advance ordering both structurally locked in by tests.
+- `verify --full` no longer converts unexpected bugs into "drift" — real bugs propagate.
+
+**v0.5-c clears ship.**  Migrate hardening complete.  Ready for v0.6 (Google Photos + iCloud) or v0.7 (image near-dup).
 
 ### v0.5-b — combined Code Review + Security pass 15 (2026-09-10)
 

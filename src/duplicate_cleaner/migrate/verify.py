@@ -11,10 +11,12 @@ Two verification modes:
   detects post-upload drift.  A silent bit-flip on the provider side would
   not surface.
 - **Full mode (``--full`` in the CLI)** — additionally stream the destination
-  bytes through BLAKE3 and compare against the source's canonical hash.
-  Catches bit-flips at the cost of a full re-download per entry.  The
-  ``read_bytes`` iterator is consumed to a running BLAKE3 hash so peak
-  memory stays flat.
+  bytes through BLAKE3 and compare against the source's canonical BLAKE3
+  (``source_blake3`` stamped by the copy loop's outgoing byte tee).  Catches
+  bit-flips at the cost of a full re-download per entry.  Both source and
+  dest BLAKE3s persist on the entry so a cross-algo pair (md5 gdrive →
+  sha256 onedrive) gets a real byte-level integrity check rather than only
+  the etag round-trip.
 
 Every entry update is flushed atomically (tempfile + fsync + os.replace +
 parent-dir fsync) so an aborted verify leaves a correct partial manifest.
@@ -25,6 +27,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import blake3
 
@@ -74,11 +77,12 @@ def verify_migration(
     ``verified=True`` and ``verified_ts`` bumps to now.
 
     ``full=True`` additionally streams the destination bytes through BLAKE3
-    and compares against a canonical BLAKE3 for the source.  When the source
-    hash algo is not BLAKE3 (md5 / sha256), the source-side canonical hash
-    is not directly available on the manifest — full-mode falls back to
-    accepting the etag match but stamps a ``verified_full_hash`` on the
-    entry recording the destination's BLAKE3 so a later audit can compare.
+    and compares against ``entry.source_blake3`` (stamped by the copy loop's
+    outgoing byte tee).  When ``source_blake3`` is missing (legacy manifest
+    predating v0.5-c), falls back to the bare-BLAKE3 source hash if present
+    (local source origin); pure cross-algo pairs without a stamped source
+    BLAKE3 stay optimistically verified on the etag match but the destination
+    BLAKE3 is persisted for a later audit.
     """
     manifest = _load_manifest(manifest_path)
     result = VerifyResult()
@@ -163,9 +167,12 @@ def verify_migration(
                 f"Manifest at {manifest_path} reflects reality "
                 f"({result.verified} entry(ies) verified so far)."
             ) from exc
-        except Exception as exc:  # SourceDriftError + generic SourceError
-            # Any drift (etag mismatch) surfaces as ``verified=False`` — the
-            # cleanup step will refuse to trash the source.
+        except SourceError as exc:
+            # Audit pass 15 finding #4: narrow to SourceError (covers
+            # SourceDriftError + any not-yet-classified subclass) — anything
+            # else (KeyError from a mis-shaped Graph response, ValueError
+            # from a bad etag parse) propagates and aborts the pass so real
+            # bugs surface instead of being masked as "dest etag drifted".
             log.warning(
                 "Verify: drift or error for %s: %s",
                 entry.source_path,
@@ -185,6 +192,7 @@ def verify_migration(
         # Full mode: additionally stream the destination bytes for a
         # canonical BLAKE3.  Kept behind a flag because a bulk verify would
         # otherwise re-download every migrated byte.
+        extra_full: dict[str, Any] = {}
         if full:
             try:
                 h = blake3.blake3()
@@ -207,18 +215,28 @@ def verify_migration(
                 result.errors.append(f"{entry.source_path}: {exc}")
                 _flush_manifest(manifest, manifest_path)
                 continue
-            # Compare against the source's foreign hash when it happens to
-            # be BLAKE3 (local source).  Cross-algo pairs cache the
-            # destination BLAKE3 for a later audit but do not fail here —
-            # the etag check above already caught post-upload drift.
-            src_algo, src_hex = _split_algo_hash_local(entry.source_hash)
-            if src_algo == "blake3" and src_hex and src_hex != dest_blake3:
+            # Persist dest_blake3 regardless — cross-algo pairs at least get
+            # an audit trail; a mismatch below trashes the verified flag.
+            extra_full["dest_blake3"] = dest_blake3
+            # Prefer the copy-time source BLAKE3 tee (real byte-level check
+            # even on cross-algo pairs).  Legacy manifests without it fall
+            # back to a bare-BLAKE3 source hash (local source origin).
+            expected_blake3: str | None = None
+            if entry.source_blake3:
+                expected_blake3 = entry.source_blake3.lower()
+            else:
+                src_algo, src_hex = _split_algo_hash_local(entry.source_hash)
+                if src_algo == "blake3" and src_hex:
+                    expected_blake3 = src_hex
+            if expected_blake3 and expected_blake3 != dest_blake3:
                 manifest.entries[i] = entry.model_copy(
                     update={
                         "verified": False,
+                        "dest_blake3": dest_blake3,
                         "error_message": (
                             f"verify --full BLAKE3 mismatch: "
-                            f"src={src_hex[:12]} dst={dest_blake3[:12]}"
+                            f"src={expected_blake3[:12]} "
+                            f"dst={dest_blake3[:12]}"
                         ),
                     }
                 )
@@ -234,6 +252,7 @@ def verify_migration(
                 "verified": True,
                 "verified_ts": datetime.now(UTC).timestamp(),
                 "error_message": None,
+                **extra_full,
             }
         )
         result.verified += 1

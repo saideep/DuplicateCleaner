@@ -34,7 +34,14 @@ from duplicate_cleaner.sources.base import (
 
 
 class _FakeSource:
-    """Fake Source with configurable behaviour for every method the mover uses."""
+    """Fake Source with configurable behaviour for every method the mover uses.
+
+    ``upload`` consumes the passed byte stream so any producer-side tee
+    (e.g. the BLAKE3 hasher in ``execute_migration``) sees the bytes —
+    real cloud uploads always consume the stream to build their request.
+    Consumed bytes are captured on ``consumed_upload_bytes`` for tests
+    that need to assert on what was uploaded.
+    """
 
     def __init__(
         self,
@@ -46,6 +53,8 @@ class _FakeSource:
         self.is_read_only_scan = is_read_only_scan
         self.check_drift = MagicMock(return_value=None)
         self.upload = MagicMock()
+        self.upload.side_effect = self._upload_side_effect
+        self.consumed_upload_bytes: bytes = b""
         self.move_to_trash = MagicMock(
             return_value=TrashedLocation(
                 source_id=source_id,
@@ -55,6 +64,13 @@ class _FakeSource:
             )
         )
         self.restore_from_trash = MagicMock(return_value=None)
+
+    def _upload_side_effect(
+        self, dest_path: str, stream: Iterator[bytes], size: int
+    ) -> UploadResult:
+        # Drain the stream so BLAKE3 tees / throttle wrappers see the bytes.
+        self.consumed_upload_bytes = b"".join(stream)
+        return self.upload.return_value
 
     def read_bytes(
         self, record: object, chunk_size: int = 1 << 20
@@ -151,15 +167,25 @@ def test_copy_commit_uploads_and_manifests(tmp_path: Path) -> None:
 
     # The upload was handed an iterator that produced the fake bytes.
     args, _ = dst.upload.call_args
-    dest_path, byte_stream, size = args
+    dest_path, _byte_stream, size = args
     assert dest_path == "a.pdf"
     assert size == 10
-    joined = b"".join(byte_stream)
-    assert joined == b"helloworld"
+    # The fake upload's side_effect drained the stream — assert on what was
+    # actually consumed (real cloud uploads always drain to build the wire
+    # request; matching that here also lets the BLAKE3 tee see the bytes).
+    assert dst.consumed_upload_bytes == b"helloworld"
 
 
 def test_copy_hash_mismatch_trashes_dest(tmp_path: Path) -> None:
-    """Same-algo hash mismatch → dest trashed, source untouched, state='error'."""
+    """Same-algo hash mismatch → dest trashed BEFORE manifest state flips to error.
+
+    Audit pass 15 finding #6: locks in the ORDER (trash first, then manifest
+    advance) so a future refactor that flipped state to 'error' before
+    trashing the botched dest would fail this test.  Reads the on-disk
+    manifest inside the trash side_effect and asserts the state is still
+    'pending' at that instant — after execute_migration returns, state is
+    'error' and dest.move_to_trash was called exactly once.
+    """
     plan = _make_plan(_copy_entry(source_hash="md5:" + "a" * 32))
     plan_path = _write_plan(tmp_path, plan)
     manifest_path = tmp_path / "manifest.json"
@@ -171,6 +197,24 @@ def test_copy_hash_mismatch_trashes_dest(tmp_path: Path) -> None:
         uploaded_hash_algo="md5",
         uploaded_hash="c" * 32,  # different from source_hash
     )
+
+    # Capture the entry state at the moment dst.move_to_trash fires.
+    # If the mover advanced state to 'error' BEFORE trashing, this list will
+    # contain 'error' instead of 'pending' — the assertion below fails.
+    state_at_trash: list[str] = []
+
+    def _record_state_then_trash(record: object) -> TrashedLocation:
+        current = json.loads(manifest_path.read_text())
+        state_at_trash.append(current["entries"][0]["state"])
+        return TrashedLocation(
+            source_id=dst.id,
+            original_path="",
+            cloud_file_id="trashed",
+            cloud_trash_id="trashed",
+        )
+
+    dst.move_to_trash.side_effect = _record_state_then_trash
+
     result = execute_migration(
         plan_path,
         manifest_path,
@@ -182,6 +226,9 @@ def test_copy_hash_mismatch_trashes_dest(tmp_path: Path) -> None:
     dst.move_to_trash.assert_called_once()
     trash_arg = dst.move_to_trash.call_args.args[0]
     assert getattr(trash_arg, "cloud_file_id", None) == "DST_WRONG"
+    # Ordering lock: at the moment of trash the manifest still reflects
+    # 'pending'; the flip to 'error' happens strictly AFTER.
+    assert state_at_trash == ["pending"]
     # Source never trashed.
     src.move_to_trash.assert_not_called()
     manifest = MigrationManifest.model_validate_json(manifest_path.read_text())
@@ -451,3 +498,110 @@ def test_copy_manifest_json_shape(tmp_path: Path) -> None:
     assert raw["manifest_version"] == "0.5.0"
     assert raw["plan_source_id"] == "gdrive:src"
     assert raw["plan_dest_id"] == "gdrive:dst"
+
+
+def test_copy_refuses_self_copy(tmp_path: Path) -> None:
+    """Audit pass 15 finding #5: source_id == dest_id refuses upfront.
+
+    Same-account migration cannot cross an ownership boundary and would
+    burn quota on a self-copy.  The tripwire fires before any HTTP call.
+    """
+    plan = MigrationPlan(
+        source_id="gdrive:same",
+        dest_id="gdrive:same",
+        entries=[
+            MigrationEntry(
+                source_id="gdrive:same",
+                source_path="gdrive:same://a.pdf",
+                source_size=10,
+                dest_expected_path="a.pdf",
+                action="copy",
+                reason="copy",
+            )
+        ],
+    )
+    plan_path = _write_plan(tmp_path, plan)
+    manifest_path = tmp_path / "manifest.json"
+    src = _FakeSource("gdrive:same")
+    with pytest.raises(MigrationError, match="same-account"):
+        execute_migration(
+            plan_path,
+            manifest_path,
+            commit=True,
+            sources_by_id={"gdrive:same": src},
+        )
+    src.upload.assert_not_called()
+
+
+def test_copy_persists_source_blake3(tmp_path: Path) -> None:
+    """Audit pass 15 finding #7 / L2: BLAKE3 tee runs during upload.
+
+    After a copy, ``source_blake3`` on the manifest entry equals the BLAKE3
+    hex of the streamed bytes.  This holds regardless of whether the pair
+    is same-algo or cross-algo — the tee is unconditional so any future
+    ``dc migrate verify --full`` can byte-compare.
+    """
+    import blake3
+
+    plan = _make_plan(_copy_entry(source_hash="md5:" + "b" * 32))
+    plan_path = _write_plan(tmp_path, plan)
+    manifest_path = tmp_path / "manifest.json"
+    src = _FakeSource("gdrive:src")
+    dst = _FakeSource("gdrive:dst")
+    dst.upload.return_value = UploadResult(
+        cloud_file_id="DST_ID",
+        etag="DST_ID:t",
+        uploaded_hash_algo="md5",
+        uploaded_hash="b" * 32,
+    )
+    execute_migration(
+        plan_path,
+        manifest_path,
+        commit=True,
+        sources_by_id={"gdrive:src": src, "gdrive:dst": dst},
+    )
+    manifest = MigrationManifest.model_validate_json(manifest_path.read_text())
+    e = manifest.entries[0]
+    # _FakeSource.read_bytes yields b"hello" then b"world".
+    expected = blake3.blake3(b"helloworld").hexdigest()
+    assert e.source_blake3 == expected
+
+
+def test_copy_cross_algo_marks_unverified_at_copy_time(tmp_path: Path) -> None:
+    """Audit pass 15 finding #7: cross-algo pair ends state='done', verified=False.
+
+    Source hash is ``md5:``; dest reports ``sha256:``.  The two cannot be
+    compared cheaply at copy time so the entry stays ``verified=False`` +
+    ``verified_ts=None`` — ``dc migrate cleanup`` will refuse to trash the
+    source until ``dc migrate verify --full`` runs.  ``source_blake3`` is
+    populated by the BLAKE3 tee so ``verify --full`` has ground truth.
+    """
+    plan = _make_plan(_copy_entry(source_hash="md5:" + "a" * 32))
+    plan_path = _write_plan(tmp_path, plan)
+    manifest_path = tmp_path / "manifest.json"
+    src = _FakeSource("gdrive:src")
+    dst = _FakeSource("gdrive:dst")
+    dst.upload.return_value = UploadResult(
+        cloud_file_id="DST_CROSS",
+        etag="DST_CROSS:t",
+        uploaded_hash_algo="sha256",  # cross-algo pair
+        uploaded_hash="d" * 64,
+    )
+    result = execute_migration(
+        plan_path,
+        manifest_path,
+        commit=True,
+        sources_by_id={"gdrive:src": src, "gdrive:dst": dst},
+    )
+    assert result.copied == 1
+    assert result.errored == 0
+    dst.move_to_trash.assert_not_called()
+    manifest = MigrationManifest.model_validate_json(manifest_path.read_text())
+    e = manifest.entries[0]
+    assert e.state == "done"
+    assert e.verified is False
+    assert e.verified_ts is None
+    # source_blake3 is populated so verify --full has ground truth for the
+    # cross-algo pair.
+    assert e.source_blake3 is not None
+    assert len(e.source_blake3) == 64  # BLAKE3 hex

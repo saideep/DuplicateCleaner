@@ -142,6 +142,15 @@ class MigrationManifestEntry(BaseModel):
     - ``cleanup_done`` / ``source_cloud_trash_id`` — populated by
       ``cleanup_source_after_migration`` when the source's original is
       trashed.  ``undo_migration`` reads both to reverse the cleanup.
+    - ``source_blake3`` — stamped by the copy loop from a BLAKE3 tee over
+      the outgoing byte stream.  Provides a canonical hash for cross-algo
+      pairs (md5 gdrive → sha256 onedrive) so ``dc migrate verify --full``
+      can do a real byte-level compare against ``dest_blake3`` instead of
+      trusting only the etag.
+    - ``dest_blake3`` — stamped by ``dc migrate verify --full`` from a
+      streaming BLAKE3 over the destination bytes.  Compared against
+      ``source_blake3`` (when present); persisted regardless as an audit
+      trail even when only one side of the pair carries BLAKE3.
     - ``error_message`` retains the last failure reason so a run log stays
       self-contained even after the CLI process exits.
     """
@@ -162,6 +171,8 @@ class MigrationManifestEntry(BaseModel):
     dest_etag: str | None = None
     uploaded_hash_algo: str | None = None
     uploaded_hash: str | None = None
+    source_blake3: str | None = None
+    dest_blake3: str | None = None
     verified: bool = False
     verified_ts: float | None = None
     cleanup_done: bool = False

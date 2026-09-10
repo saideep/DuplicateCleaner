@@ -136,3 +136,31 @@ def test_cleanup_commit_trashes_sources(tmp_path: Path) -> None:
     for e in manifest.entries:
         assert e.cleanup_done is True
         assert e.source_cloud_trash_id == "TRASHED_ID"
+
+
+def test_cleanup_refuses_when_verified_false_after_cross_algo_copy(
+    tmp_path: Path,
+) -> None:
+    """Audit pass 15 finding #7: cross-algo copy → cleanup refuses without verify.
+
+    ``dc migrate copy`` leaves cross-algo entries ``verified=False`` even
+    on a successful upload — the byte-level check is deferred to
+    ``dc migrate verify --full``.  ``cleanup`` MUST refuse to trash the
+    source in this state so a hand-crafted "skip verify" workflow cannot
+    silently trash the source original against an unverified copy.
+    """
+    # Simulate the state a cross-algo copy leaves behind: state='done',
+    # verified=False, verified_ts=None, source_blake3 stamped for future
+    # verify --full.
+    entry = _done_entry("cross.pdf", verified=False, verified_ts=None).model_copy(
+        update={"source_blake3": "b" * 64},
+    )
+    manifest_path = _write_manifest(tmp_path, [entry])
+    src = _FakeSrc()
+    with pytest.raises(CleanupError, match="verify"):
+        cleanup_source_after_migration(
+            manifest_path,
+            commit=True,
+            sources_by_id={"gdrive:src": src},
+        )
+    src.move_to_trash.assert_not_called()

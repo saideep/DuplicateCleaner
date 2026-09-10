@@ -44,6 +44,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+import blake3
+
 from duplicate_cleaner.migrate.plan import (
     MigrationEntryState,
     MigrationManifest,
@@ -147,6 +149,22 @@ def _load_manifest(manifest_path: Path) -> MigrationManifest:
     for the dedup manifest.
     """
     return MigrationManifest.model_validate_json(manifest_path.read_text())
+
+
+def _blake3_tee(
+    byte_stream: Iterator[bytes],
+    hasher: Any,
+) -> Iterator[bytes]:
+    """Yield ``byte_stream`` unmodified while updating ``hasher`` on each chunk.
+
+    Lets the upload path capture a canonical BLAKE3 of the source bytes
+    without a second read — the destination gets the same bytes and the
+    hasher's final ``hexdigest()`` becomes the manifest's ``source_blake3``.
+    """
+    for chunk in byte_stream:
+        if chunk:
+            hasher.update(chunk)
+        yield chunk
 
 
 def _throttled_stream(
@@ -272,6 +290,15 @@ def execute_migration(
     - Post-upload hash mismatch: destination trashed, source untouched.
     """
     plan = MigrationPlan.model_validate_json(plan_path.read_text())
+
+    # Audit pass 15 finding #5: refuse self-copy. Same-account migration is
+    # never useful (bytes never change owners, quota gets burned twice) and
+    # every downstream tripwire assumes source_id != dest_id.
+    if plan.source_id == plan.dest_id:
+        raise MigrationError(
+            f"Refusing to migrate: source_id and dest_id must differ; "
+            f"migration cannot be same-account (both are {plan.source_id!r})."
+        )
 
     resume_done_by_path: dict[str, MigrationManifestEntry] = {}
     if resume_from is not None:
@@ -421,13 +448,18 @@ def execute_migration(
             _flush_manifest(manifest, manifest_path)
             continue
 
-        # 2. Stream bytes source → optional throttle → dest.upload.
+        # 2. Stream bytes source → optional throttle → BLAKE3 tee → dest.upload.
+        # The tee hashes the outgoing bytes so cross-algo pairs get a canonical
+        # BLAKE3 stamped on the manifest — ``dc migrate verify --full`` then
+        # does a real byte-level compare instead of trusting only the etag.
+        src_blake3_hasher = blake3.blake3()
         try:
             byte_stream = src_source.read_bytes(record)
             throttled = _throttled_stream(byte_stream, max_bandwidth_mbps)
+            hashed = _blake3_tee(throttled, src_blake3_hasher)
             upload_result: UploadResult = dst_source.upload(
                 entry.dest_expected_path,
-                throttled,
+                hashed,
                 int(entry.source_size),
             )
         except (SourceAuthError, SourceRateLimitError) as exc:
@@ -528,7 +560,8 @@ def execute_migration(
             continue
 
         # 4. Success (same-algo match OR cross-algo optimistic).  Stamp the
-        # entry and flush.
+        # entry and flush.  ``source_blake3`` lands regardless so a later
+        # ``dc migrate verify --full`` can byte-compare cross-algo pairs.
         verified_now = datetime.now(UTC).timestamp() if match_verdict else None
         manifest.entries[i] = entry.model_copy(
             update={
@@ -537,6 +570,7 @@ def execute_migration(
                 "dest_etag": upload_result.etag,
                 "uploaded_hash": upload_result.uploaded_hash,
                 "uploaded_hash_algo": upload_result.uploaded_hash_algo,
+                "source_blake3": src_blake3_hasher.hexdigest(),
                 "verified": bool(match_verdict),
                 "verified_ts": verified_now,
                 "error_message": None,

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import blake3  # type: ignore[import-untyped]
+import pytest
 
 from duplicate_cleaner.migrate.mover import _flush_manifest
 from duplicate_cleaner.migrate.plan import (
@@ -132,3 +133,86 @@ def test_verify_full_mode_streams_dest(tmp_path: Path) -> None:
     manifest = MigrationManifest.model_validate_json(manifest_path.read_text())
     e = manifest.entries[0]
     assert e.verified is True
+    # ``dest_blake3`` persisted as an audit trail even on the happy path.
+    assert e.dest_blake3 == src_hex
+
+
+def test_verify_propagates_unexpected_exceptions(tmp_path: Path) -> None:
+    """Audit pass 15 finding #4: KeyError from check_drift propagates.
+
+    A real bug in the source implementation (e.g. mis-shaped Graph response
+    triggering a KeyError, or a bad etag parse raising ValueError) must NOT
+    be silently converted into ``verified=False`` + ``"dest etag drifted"``.
+    The exception propagates and aborts the verify pass so the bug surfaces.
+    """
+    manifest_path = _write_manifest(tmp_path, [_done_entry()])
+    dst = _FakeDst()
+    dst.check_drift.side_effect = KeyError("mis-shaped response")
+    with pytest.raises(KeyError):
+        verify_migration(
+            manifest_path,
+            sources_by_id={"gdrive:src": MagicMock(), "gdrive:dst": dst},
+        )
+    # Manifest was NOT flipped to verified=False — the bug bubbles.
+    manifest = MigrationManifest.model_validate_json(manifest_path.read_text())
+    e = manifest.entries[0]
+    assert e.verified is True  # untouched from the seed
+    assert e.error_message is None
+
+
+def test_verify_full_cross_algo_matches_hashes(tmp_path: Path) -> None:
+    """Audit pass 15 finding #3 / L2: cross-algo pair verifies via BLAKE3.
+
+    Source hash is ``md5:``; source_blake3 stamped at copy time equals the
+    destination bytes' BLAKE3 — ``dc migrate verify --full`` confirms
+    ``verified=True`` on the strength of the real byte-level compare.
+    """
+    payload = b"payload bytes for cross-algo verify"
+    canonical = blake3.blake3(payload).hexdigest()
+    entry = _done_entry(source_hash="md5:" + "a" * 32).model_copy(
+        update={"source_blake3": canonical, "verified": False}
+    )
+    manifest_path = _write_manifest(tmp_path, [entry])
+    dst = _FakeDst()
+    dst._bytes = payload
+    result = verify_migration(
+        manifest_path,
+        sources_by_id={"gdrive:src": MagicMock(), "gdrive:dst": dst},
+        full=True,
+    )
+    assert result.verified == 1
+    manifest = MigrationManifest.model_validate_json(manifest_path.read_text())
+    e = manifest.entries[0]
+    assert e.verified is True
+    assert e.dest_blake3 == canonical
+    assert e.source_blake3 == canonical
+
+
+def test_verify_full_cross_algo_mismatch_marks_false(tmp_path: Path) -> None:
+    """Audit pass 15 finding #3 / L2: cross-algo BLAKE3 mismatch → verified=False.
+
+    source_blake3 stamped at copy time differs from what the destination
+    bytes now hash to — a real bit-flip.  ``verify --full`` demotes the
+    entry to ``verified=False`` and stamps an error message naming both
+    truncated hex digests.
+    """
+    dest_payload = b"corrupted destination bytes"
+    wrong_dest_hex = blake3.blake3(dest_payload).hexdigest()
+    stamped_source_hex = blake3.blake3(b"original source bytes").hexdigest()
+    entry = _done_entry(source_hash="md5:" + "a" * 32).model_copy(
+        update={"source_blake3": stamped_source_hex, "verified": False}
+    )
+    manifest_path = _write_manifest(tmp_path, [entry])
+    dst = _FakeDst()
+    dst._bytes = dest_payload
+    result = verify_migration(
+        manifest_path,
+        sources_by_id={"gdrive:src": MagicMock(), "gdrive:dst": dst},
+        full=True,
+    )
+    assert result.errored == 1
+    manifest = MigrationManifest.model_validate_json(manifest_path.read_text())
+    e = manifest.entries[0]
+    assert e.verified is False
+    assert e.dest_blake3 == wrong_dest_hex
+    assert e.error_message and "BLAKE3 mismatch" in e.error_message
