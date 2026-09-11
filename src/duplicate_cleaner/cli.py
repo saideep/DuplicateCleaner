@@ -870,6 +870,12 @@ def scan(
     # TTL default so warm entries survive while the table cannot grow
     # without bound after a long stretch without ``dc cache clear``.
     store.purge_stale_phashes(max_age_days=cloud_hash_ttl_days)
+    # v0.8: same sweep for audio Chromaprint fingerprints and video
+    # keyframe-pHash signatures.  Without this the two new v0.8 cache
+    # tables grew unbounded — the invariant was defined (see AUDIT_LOG
+    # §E.2) but the wiring was missing until audit pass 17.
+    store.purge_stale_audio_fingerprints(max_age_days=cloud_hash_ttl_days)
+    store.purge_stale_video_signatures(max_age_days=cloud_hash_ttl_days)
 
     file_count = 0
     archive_paths: list[Path] = []

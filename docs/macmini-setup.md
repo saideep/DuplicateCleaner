@@ -36,10 +36,10 @@ What each one is for:
 
 - `python@3.12` — the interpreter DuplicateCleaner targets. Pinned to the 3.12.x series.
 - `uv` — the package and virtual environment manager used to install and lock Python dependencies. Fast and deterministic.
-- `chromaprint` — the C library that backs `pyacoustid` for audio fingerprinting. **Only required once v0.5 (audio near-duplicate) ships. Safe to skip for v0.1.**
-- `ffmpeg` — used to extract video keyframes for video near-duplicate comparison. **Only required once v0.5 ships. Safe to skip for v0.1.**
+- `chromaprint` — C library backing `pyacoustid`. **Required for audio near-duplicate detection (v0.8).** Safe to skip if you don't care about music/podcast dedup.
+- `ffmpeg` — extracts video keyframes for video near-duplicate comparison (v0.8). **Required for video near-dup.** Safe to skip if you don't scan large video libraries.
 
-If you want the minimum install for v0.1, run:
+Minimum install (exact dedup + image near-dup + organize + migrate + cloud sources — no audio/video near-dup):
 
 ```shell
 brew install python@3.12 uv
@@ -213,4 +213,4 @@ macOS ships its own Python, which is not what you want. Always invoke DuplicateC
 - Python: 3.12.x (see `requires-python = ">=3.12,<3.13"` in `pyproject.toml`).
 - macOS: 15 Sequoia or later.
 - Python package versions: pinned via `pyproject.toml` and locked in `uv.lock`. Do not edit either file by hand.
-- Homebrew formulae: latest stable at install time. Chromaprint and ffmpeg are only used by the v0.5 audio and video comparators; their exact versions do not matter for v0.1.
+- Homebrew formulae: latest stable at install time. Chromaprint and ffmpeg are only invoked by v0.8's audio + video near-dup comparators; their exact versions do not matter as long as `fpcalc` and `ffmpeg` binaries are found at their standard Homebrew paths (`/opt/homebrew/bin/` on Apple Silicon, `/usr/local/bin/` on Intel).

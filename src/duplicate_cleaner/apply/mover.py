@@ -294,23 +294,11 @@ def plan_moves(report: Report) -> list[tuple[Path, int, float, str]]:
         # through the local file trash loop.
         if g.kind == "tree":
             continue
-        # v0.7: image-near-dup groups are file-scoped and flow through
-        # the same rail as ``exact`` groups — fall through into the
-        # per-member loop below.
-        # v0.8: audio-near-dup and video-near-dup groups follow the exact
-        # same shape (single-file discards via send2trash) — fall through
-        # into the same per-member loop as image-near-dup and exact.
-        if g.kind == "audio-near-dup":
-            # Explicit branch documenting the audio-near-dup routing so a
-            # future refactor cannot accidentally divert audio groups
-            # into a directory-scoped rail (there is none — audio-near-dup
-            # discards are single-file only).
-            pass
-        elif g.kind == "video-near-dup":
-            # Same as the audio branch: explicit no-op branch to document
-            # that video-near-dup discards are single-file only and share
-            # the send2trash rail with exact / image-near-dup.
-            pass
+        # v0.7 / v0.8: image-near-dup, audio-near-dup, and video-near-dup
+        # groups all flow through the same file-scoped ``send2trash``
+        # rail as ``kind="exact"`` groups.  The dispatch is uniform per
+        # non-tree group — see the class docstring and
+        # ``schema.py::GroupKind`` for the documented contract.
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
                 continue

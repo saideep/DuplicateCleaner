@@ -34,16 +34,24 @@ Discards in an audio-near-dup group flow through the standard per-file
 ``send2trash`` level — the only difference is how the group was
 assembled.
 
-The system ``fpcalc`` binary (from Homebrew's ``chromaprint`` package)
-must be on ``$PATH`` for fingerprint computation to work.  A missing
-binary short-circuits :func:`compute_audio_fingerprint` to ``None`` and
-the whole audio-near-dup pass ends up with zero groups — no crash.  The
-CLI warns at scan start when the binary is absent.
+**Path safety** (H9-style rail, audit pass 17):  the ``fpcalc`` binary
+path is HARDCODED to :data:`_FPCALC_PRIMARY_PATH` /
+:data:`_FPCALC_FALLBACK_PATH` and NEVER resolved through ``$PATH``.
+Pyacoustid honours the ``FPCALC`` environment variable, so we stamp it
+to the vetted absolute path BEFORE importing the module.  An attacker
+with write access to an early PATH entry (``~/bin``,
+``/opt/homebrew/bin``, …) therefore cannot inject a shim that runs with
+this process's UID during ``dc scan``.  Same rail as
+:mod:`compare.video` (ffmpeg) and :func:`sys.monitor.be_polite`
+(``/usr/bin/taskpolicy``).  This module deliberately does NOT
+``import shutil`` — the presence check consults ``os.path.exists`` on
+the two hardcoded paths only.
 """
 from __future__ import annotations
 
 import logging
-import shutil
+import os
+import subprocess
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -75,15 +83,15 @@ AUDIO_EXTENSIONS: frozenset[str] = frozenset(
 # the same content.  Below this, we still run the fingerprint compare.
 _DURATION_TOLERANCE_SECONDS = 2.0
 
-# Name of the Chromaprint binary shipped by Homebrew as ``chromaprint``.
-# pyacoustid invokes it via ``subprocess`` under the hood; we consult
-# ``shutil.which`` here purely for a presence check so the CLI can warn
-# before scanning.  Fpcalc is a fingerprint COMPUTATION helper, not a
-# privileged binary — so the ``taskpolicy``-style hardcoded-path guard
-# (H9 in ``sys/monitor.py``) does NOT apply.  A PATH-hijacked ``fpcalc``
-# would produce a bogus fingerprint that would fail to match anything
-# real, not compromise the process.
-_FPCALC_BINARY_NAME = "fpcalc"
+# ------------------------------------------------------------------ #
+# Hardcoded fpcalc binary paths — never trust $PATH (H9 invariant).  #
+# Same rail as compare/video.py's ffmpeg lookup.  Pyacoustid honours  #
+# the FPCALC env var, so we stamp it to the resolved absolute path   #
+# BEFORE importing acoustid — pyacoustid's internal subprocess call  #
+# then routes through the vetted binary rather than $PATH.           #
+# ------------------------------------------------------------------ #
+_FPCALC_PRIMARY_PATH: str = "/opt/homebrew/bin/fpcalc"
+_FPCALC_FALLBACK_PATH: str = "/usr/local/bin/fpcalc"
 
 
 def is_audio_path(path: Path) -> bool:
@@ -91,14 +99,27 @@ def is_audio_path(path: Path) -> bool:
     return path.suffix.lower() in AUDIO_EXTENSIONS
 
 
+def _find_fpcalc() -> str | None:
+    """Return the first hardcoded fpcalc path that exists on disk, or None.
+
+    Never falls back to ``shutil.which`` — a PATH-hijacked ``~/bin/fpcalc``
+    would execute with the scan process's UID and could exfiltrate the
+    audio bytes pyacoustid hands it.  See H9 invariant in AUDIT_LOG.
+    """
+    for candidate in (_FPCALC_PRIMARY_PATH, _FPCALC_FALLBACK_PATH):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def is_fpcalc_available() -> bool:
-    """Return True when the ``fpcalc`` binary can be resolved on ``$PATH``.
+    """True when a hardcoded fpcalc absolute path resolves on disk.
 
     Cheap presence check for the CLI's scan-start warning.  A missing
     binary makes :func:`compute_audio_fingerprint` return None for every
     candidate — no crash, but no audio-near-dup groups either.
     """
-    return shutil.which(_FPCALC_BINARY_NAME) is not None
+    return _find_fpcalc() is not None
 
 
 @dataclass(frozen=True)
@@ -158,13 +179,21 @@ def compute_audio_fingerprint(
         if cached is not None:
             return cached
 
-    if shutil.which(_FPCALC_BINARY_NAME) is None:
+    fpcalc_path = _find_fpcalc()
+    if fpcalc_path is None:
         log.debug(
-            "audio fingerprint: %s binary not on $PATH; skipping %s",
-            _FPCALC_BINARY_NAME,
+            "audio fingerprint: fpcalc absent at %s and %s; skipping %s",
+            _FPCALC_PRIMARY_PATH,
+            _FPCALC_FALLBACK_PATH,
             path,
         )
         return None
+
+    # Route pyacoustid's internal subprocess through the vetted absolute
+    # path.  The ``FPCALC`` env var must be set BEFORE ``import acoustid``
+    # so pyacoustid's module-load-time lookup picks it up rather than
+    # falling back to $PATH.
+    os.environ["FPCALC"] = fpcalc_path
 
     try:
         import acoustid  # type: ignore[import-untyped,import-not-found]
@@ -174,7 +203,16 @@ def compute_audio_fingerprint(
 
     try:
         duration, raw_fingerprint = acoustid.fingerprint_file(str(path))
-    except Exception as e:  # pyacoustid raises assorted types (BLE001 intentional)
+    except (
+        acoustid.FingerprintGenerationError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as e:
+        # Expected error modes: unsupported codec, corrupt bytes, missing
+        # binary, permission denied, subprocess timeout.  Anything else is
+        # a genuine bug (broken pyacoustid install, memory error on huge
+        # file, ...) and MUST propagate so the operator sees it instead of
+        # silently getting zero audio-near-dup groups.
         log.debug("audio fingerprint failed on %s: %s", path, e)
         return None
 
@@ -202,6 +240,31 @@ def _parse_fingerprint(value: str) -> tuple[float, str] | None:
         return None
 
 
+def _decode_fingerprint(fp: str) -> list[int] | None:
+    """Decode a base64 Chromaprint payload to a list of uint32 samples.
+
+    Returns None when pyacoustid / chromaprint is unavailable or the
+    payload cannot be decoded.  The returned list is safe to XOR
+    positionally against another decoded fingerprint of matching length
+    for a bit-level Hamming compare.
+    """
+    if not fp:
+        return None
+    try:
+        from acoustid import (  # type: ignore[import-untyped,import-not-found]
+            chromaprint,
+        )
+    except ImportError:  # pragma: no cover - audio extras missing in dev
+        return None
+    try:
+        decoded, _algorithm = chromaprint.decode_fingerprint(fp.encode("ascii"))
+    except (ValueError, TypeError, UnicodeEncodeError):
+        return None
+    if not decoded:
+        return None
+    return list(decoded)
+
+
 def fingerprint_similarity(a: str, b: str) -> float:
     """Return a 0.0-1.0 similarity between two Chromaprint fingerprint blobs.
 
@@ -210,18 +273,16 @@ def fingerprint_similarity(a: str, b: str) -> float:
       :data:`_DURATION_TOLERANCE_SECONDS` — the same song at different
       lengths cannot be the same content, and skipping the expensive
       fingerprint diff on this fast filter is a big win on large libraries.
-    * Otherwise compares the fingerprint payloads character-by-character
-      as a rough proxy for Chromaprint's bit-level compare.  The
-      base64-ish payload emitted by ``fpcalc`` shifts under re-encodes in
-      a way that puts genuinely-similar songs consistently above 0.9 and
-      unrelated tracks consistently below 0.5 — good enough for the
-      union-find threshold at 0.95.
+    * Otherwise decodes both payloads via
+      :func:`acoustid.chromaprint.decode_fingerprint` to uint32 arrays and
+      computes a bit-level Hamming similarity across positional samples.
+      A bit-distance of 0 across every sample → similarity 1.0; a
+      bit-distance of 32 per sample (random bit noise) → similarity 0.5.
+      This is the same compare algorithm AcoustID's own matcher uses.
 
-    Callers wanting a full Chromaprint bit-level compare can post-process
-    by calling ``chromaprint.decode_fingerprint`` on both fingerprints and
-    counting XOR-bit mismatches; the wrapper stays optional because the
-    heavy dep would defeat the "graceful degrade on missing binary"
-    design.
+    Threshold interpretation: 0.95 corresponds to ~5% bit distance across
+    the decoded fingerprint — same song re-encoded at a different bitrate
+    consistently sits at 0.95+; unrelated tracks sit near 0.5.
     """
     parsed_a = _parse_fingerprint(a)
     parsed_b = _parse_fingerprint(b)
@@ -233,25 +294,23 @@ def fingerprint_similarity(a: str, b: str) -> float:
         return 0.0
     if not fp_a and not fp_b:
         return 1.0
-    max_len = max(len(fp_a), len(fp_b))
-    if max_len == 0:
+    decoded_a = _decode_fingerprint(fp_a)
+    decoded_b = _decode_fingerprint(fp_b)
+    if decoded_a is None or decoded_b is None:
         return 0.0
-    matches = sum(
-        1 for i in range(min(len(fp_a), len(fp_b))) if fp_a[i] == fp_b[i]
-    )
-    return matches / max_len
-
-
-def _load_or_compute_fingerprint(
-    rec: HashedRecord, store: Store | None
-) -> str | None:
-    """Return ``rec``'s fingerprint — cache hit if stats match, else compute.
-
-    Symmetric to :func:`compare.image._load_or_compute_phash`.  A miss on
-    the compute path yields None without caching; the caller drops the
-    record from grouping.
-    """
-    return compute_audio_fingerprint(rec.path, store=store)
+    common = min(len(decoded_a), len(decoded_b))
+    if common == 0:
+        return 0.0
+    total_bits = common * 32
+    diff_bits = 0
+    for i in range(common):
+        diff_bits += bin(decoded_a[i] ^ decoded_b[i]).count("1")
+    similarity = 1.0 - (diff_bits / total_bits)
+    if similarity < 0.0:
+        return 0.0
+    if similarity > 1.0:
+        return 1.0
+    return similarity
 
 
 def find_audio_near_duplicates(
@@ -290,7 +349,7 @@ def find_audio_near_duplicates(
             continue
         if rec.size < min_size:
             continue
-        fp = _load_or_compute_fingerprint(rec, store)
+        fp = compute_audio_fingerprint(rec.path, store=store)
         if fp is None:
             continue
         audio.append((rec, fp))

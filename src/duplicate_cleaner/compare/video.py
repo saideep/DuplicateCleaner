@@ -14,10 +14,14 @@ Detection pipeline:
     lookup (``/opt/homebrew/bin/ffmpeg`` primary,
     ``/usr/local/bin/ffmpeg`` fallback) — to extract N keyframes evenly
     spaced across the video's duration.  Each keyframe is downscaled to
-    32x32 grayscale and pHashed via :func:`imagehash.phash`.  Signature
-    is stored as ``"duration:phash1,phash2,..."`` so the comparator can
-    reject a pair on gross duration mismatch before running the pairwise
-    Hamming compare.
+    32x32 grayscale and pHashed via :func:`imagehash.phash` at
+    ``hash_size=16`` (256-bit hash — matches the image pipeline).
+    Signature is stored as ``"duration:phash1,phash2,..."`` so the
+    comparator can reject a pair on gross duration mismatch before
+    running the pairwise Hamming compare, and the similarity score
+    normalises by the true bit budget (``256``) so random content sits
+    at ≈ 0.5 rather than 0.87 as the earlier ``/256`` +64-bit-hash
+    mismatch produced.
 3.  Union-find over the pairwise similarity graph collapses N-way
     clusters into ONE :class:`VideoNearDupGroup` — mirrors the v0.4 tree
     aggregator's union-find fix.
@@ -71,12 +75,20 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset(
 # 5 gives a decent proxy for scene content without a heavy ffmpeg cost.
 _KEYFRAMES: int = 5
 
-# pHash hash_size used for keyframe compares.  8 → 64-bit hash → max
-# Hamming distance 64.  The task-spec normalises by 256 (not 64) so the
-# formula is deliberately conservative — the "distance" is really 4x
-# looser than the raw bit count, giving similarity scores that lean high
-# for legitimately-similar re-encodes.
-_PHASH_HASH_SIZE: int = 8
+# pHash hash_size used for keyframe compares.  16 → 256-bit hash → max
+# Hamming distance 256.  Matches :mod:`compare.image`'s pHash budget for
+# consistency, and gives the video near-dup pass real resolution — video
+# re-encodes have more variation than image re-saves, so tighter bits +
+# a matching normaliser make the default threshold discriminate rather
+# than trivially cluster unrelated clips.
+_PHASH_HASH_SIZE: int = 16
+
+# Bit budget the similarity score normalises against.  Equals the number
+# of bits in one keyframe pHash — ``_PHASH_HASH_SIZE * _PHASH_HASH_SIZE``.
+# Two random pHashes score ≈ 0.5 (half the bits flipped on average);
+# identical pHashes score 1.0.  Kept as a named constant so future
+# resolution bumps stay locked to the actual bit count.
+_PHASH_BIT_BUDGET: int = _PHASH_HASH_SIZE * _PHASH_HASH_SIZE
 
 # Duration filter — two videos differing by more than N seconds cannot
 # be the same content.  Video has more variance across re-encodes than
@@ -340,10 +352,11 @@ def signature_similarity(a: str, b: str) -> float:
     * Returns ``0.0`` when parsed durations differ by more than
       :data:`_DURATION_TOLERANCE_SECONDS`.
     * Otherwise averages the pairwise Hamming distances of the N
-      keyframe pHashes (positional) and normalises via
-      ``1.0 - (avg_distance / 256.0)``.  Normalising by 256 makes the
-      similarity lean high for close matches — a distance-averaged 6.4
-      (out of a max-8 possible on 64-bit pHashes) still returns 0.975.
+      keyframe pHashes (positional) and normalises by the actual bit
+      budget (:data:`_PHASH_BIT_BUDGET` = ``_PHASH_HASH_SIZE * _PHASH_HASH_SIZE``).
+      Two identical pHashes → 1.0.  Two random pHashes → ≈ 0.5 (half the
+      bits flipped on average).  The default threshold at 0.90 therefore
+      admits only pairs with < 10% of the bits differing.
     """
     parsed_a = _parse_signature(a)
     parsed_b = _parse_signature(b)
@@ -362,19 +375,12 @@ def signature_similarity(a: str, b: str) -> float:
             return 0.0
         distances.append(d)
     avg = sum(distances) / float(len(distances))
-    similarity = 1.0 - (avg / 256.0)
+    similarity = 1.0 - (avg / float(_PHASH_BIT_BUDGET))
     if similarity < 0.0:
         return 0.0
     if similarity > 1.0:
         return 1.0
     return similarity
-
-
-def _load_or_compute_signature(
-    rec: HashedRecord, store: Store | None
-) -> str | None:
-    """Return ``rec``'s signature — cache hit if stats match, else compute."""
-    return compute_video_signature(rec.path, store=store)
 
 
 def find_video_near_duplicates(
@@ -402,7 +408,7 @@ def find_video_near_duplicates(
             continue
         if rec.size < min_size:
             continue
-        signature = _load_or_compute_signature(rec, store)
+        signature = compute_video_signature(rec.path, store=store)
         if signature is None:
             continue
         videos.append((rec, signature))

@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file. Format: Kee
 
 ## [Unreleased]
 
+### v0.7/v0.8-patch — closes pass-17 audit findings (2026-09-11)
+
+Sub-milestone patch on top of v0.7 + v0.8 closing all 8 audit pass-17 findings (3 must-fix ship-blockers + 5 deferrable follow-ups) in a single release. Every finding lands with a matching test.
+
+Fixed:
+
+- Audio fpcalc path safety (N1, must-fix — H9 invariant regression). `compare/audio.py` no longer imports `shutil`; the fpcalc binary is resolved through hardcoded absolute paths (`/opt/homebrew/bin/fpcalc` primary, `/usr/local/bin/fpcalc` fallback). Before importing pyacoustid we stamp `os.environ["FPCALC"]` to the vetted absolute path so pyacoustid's internal subprocess call cannot be PATH-hijacked. Same rail as `compare/video.py`'s ffmpeg lookup — a hostile `~/bin/fpcalc` shim can no longer execute with the scan process's UID.
+- Audio + video cache TTL sweeps wired at scan start (N2, must-fix — invariant weakening). `cli.py::scan` now calls `store.purge_stale_audio_fingerprints` and `store.purge_stale_video_signatures` alongside the existing image + cloud sweeps. The invariant was defined but the wiring was missing; the two caches otherwise grew unbounded.
+- Video similarity normaliser matches the actual bit budget (N3, must-fix — default-threshold false positives). `_PHASH_HASH_SIZE` bumped from 8 → 16 (matches `compare/image.py`'s 256-bit budget) and `_PHASH_BIT_BUDGET` (=256) is derived from the hash size, so two random pHashes score ≈ 0.5 (not 0.87 as the old `/256` + 64-bit-hash mismatch produced). The default threshold 0.90 now discriminates instead of trivially clustering unrelated clips.
+- Chromaprint bit-level compare (N4). `fingerprint_similarity` decodes both payloads via `acoustid.chromaprint.decode_fingerprint` to uint32 arrays and computes bit-level Hamming similarity across positional samples. Same-song re-encodes cluster; unrelated tracks are rejected — the earlier char-by-char base64 compare drifted to near-random rates on real fpcalc output.
+- Narrowed bare exception on pyacoustid (N6). `except Exception` on `acoustid.fingerprint_file` narrowed to `except (acoustid.FingerprintGenerationError, OSError, subprocess.SubprocessError)`. A broken pyacoustid install now surfaces loudly instead of silently returning zero audio-near-dup groups.
+- Dead pass branches deleted (N5, simplification). `apply/mover.py::plan_moves` no longer carries the pure-comment `if g.kind == "audio-near-dup": pass elif g.kind == "video-near-dup": pass` branches; the uniform dispatch is documented in the module docstring and `schema.py::GroupKind`.
+- Dead helper indirection removed (N8, simplification). `_load_or_compute_signature` / `_load_or_compute_fingerprint` inlined at their single call sites — both were pure forwarders over `compute_*` (which already handle the cache).
+
+Added:
+
+- `test_fpcalc_path_safety_uses_hardcoded_absolute_path` mirrors the existing ffmpeg test; asserts `not hasattr(amod, "shutil")` AND that `_find_fpcalc` only checks the two hardcoded paths.
+- `test_compute_audio_fingerprint_sets_fpcalc_env` locks in the `FPCALC` env-var stamp.
+- `test_fingerprint_similarity_bit_hamming` + `test_fingerprint_similarity_identical_payloads` — the N4 compare regression path.
+- `test_video_similarity_bit_scale_matches_hash_size` — 32 random-pHash trials assert the average sits in `[0.40, 0.60]` (near the 0.5 random-input baseline) instead of the old ~0.87 regime.
+- `test_store_purge_stale_audio_fingerprints` + `test_store_purge_stale_video_signatures` — mirror `test_store_purge_stale_phashes`; without these the missing TTL wiring would remain invisible to CI.
+- `test_cli_scan_emits_audio_near_dup_groups` + `test_cli_scan_emits_video_near_dup_groups` — CLI end-to-end mirrors of the existing image near-dup test; a scan on the appropriate mocked corpus surfaces the expected group in `report.json` (N7, test-coverage).
+
+Tests: 553 → 561 (8 new).
+
 ### v0.6.1 — Google Photos trash scope escalation (2026-09-11)
 
 Per-account escalation flow so users can re-consent Google Photos accounts from `photoslibrary.readonly` (v0.6 default) to the full `photoslibrary` scope.  Adding trash for `gphotos:personal` doesn't grant it for `gphotos:family` — each token file carries its own `has_trash` flag.

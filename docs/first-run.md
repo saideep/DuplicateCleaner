@@ -17,19 +17,33 @@ xcode-select --install
 brew install python@3.12 uv
 ```
 
-Optional — only needed once v0.5+ ships (audio/video near-dup):
+Optional (only if you want audio and/or video near-duplicate detection):
 
 ```shell
-brew install chromaprint ffmpeg
+brew install chromaprint ffmpeg   # audio: v0.8 uses chromaprint via pyacoustid; video: v0.8 uses ffmpeg for keyframes
 ```
+
+Skip these if you only care about exact + image near-dup + organize + migrate. Image near-dup is pure Python (Pillow + imagehash) and needs no Homebrew step.
 
 ## Step 2 — Clone and sync
 
 ```shell
 git clone https://github.com/saideep/DuplicateCleaner.git ~/DuplicateCleaner
 cd ~/DuplicateCleaner
-uv sync
+uv sync                          # core deps
+# or: uv sync --all-extras       # + [audio], [video], [icloud], [docs], [gps], [ocr]
 ```
+
+Optional-extra install groups (add on demand):
+
+| Extra | What it enables |
+|---|---|
+| `[audio]` | `pyacoustid` — Chromaprint audio fingerprint (needs `brew install chromaprint`) |
+| `[video]` | `Pillow` + `imagehash` for keyframe pHash (needs `brew install ffmpeg`) |
+| `[icloud]` | `osxphotos` — reads the local Photos.photoslibrary bundle for `dc scan --sources icloud:*` |
+| `[docs]` | `python-docx` / `python-pptx` / `openpyxl` for organizer signal extraction on Office documents |
+| `[gps]` | `piexif` + `geopy` for photo event clustering with GPS-based sub-events |
+| `[ocr]` | `pytesseract` for PDF classification via OCR on scan-based PDFs |
 
 `uv sync` reads `pyproject.toml` + `uv.lock`, creates `.venv/`, installs every runtime and dev dependency, and puts the `dc` command on the venv's PATH. Every future command in this guide uses `uv run dc <...>` (or activate the venv once with `source .venv/bin/activate` and drop the `uv run` prefix).
 
@@ -181,18 +195,29 @@ uv run dc organize undo ~/.local/share/duplicate_cleaner/organize-runs/<ts>/mani
 | Command | Purpose |
 |---|---|
 | `dc init` | Write default config + weights. |
-| `dc scan <dir> --report DIR` | Scan directories for duplicates. |
-| `dc scan --sources local,gdrive:X` | Scan across local + cloud sources. |
+| `dc scan <dir> --report DIR` | Scan directories for duplicates (exact + image + audio + video + tree). |
+| `dc scan --sources local,gdrive:X,onedrive:Y` | Scan across local + cloud sources. |
+| `dc scan --no-include-image-near-dup` | Turn off perceptual image near-dup (default on). |
+| `dc scan --no-include-audio-near-dup` | Turn off Chromaprint audio near-dup (default on). |
+| `dc scan --no-include-video-near-dup` | Turn off keyframe-pHash video near-dup (default on). |
+| `dc scan --min-project-similarity 0.85` | Loosen the git-project tree-aggregation threshold. |
 | `dc apply <report.json>` | Dry-run — print proposed moves. |
 | `dc apply <report.json> --commit` | Move discards to Trash. |
 | `dc undo <manifest.json>` | Restore a previous apply run. |
-| `dc auth add <type>` | Register a cloud account (BYO OAuth today). |
-| `dc auth list` | Show configured cloud accounts. |
+| `dc auth add <gdrive\|onedrive\|gphotos> --client-secret PATH.json` | Register a cloud account (BYO OAuth). |
+| `dc auth add icloud [--library-path PATH]` | Register the local iCloud Photos library (no OAuth). |
+| `dc auth grant-gphotos-trash <account_id>` | Re-auth GPhotos with the broader `photoslibrary` scope. |
+| `dc auth revoke-gphotos-trash <account_id>` | Downgrade a GPhotos account back to read-only. |
+| `dc auth list` | Show configured accounts + their scopes. |
 | `dc sources list` | Show all sources incl. local. |
 | `dc organize discover <dir> --report DIR` | Propose an organized destination taxonomy. |
-| `dc organize apply <plan.json>` | Dry-run organizer. |
-| `dc organize apply <plan.json> --commit` | Move files to organized destinations. |
+| `dc organize apply <plan.json> [--commit]` | Dry-run / move files to organized destinations. |
 | `dc organize undo <manifest.json>` | Reverse an organize run. |
+| `dc migrate plan --from A --to B --report DIR` | Plan a cloud-to-cloud consolidation. |
+| `dc migrate copy <plan.json> [--commit] [--max-bandwidth-mbps N] [--resume-from MANIFEST]` | Execute the migration copies. |
+| `dc migrate verify <manifest.json> [--full]` | Re-verify destination hashes. |
+| `dc migrate cleanup <manifest.json> [--commit]` | Trash source originals (only after verify). |
+| `dc migrate undo <manifest.json>` | Reverse a migration. |
 | `dc cache stats` | Show hash-cache size and hit rate. |
 | `dc cache clear` | Empty the hash cache. |
 
@@ -209,14 +234,24 @@ uv run dc organize undo ~/.local/share/duplicate_cleaner/organize-runs/<ts>/mani
 
 Full safety design: [`docs/safety.md`](safety.md).
 
-## What's still coming
+## What's shipped, what's still coming
 
-Not usable yet in the current release:
-- `dc migrate` (cloud-to-cloud consolidation) — v0.5.
-- Google Photos + iCloud Photos integrations — v0.6.
-- Image near-duplicate detection (resized JPEGs, screenshots of photos) — v0.7.
-- Audio/video near-duplicate detection — v0.8.
+Shipped (current release):
+- Exact-duplicate detection (v0.1) with size-bucket → partial → full BLAKE3 hashing
+- Archives, macOS bundles, APFS clones, singletons, `--discover` (v0.1.1)
+- Cloud sources: Google Drive + OneDrive Personal (v0.2, BYO OAuth)
+- Cross-algo hash reconciliation across sources (v0.2.1)
+- Organizer: three-phase discover → apply → undo with cohesion + event clustering (v0.3-a/b/c)
+- Project-tree aggregation for backup-folder collapse (v0.4)
+- `dc migrate` cloud-to-cloud consolidation with post-upload hash verify (v0.5-a/b/c)
+- Google Photos source, read-only (v0.6) with per-account trash-scope escalation infra (v0.6.1)
+- iCloud Photos source via `osxphotos` (v0.6), permanently read-only
+- Perceptual image near-duplicate detection (v0.7)
+- Chromaprint audio + keyframe-pHash video near-duplicate detection (v0.8)
+
+Still coming:
 - Interactive HTML review with click-to-override (currently: edit the JSON directly).
+- Google Photos library-wide trash — blocked on Google API capability (Photos Library API v1 does not expose a library-wide trash endpoint; escalation infrastructure is in place if Google adds it).
 
 Track progress in [`README.md`](../README.md) roadmap section or `CHANGELOG.md`.
 

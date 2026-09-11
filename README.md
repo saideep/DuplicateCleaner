@@ -25,6 +25,15 @@ Grouped by capability, not by version. Everything below is shipped.
 - Singleton "Unique files" section in every report — files with no duplicates are enumerated so a scan doubles as a directory census.
 - `dc scan --discover` mode. Enumeration-only scan; the report proposes zero deletions. Useful for surveying an unfamiliar drive before running a real scan.
 
+### Near-duplicate detection
+
+- Perceptual image near-dup (v0.7). `imagehash.phash` at 256-bit resolution groups resized JPEGs, re-encodes, and screenshots-of-photos across every configured source. Hamming-distance threshold configurable via `--image-near-dup-distance` (default `8` out of 256). Skips exact-dup members already grouped by content hash. Uses union-find so three-way near-dups produce one group, not N*(N-1)/2 pairs.
+- Chromaprint audio near-dup (v0.8). `pyacoustid.fingerprint_file` computes a local-only Chromaprint (no AcoustID.org lookup — privacy preserved). Fingerprints are decoded to uint32 arrays and compared bit-level; duration-first fast filter rejects pairs > 2s apart. Threshold `--audio-similarity-threshold` (default `0.95`). Requires `brew install chromaprint`.
+- Video near-dup (v0.8). `ffmpeg` extracts 5 keyframes evenly across each video's duration, downscales each to 32×32 grayscale, computes pHashes (256-bit each), and averages Hamming distance across keyframes. Duration-first filter rejects pairs > 5s apart. Threshold `--video-similarity-threshold` (default `0.90`). Requires `brew install ffmpeg`. `ffmpeg` invoked via hardcoded absolute path (`/opt/homebrew/bin/ffmpeg` primary, `/usr/local/bin/ffmpeg` fallback) — never `shutil.which`, per the H9 PATH-hijack safety rail.
+- All three near-dup passes are local-only. Cloud records are filtered out at intake, so cloud paths never round-trip through `Path.resolve()`.
+- Cache per source in SQLite (`image_phash_cache`, `audio_fingerprint_cache`, `video_signature_cache`) with 90-day TTL sweep at scan start — rescans are near-instant.
+- All three families flow through the same drift-check + `send2trash` mover rail as exact discards, and the same undo manifest restores them.
+
 ### Cloud sources
 
 - Google Drive and OneDrive Personal accounts scanned alongside local trees. Sub-command layer is source-agnostic — a single `dc scan` invocation can mix local roots and any number of cloud accounts.
@@ -291,13 +300,14 @@ Shipped:
 - [x] **v0.4 — Project-tree aggregation.** Whole-directory dedup for two copies of the same git repo / npm project / Cargo crate. Jaccard similarity ≥ 0.90 default; dirty git repos refuse discard; connected-component grouping.
 - [x] **v0.5 — Cloud consolidation (`dc migrate`).** `plan → copy → verify → cleanup → undo`. Post-upload hash verify, cleanup refuses without verify, bandwidth throttle, resume-from-manifest.
 - [x] **v0.6 — Google Photos and iCloud Photos.** Read-only sources scan alongside Drive / OneDrive / local. Google Photos via BYO OAuth (`photoslibrary.readonly`); iCloud via the local `~/Pictures/Photos Library.photoslibrary` bundle through `osxphotos`. No provider-side hash on either → reconciliation downloads bytes and BLAKE3s them, cached per `(source_id, cloud_file_id, etag)`. Google Photos trash is deferred to v0.6.1 (scope escalation required); iCloud Photos deletion goes via the Photos.app.
+- [x] **v0.6.1 — Google Photos trash scope escalation infrastructure.** `dc auth grant-gphotos-trash <account>` re-authorises with the broader `photoslibrary` scope. Token gains `has_trash=True`; scorer stops marking that account's records as informational; three-layer read-only defense still fires on non-escalated accounts. Actual library-wide trash currently constrained by Google Photos Library API v1 which doesn't expose a trash endpoint — the escalation surfaces an actionable error pointing at `photos.google.com/trash`; the code path is ready when Google adds the endpoint.
+- [x] **v0.7 — Image near-duplicate.** Perceptual hash comparator via `imagehash.phash` at 256-bit resolution. Hamming-distance clustering with union-find (no combinatorial explosion for N-way near-dups). Cross-source aware but filters to `source_id == "local"` at intake so cloud paths never round-trip through `.resolve()`. SQLite cache with 90-day TTL sweep.
+- [x] **v0.8 — Audio and video near-duplicate.** Chromaprint fingerprints via `pyacoustid` (local-only, no AcoustID.org lookup — privacy preserved); ffmpeg keyframe pHash for video. `ffmpeg` and `fpcalc` invoked via hardcoded absolute paths (H9 PATH-hijack safety rail). Bit-level fingerprint Hamming for audio; averaged keyframe Hamming for video. Same union-find clustering, same cache pattern with TTL sweep.
 
 Upcoming:
 
 - [ ] **v0.3-f — Interactive HTML review UI.** Click-to-override in the browser as an alternative to the Rich TUI. Today: edit the plan JSON directly (the apply step re-validates the schema).
-- [ ] **v0.6.1 — Google Photos trash scope escalation.** Requests the full `photoslibrary` scope via user re-consent, enabling `dc apply` to trash Google Photos duplicates alongside Drive / OneDrive.
-- [ ] **v0.7 — Image near-duplicate.** Perceptual hash comparator (`imagehash.phash` / `dhash`) plus thumbnails in the report.
-- [ ] **v0.8 — Audio and video near-duplicate.** Chromaprint fingerprints and keyframe pHash.
+- [ ] **Google Photos library-wide trash** — blocked on Google API capability (Photos Library API v1 does not expose a library-wide trash endpoint). Escalation infrastructure is in place if Google adds it.
 
 ## License
 

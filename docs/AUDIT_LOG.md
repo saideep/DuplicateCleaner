@@ -48,6 +48,215 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 
 ## Round-by-round history
 
+### v0.7/v0.8-patch — closes pass-17 findings (2026-09-11)
+
+Sub-milestone patch on top of v0.7 + v0.8 that closes all 8 audit pass-17 findings (3 must-fix ship-blockers + 5 deferrable-to-v0.8.1 items) in a single release; every finding lands with a matching test so a future refactor that regresses one path breaks the corresponding test.
+
+All 561 tests pass (553 pre-existing + 8 net-new); `test_no_forbidden_calls.py` still green; ruff clean on every changed file (pre-existing SIM102 in `organize/mover.py:143` documented in v0.4 unchanged); mypy `--strict` clean on every changed source file modulo the same pre-existing `unused-ignore` warnings on 3rd-party stubs (googleapiclient / msal / acoustid / imagehash) documented in v0.2 sub-milestone 2 and v0.5-a.
+
+Shipped:
+
+- `src/duplicate_cleaner/compare/audio.py` (N1, must-fix — H9 invariant regression):
+  - Removed `import shutil` from the module entirely — verified by `test_fpcalc_path_safety_uses_hardcoded_absolute_path` (mirrors the existing ffmpeg test in `compare/video.py`).
+  - New `_FPCALC_PRIMARY_PATH = "/opt/homebrew/bin/fpcalc"` and `_FPCALC_FALLBACK_PATH = "/usr/local/bin/fpcalc"` constants + `_find_fpcalc()` helper that returns the first existing absolute path, or None. NEVER falls back to `shutil.which`.
+  - `is_fpcalc_available()` now consults `_find_fpcalc()` instead of `shutil.which(_FPCALC_BINARY_NAME)`.
+  - Before importing `acoustid`, `compute_audio_fingerprint` stamps `os.environ["FPCALC"] = fpcalc_path` — pyacoustid honours that env var, routing its internal subprocess call through the vetted absolute path even though the module-level lookup would otherwise consult `$PATH`. H9 pattern now intact on audio.
+- `src/duplicate_cleaner/compare/audio.py` (N4, correctness — Chromaprint bit-level compare):
+  - `fingerprint_similarity` now decodes both payloads via `acoustid.chromaprint.decode_fingerprint` to uint32 arrays and computes bit-level Hamming similarity across positional samples (`bin(a[i] ^ b[i]).count("1")` per sample, normalised by total bit count).
+  - Two identical decoded payloads → similarity 1.0; two random payloads → similarity ≈ 0.5. Default threshold 0.95 now corresponds to ~5% bit distance — same-song re-encodes cluster; unrelated tracks are rejected.
+  - Char-by-char base64 compare deleted — that was drift-prone under real fpcalc alignment shifts.
+- `src/duplicate_cleaner/compare/audio.py` (N6, correctness — narrow bare except):
+  - `except Exception as e:` on `acoustid.fingerprint_file` narrowed to `except (acoustid.FingerprintGenerationError, OSError, subprocess.SubprocessError) as e:`. Anything else propagates so a broken pyacoustid install surfaces loudly instead of masquerading as "zero audio-near-dup groups".
+- `src/duplicate_cleaner/compare/audio.py` (N8, simplification):
+  - `_load_or_compute_fingerprint` inlined into `find_audio_near_duplicates` — the helper was pure indirection over `compute_audio_fingerprint` which already handles the cache.
+- `src/duplicate_cleaner/compare/video.py` (N3, must-fix — default-threshold false-positives):
+  - `_PHASH_HASH_SIZE` bumped `8 → 16` (matches `compare/image.py`'s 256-bit budget). Video re-encodes have more variation than image re-saves, so tighter bits + a matching normaliser gives the default threshold real bite.
+  - New `_PHASH_BIT_BUDGET = _PHASH_HASH_SIZE * _PHASH_HASH_SIZE` (=256) constant.
+  - `signature_similarity` now normalises `avg_distance / _PHASH_BIT_BUDGET` — two random 256-bit pHashes score ≈ 0.5, not 0.87 as the old `/256` + 64-bit-hash mismatch produced. The default threshold 0.90 no longer admits unrelated pairs.
+  - Docstring updated to describe the new bit budget and remove the "leans high on close matches" caveat.
+- `src/duplicate_cleaner/compare/video.py` (N8, simplification):
+  - `_load_or_compute_signature` inlined into `find_video_near_duplicates` — symmetric to the audio helper deletion.
+- `src/duplicate_cleaner/cli.py` (N2, must-fix — cache TTL sweeps):
+  - Added `store.purge_stale_audio_fingerprints(max_age_days=cloud_hash_ttl_days)` and `store.purge_stale_video_signatures(max_age_days=cloud_hash_ttl_days)` immediately after the existing image + cloud sweeps at scan start. The invariant was defined (AUDIT_LOG §E.2) but the wiring was missing — audio_fingerprint_cache and video_signature_cache would otherwise grow unbounded.
+- `src/duplicate_cleaner/apply/mover.py` (N5, simplification):
+  - Removed the dead `if g.kind == "audio-near-dup": pass elif g.kind == "video-near-dup": pass` branches in `plan_moves`. The uniform dispatch is already documented in the module docstring and `schema.py::GroupKind`.
+
+Tests shipped (8 net-new):
+
+- `tests/test_compare_audio.py`:
+  - `test_fpcalc_path_safety_uses_hardcoded_absolute_path` — mirrors the ffmpeg test; asserts `not hasattr(amod, "shutil")` AND that `_find_fpcalc` only checks the two hardcoded paths.
+  - `test_compute_audio_fingerprint_sets_fpcalc_env` — asserts `os.environ["FPCALC"]` is stamped to the resolved absolute path before pyacoustid imports.
+  - `test_fingerprint_similarity_bit_hamming` — mocked decoded uint32 arrays with a known 32-bit XOR distance produce the expected 0.75 similarity.
+  - `test_fingerprint_similarity_identical_payloads` — identical decoded payloads → similarity 1.0.
+  - `test_cli_scan_emits_audio_near_dup_groups` — CLI end-to-end: `dc scan` on a pair of mocked audio-near-dup records surfaces an `audio-near-dup` group in `report.json` (mirrors the existing image test).
+  - `test_store_purge_stale_audio_fingerprints` — mirrors `test_store_purge_stale_phashes`; freezes time backward, inserts a row, sweeps at `max_age_days=1.0`, verifies the row is gone.
+- `tests/test_compare_video.py`:
+  - `test_video_similarity_bit_scale_matches_hash_size` — 32 trials of random 256-bit pHashes; asserts the average similarity sits in `[0.40, 0.60]` (near 0.5 baseline) instead of the old ~0.87 regime.
+  - `test_cli_scan_emits_video_near_dup_groups` — CLI end-to-end for the video-near-dup rail.
+  - `test_store_purge_stale_video_signatures` — mirror of the audio TTL test.
+
+Existing test updates:
+
+- `tests/test_compare_audio.py`: char-position tests removed (`test_fingerprint_similarity_partial_overlap`); every mock now patches `compute_audio_fingerprint` directly (the `_load_or_compute_fingerprint` helper is gone). The remaining `test_compute_audio_fingerprint_on_missing_binary` was rewritten to patch `os.path.exists` (no `shutil.which` left to patch).
+- `tests/test_compare_video.py`: all pHash strings widened to 64 hex chars (256 bits) to match `hash_size=16`; every mock now patches `compute_video_signature` directly. `test_find_video_near_duplicates_below_threshold_produces_nothing` uses the default 0.90 threshold — the earlier `0.999` workaround that hid the /256-normaliser bug is gone.
+
+Invariants preserved:
+
+- 553 pre-existing tests still pass unchanged (8 new tests added, total 561).
+- `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`.
+- Cloud paths still never `.resolve()`d.
+- H9 pattern preserved on BOTH `compare/video.py` (existing) AND `compare/audio.py` (new via this patch): both modules resolve their binaries through hardcoded absolute paths only, and neither imports `shutil` at module scope. Locked in by two symmetric tests (`test_ffmpeg_path_safety_uses_hardcoded_absolute_path` + `test_fpcalc_path_safety_uses_hardcoded_absolute_path`).
+- Audio + video cache TTL sweeps now fire at scan start alongside the existing image + cloud sweeps; locked in by two symmetric store-level tests (`test_store_purge_stale_audio_fingerprints` + `test_store_purge_stale_video_signatures`).
+
+**v0.7/v0.8-patch clears ship.** All 8 pass-17 findings closed.
+
+### v0.7 + v0.8 — combined Code Review + Security pass 17 (2026-09-11)
+
+**Seventeenth audit** — verdict: **Ready with must-fix follow-ups.** 8 findings total: 2 safety CONFIRMED (1 H9 invariant regression on audio fpcalc; 1 missing TTL sweep — invariant weakening for audio/video caches), 3 correctness (1 CONFIRMED default-threshold false-positive on video, 2 PLAUSIBLE), 1 simplification CONFIRMED (dead pass branches), 2 test-coverage CONFIRMED. Zero DATA-LOSS committed; ffmpeg path safety on video.py holds (hardcoded absolute paths, no `import shutil`); pyacoustid uses `fingerprint_file` only — no AcoustID web-API calls, no privacy leak.
+
+Verified positives (no drift from prior invariants):
+- `compare/video.py` — `_FFMPEG_PRIMARY_PATH = "/opt/homebrew/bin/ffmpeg"` + `_FFMPEG_FALLBACK_PATH = "/usr/local/bin/ffmpeg"` + mirror pair for ffprobe. Module does NOT `import shutil` at all (verified by grep + the test `test_ffmpeg_path_safety_uses_hardcoded_absolute_path` asserts `not hasattr(vmod, "shutil")`). Subprocess call is `shell=False` default, args passed as list, `check=False`, no user-controlled data flowing into argv beyond the local absolute path from a validated scan root. H9 pattern intact on video.
+- `_iter_all_groups` helper in `apply/mover.py` folds image-/audio-/video-near-dup lists into every validator + planner loop so the mover treats every new near-dup group identically to `kind="exact"` at the `send2trash` rail. `active_homes` check keys on `report.groups` only (correct — near-dup groups can never be `kind="tree"`).
+- Cross-source rail preserved: image/audio/video near-dup pipelines filter to `source_id == "local"` at intake (compare/image.py:198, compare/audio.py:287, compare/video.py:399). Cloud paths never `.resolve()`d.
+- Exact-dup skip inside every near-dup grouper: if a component's members all share the same `full_hash`, the group is dropped (avoids double-counting reclaim with `compare.exact`).
+- Union-find over the pairwise similarity graph in all three modules (mirrors v0.4 K2 union-find fix) — no N*(N-1)/2 pair explosion for N-way clusters.
+- pyacoustid usage restricted to `fingerprint_file(path)` — reads local bytes, invokes fpcalc via subprocess for the compute, does NOT call `acoustid.match` / `acoustid.lookup` which would hit the AcoustID web API. Privacy invariant (scan never phones home) upheld.
+- Manifest roundtrip: near-dup discards are recorded as ordinary local file entries (`source_id="local"`, `is_project_tree=False`); undo restores via the same `restore_from_manifest` path with zero special-casing. `ManifestEntry` intentionally does NOT carry `kind` — the trash rail is uniform per-file.
+- `test_apply_image_near_dup_alongside_exact_group` proves an exact group + an image-near-dup group commit together in one apply.
+- `test_no_forbidden_calls.py` clean on `compare/audio.py` + `compare/video.py` + `compare/image.py`: no `os.remove`, `os.unlink`, `Path.unlink`, `os.rmdir`, `shutil.rmtree`, `shutil.move`, `os.system`, no `subprocess` + `rm` literal.
+- All three new cache tables use `CREATE TABLE IF NOT EXISTS` — a v0.6.1 cache DB gets the new tables on next open with no data loss.
+- Every cache key is `(path, size, mtime)` with the shared `_MTIME_EPS = 1e-6` tolerance for SQLite REAL round-trip loss (mirrors v0.1 G9 fix).
+
+Findings (JSON, most severe first):
+
+```json
+{
+  "file": "src/duplicate_cleaner/compare/audio.py",
+  "line": 101,
+  "short_summary": "fpcalc via shutil.which is a PATH-hijack (weakens H9 invariant)",
+  "summary": "Audio near-dup resolves the fpcalc binary through shutil.which, letting pyacoustid launch it via $PATH — a hostile ~/bin/fpcalc shim executes with the scan process's UID.",
+  "failure_scenario": "A user with a writable early-PATH directory (~/bin, /usr/local/bin without root) drops a malicious fpcalc; running `dc scan` on audio spawns it with the UID that owns ~/Documents; the shim can exfiltrate the audio bytes it is handed (or anything else) before returning a bogus fingerprint. The docstring justifies shutil.which as 'not privileged' — this is the exact threat model H9 patched for taskpolicy.",
+  "category": "safety",
+  "verdict": "CONFIRMED",
+  "alternative": "Hardcode _FPCALC_PRIMARY_PATH='/opt/homebrew/bin/fpcalc' + _FPCALC_FALLBACK_PATH='/usr/local/bin/fpcalc' and set os.environ['FPCALC'] to the resolved path before importing acoustid (pyacoustid honours the FPCALC env var). Or link chromaprint's C library directly and skip the subprocess.",
+  "regression_surface": "H9 invariant is 'ffmpeg / binaries must use hardcoded absolute paths, never shutil.which' — audit brief lists this explicitly. Ships as v0.8 regression; the docstring's own rationale ('a PATH-hijacked fpcalc would produce a bogus fingerprint') is factually wrong."
+}
+```
+
+```json
+{
+  "file": "src/duplicate_cleaner/cli.py",
+  "line": 872,
+  "short_summary": "Audio + video cache TTL sweeps never called at scan start",
+  "summary": "Store.purge_stale_audio_fingerprints and Store.purge_stale_video_signatures are defined (store.py:760, 806) but no code path invokes them. Only the image and cloud sweeps fire at scan start.",
+  "failure_scenario": "After N months of scans across a music/video library, audio_fingerprint_cache and video_signature_cache grow unbounded. Compare with cloud_hash_cache (v0.2 B12 invariant) and image_phash_cache (v0.7) — both sweep at scan start with the 90-day default. The audit-brief §E.2 explicitly names this: 'TTL sweep — 90 days each. Runs at scan start.' The invariant is defined but the wiring is missing.",
+  "category": "safety",
+  "verdict": "CONFIRMED",
+  "alternative": "Add two lines after cli.py:872: `store.purge_stale_audio_fingerprints(max_age_days=cloud_hash_ttl_days)` and `store.purge_stale_video_signatures(max_age_days=cloud_hash_ttl_days)`. Rename --cloud-hash-ttl-days to --hash-cache-ttl-days (or leave the flag name for backward-compat and update help text) to reflect the wider scope.",
+  "regression_surface": "Documented invariant unmet. A future refactor cannot regress a check that has no test — see finding on test-coverage below."
+}
+```
+
+```json
+{
+  "file": "src/duplicate_cleaner/compare/video.py",
+  "line": 365,
+  "short_summary": "Video similarity normalised by 256 instead of 64 — default threshold clusters unrelated videos",
+  "summary": "signature_similarity computes `1.0 - avg_distance / 256.0` but _PHASH_HASH_SIZE=8 gives a 64-bit hash (max Hamming distance 64). Two completely unrelated videos of matching duration score ≥ 0.75; the default threshold=0.90 admits any pair with avg Hamming ≤ 25.6 bits (40% of budget).",
+  "failure_scenario": "Two 60-second unrelated clips with maximally-different keyframe pHashes score 1.0 - 64/256 = 0.75, comfortably above any conservative threshold. Default 0.90 corresponds to avg-Hamming ≤ 25.6 bits — imagehash convention for 'same image, minor difference' is ≤3% (2 bits for hash_size=8). The video pipeline's default threshold is 13× too loose. The test `test_find_video_near_duplicates_below_threshold_produces_nothing` acknowledges the bug by forcing threshold=0.999.",
+  "category": "correctness",
+  "verdict": "CONFIRMED",
+  "alternative": "Normalise by _PHASH_HASH_SIZE * _PHASH_HASH_SIZE = 64 (matches the actual bit budget); or bump _PHASH_HASH_SIZE to 16 to match the image pipeline's 256-bit budget and keep the 256 normaliser. Either way, sim ranges [0, 1] naturally and the threshold has real bite.",
+  "regression_surface": "First-time users running `dc scan --include-video-near-dup` on a video library see clusters of unrelated videos and lose trust in the tool. Not DATA-LOSS (keeper heuristic picks the largest file so `dc apply --commit` still keeps something), but the reclaim number is inflated with clusters that would trash different videos."
+}
+```
+
+```json
+{
+  "file": "src/duplicate_cleaner/compare/audio.py",
+  "line": 239,
+  "short_summary": "Chromaprint compare uses char-position match on base64 payload — mostly useless on real fpcalc output",
+  "summary": "fingerprint_similarity compares raw base64-encoded compressed fingerprint payloads character-by-character. Any bitrate/silence/tag delta shifts the compression alignment, so real re-encodes drift to near-random character match rates.",
+  "failure_scenario": "User re-encodes a MP3 at a different bitrate; fpcalc emits fingerprints that (correctly) match when decoded to bit-level Chromaprint arrays but differ at ~60% of character positions in base64 form; fingerprint_similarity returns ~0.4; the pair is rejected at the default 0.95 threshold; the whole v0.8 audio feature returns zero groups on realistic input. The test suite passes because mocked fingerprints are hand-crafted to overlap.",
+  "category": "correctness",
+  "verdict": "PLAUSIBLE",
+  "alternative": "Decode payloads via chromaprint.decode_fingerprint(...) → uint32 array, then compute bit-level Hamming similarity across the arrays. That is the standard AcoustID compare algorithm. Add a real-audio fixture test (small MP3 + a re-encoded copy) so a future regression on the compare fires immediately.",
+  "regression_surface": "The feature ships but doesn't actually find real audio near-duplicates. Silent quality regression rather than data-loss."
+}
+```
+
+```json
+{
+  "file": "src/duplicate_cleaner/apply/mover.py",
+  "line": 303,
+  "short_summary": "Dead pass branches in plan_moves for audio-near-dup / video-near-dup",
+  "summary": "plan_moves has explicit `if g.kind == 'audio-near-dup': pass elif g.kind == 'video-near-dup': pass` branches that fall through to the same loop body; the branches are pure comments.",
+  "failure_scenario": "A reader assumes the branches do something (they don't) and edits one of them without realising the effect is identical to the fall-through. Adds noise, does nothing.",
+  "category": "simplification",
+  "verdict": "CONFIRMED",
+  "alternative": "Delete the two branches. The intent (documenting that audio/video near-dup groups share the file-scoped trash rail) is already captured in the class docstring and in schema.py's GroupKind comment.",
+  "regression_surface": "Cosmetic. Removing them leaves plan_moves at exactly the same behaviour."
+}
+```
+
+```json
+{
+  "file": "src/duplicate_cleaner/compare/audio.py",
+  "line": 177,
+  "short_summary": "Bare except Exception on pyacoustid silently drops genuine bugs",
+  "summary": "`except Exception as e:` on acoustid.fingerprint_file catches genuine bugs (memory errors on huge files, misconfigured pyacoustid installations) and converts them to a silent None return — the record is dropped from near-dup grouping without a warning to the operator.",
+  "failure_scenario": "A regression in pyacoustid or a bad C library link causes fingerprint_file to raise a non-obvious exception on every file; every audio file falls out of the near-dup pass; the feature silently returns zero groups; the operator sees `dc scan` complete with no audio-near-dup output and assumes there are no near-dups.",
+  "category": "correctness",
+  "verdict": "PLAUSIBLE",
+  "alternative": "Narrow to `except (acoustid.FingerprintGenerationError, OSError, subprocess.SubprocessError)`. Anything else is a genuine bug and should abort the scan or at least log at WARNING (not DEBUG). Same shape as the audit pass 15 finding on migrate/verify.py's `except Exception` narrow to `except SourceError`.",
+  "regression_surface": "Silent scan-time bug masking. Same failure class as pass 15 finding #4."
+}
+```
+
+```json
+{
+  "file": "tests/test_compare_audio.py",
+  "line": 0,
+  "short_summary": "No tests for audio/video cache TTL sweep + no CLI end-to-end for audio/video",
+  "summary": "Image path has test_store_purge_stale_phashes AND test_cli_scan_emits_image_near_dup_groups end-to-end. Audio + video have neither. The missing TTL wiring (finding F2) is therefore invisible to CI — a future refactor cannot regress what has no test.",
+  "failure_scenario": "F2 lands as ship regression; audit misses it; CI stays green; audio_fingerprint_cache grows unbounded until a user runs `dc cache clear` manually.",
+  "category": "test-coverage",
+  "verdict": "CONFIRMED",
+  "alternative": "Add test_store_purge_stale_audio_fingerprints + test_store_purge_stale_video_signatures mirroring test_store_purge_stale_phashes. Add test_cli_scan_emits_audio_near_dup_groups + test_cli_scan_emits_video_near_dup_groups mirroring test_cli_scan_emits_image_near_dup_groups (mock the acoustid + ffmpeg calls). Wire the missing purge calls in cli.py::scan and assert the sweep count in a CLI test.",
+  "regression_surface": "Symmetric to the image-path test coverage; makes the invariant enforceable."
+}
+```
+
+```json
+{
+  "file": "src/duplicate_cleaner/compare/video.py",
+  "line": 373,
+  "short_summary": "_load_or_compute_signature is a dead layer of indirection",
+  "summary": "_load_or_compute_signature just forwards to compute_video_signature (which itself handles the cache). Same in compare/audio.py::_load_or_compute_fingerprint. The image module's equivalent handles the cache in the helper (which is meaningful); the audio/video helpers add zero behaviour.",
+  "failure_scenario": "None — cosmetic. The helper exists to be monkey-patched by unit tests, but the direct compute function would work identically.",
+  "category": "simplification",
+  "verdict": "CONFIRMED",
+  "alternative": "Inline compute_video_signature / compute_audio_fingerprint at the two call sites in find_video_near_duplicates / find_audio_near_duplicates. Or keep the wrapper but drop the misleading name — call it e.g. _sig_for_record so future readers don't expect a distinct cache layer.",
+  "regression_surface": "None. Existing tests would need one patch-target rename each."
+}
+```
+
+**Verdict: Ready with must-fix follow-ups.**
+
+Must-fix in same release (v0.7-patch or v0.8-patch):
+- F1 (safety/CONFIRMED, H9 invariant regression): hardcoded absolute path for fpcalc via FPCALC env var mirror of the ffmpeg pattern.
+- F2 (safety/CONFIRMED, invariant weakening): wire the two missing purge calls in cli.py::scan next to the existing image + cloud sweeps.
+- F4 (correctness/CONFIRMED, default-threshold false positives): fix the /256 normaliser in video signature_similarity so the default threshold has real bite. Symmetric change: either divide by 64 or bump hash_size to 16.
+
+Deferrable to v0.8.1:
+- F3 (correctness/PLAUSIBLE): Chromaprint compare via chromaprint.decode_fingerprint (real bit-level compare).
+- F5 (simplification): delete dead pass branches in plan_moves.
+- F6 (test-coverage): mirror image tests for audio + video paths.
+- F7 (correctness/PLAUSIBLE): narrow the except Exception on fingerprint_file.
+- F8 (simplification): inline the _load_or_compute helper wrappers.
+
+Ship-readiness statement: zero DATA-LOSS committed; the H9 pattern holds on video.py but is weakened on audio.py; the audio + video cache TTL invariants are defined but not wired; and the video similarity default admits unrelated pairs. All three must-fix items are localised (<20 lines each) with clear test additions. Once F1 + F2 + F4 land, v0.7 + v0.8 clear ship.
+
 ### v0.6.1 — Google Photos trash scope escalation (2026-09-11)
 
 Per-account escalation from the v0.6 read-only default to the full `photoslibrary` scope, gated on user re-consent. Adding trash for `gphotos:personal` does NOT grant it for `gphotos:family` — each account's token file records its own `has_trash` flag.  The Google Photos Library API v1 turned out not to expose a library-wide trash endpoint (only album-scoped `batchRemoveMediaItems` and album/media-item creation), so v0.6.1 ships the ESCALATION INFRASTRUCTURE (token-file flag + CLI grant/revoke + scorer trash-enabled bypass + source three-layer gate) and surfaces an actionable `SourceError` at the API-capability wall pointing users at photos.google.com/trash for the manual step.  When Google reintroduces a library-scoped delete on the Photos API, the actual API call drops in between the has_trash check and the current raise with no surrounding-rail changes needed.
