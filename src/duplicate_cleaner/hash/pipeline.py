@@ -65,6 +65,23 @@ class HashedRecord:
     reconciled: bool = False
 
 
+def compute_phash(path: Path) -> str | None:
+    """Return a hex-encoded perceptual hash for ``path``, or None on failure.
+
+    v0.7 image near-duplicate detection.  Thin wrapper over
+    :func:`duplicate_cleaner.compare.image.compute_phash` so the hash
+    pipeline stays the single source of truth for content signatures —
+    a future refactor of the pHash implementation lands here, and every
+    caller (near-dup grouper, cache warmer, CLI diagnostics) picks up
+    the change without a coordinated edit sweep.
+    """
+    # Imported lazily so the module-level import graph stays cheap for
+    # scans that touch zero images.
+    from duplicate_cleaner.compare.image import compute_phash as _compute
+
+    return _compute(path)
+
+
 def _hash_partial(path: Path, size: int) -> str:
     h = blake3.blake3()
     with path.open("rb") as f:
@@ -187,6 +204,33 @@ def hash_records(
     finally:
         # Always drop this scan's staged rows — even on generator abort.
         store.clear_scan_stage(scan_id)
+
+
+def compute_audio_fingerprint(
+    path: Path, *, store: Store | None = None
+) -> str | None:
+    """Thin re-export of :func:`compare.audio.compute_audio_fingerprint`.
+
+    v0.8 addition — surfaced from the hash pipeline so callers that
+    already import from ``duplicate_cleaner.hash.pipeline`` do not need
+    to reach into ``compare.audio``.  Behaviour is otherwise identical.
+    """
+    from duplicate_cleaner.compare.audio import (
+        compute_audio_fingerprint as _impl,
+    )
+
+    return _impl(path, store=store)
+
+
+def compute_video_signature(
+    path: Path, *, store: Store | None = None
+) -> str | None:
+    """Thin re-export of :func:`compare.video.compute_video_signature`."""
+    from duplicate_cleaner.compare.video import (
+        compute_video_signature as _impl,
+    )
+
+    return _impl(path, store=store)
 
 
 def _hash_size_bucket(

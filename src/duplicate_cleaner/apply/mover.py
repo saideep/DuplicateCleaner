@@ -60,6 +60,27 @@ def load_report(json_path: Path) -> Report:
     return Report.model_validate(data)
 
 
+def _iter_all_groups(report: Report) -> list[ReportGroup]:
+    """Return every actionable group across every dedicated near-dup list.
+
+    v0.7: image near-duplicate groups live in a dedicated field on the
+    Report so consumers can dispatch on the family without walking every
+    ``groups`` entry, but the mover treats them identically to
+    ``kind="exact"`` groups — same per-file drift check, same
+    ``send2trash`` rail, same manifest schema.  v0.8: audio and video
+    near-duplicate groups follow the exact same shape and share this
+    iterator.  Rolling every list into one keeps the validator + planner
+    loops single-source and guarantees a new group family can never slip
+    past a check that only ran on ``report.groups``.
+    """
+    return [
+        *report.groups,
+        *report.image_near_dup_groups,
+        *report.audio_near_dup_groups,
+        *report.video_near_dup_groups,
+    ]
+
+
 def _validate_tree_group(
     group: ReportGroup,
     resolved_roots: list[Path],
@@ -201,7 +222,7 @@ def _validate_report_paths(
     resolved_active_homes: list[Path] | None = (
         [resolve_for_check(h) for h in active_homes] if active_homes else None
     )
-    for g in report.groups:
+    for g in _iter_all_groups(report):
         if g.kind == "tree":
             # v0.4: project-tree discards are directory paths.  Route them
             # through their dedicated validator BEFORE the per-file loop
@@ -267,12 +288,29 @@ def plan_moves(report: Report) -> list[tuple[Path, int, float, str]]:
     discards deferred to sub-phase 5c".
     """
     moves: list[tuple[Path, int, float, str]] = []
-    for g in report.groups:
+    for g in _iter_all_groups(report):
         # v0.4: project-tree groups dispatch through ``plan_tree_moves``;
         # their members are directory paths, not files, and cannot flow
         # through the local file trash loop.
         if g.kind == "tree":
             continue
+        # v0.7: image-near-dup groups are file-scoped and flow through
+        # the same rail as ``exact`` groups — fall through into the
+        # per-member loop below.
+        # v0.8: audio-near-dup and video-near-dup groups follow the exact
+        # same shape (single-file discards via send2trash) — fall through
+        # into the same per-member loop as image-near-dup and exact.
+        if g.kind == "audio-near-dup":
+            # Explicit branch documenting the audio-near-dup routing so a
+            # future refactor cannot accidentally divert audio groups
+            # into a directory-scoped rail (there is none — audio-near-dup
+            # discards are single-file only).
+            pass
+        elif g.kind == "video-near-dup":
+            # Same as the audio branch: explicit no-op branch to document
+            # that video-near-dup discards are single-file only and share
+            # the send2trash rail with exact / image-near-dup.
+            pass
         for m in g.members:
             if m.is_proposed_keeper or m.is_informational:
                 continue
@@ -311,7 +349,7 @@ def _count_cloud_discards(report: Report) -> int:
     so ``cloud_deferred`` is 0 whenever a ``sources`` map is provided.
     """
     n = 0
-    for g in report.groups:
+    for g in _iter_all_groups(report):
         if g.kind == "tree":
             continue
         for m in g.members:
@@ -332,7 +370,7 @@ def plan_cloud_moves(report: Report) -> list[ReportMember]:
     round-tripping through ``Path`` semantics.
     """
     out: list[ReportMember] = []
-    for g in report.groups:
+    for g in _iter_all_groups(report):
         if g.kind == "tree":
             continue
         for m in g.members:

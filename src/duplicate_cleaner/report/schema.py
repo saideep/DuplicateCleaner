@@ -15,7 +15,26 @@ from pydantic import BaseModel, Field
 # into a single entry — the discard member's ``path`` is the *directory*
 # root, not any individual file, and the mover sends the whole directory
 # to Trash atomically.  See ``compare/tree.py``.
-GroupKind = Literal["exact", "archive-whole", "tree"]
+#
+# v0.7: ``image-near-dup`` groups cluster images that hash to
+# perceptually-close (but not byte-identical) content via pHash Hamming
+# distance under a configured threshold.  Discards flow through the same
+# per-file ``send2trash`` rail as ``exact`` groups.  See
+# ``compare/image.py``.
+#
+# v0.8: ``audio-near-dup`` and ``video-near-dup`` groups extend the same
+# per-file trash rail to Chromaprint-fingerprint audio matches (same song
+# re-encoded at different bitrates) and ffmpeg keyframe-pHash video
+# matches (same footage in a different container).  See ``compare/audio.py``
+# and ``compare/video.py``.
+GroupKind = Literal[
+    "exact",
+    "archive-whole",
+    "tree",
+    "image-near-dup",
+    "audio-near-dup",
+    "video-near-dup",
+]
 
 
 class ReportSignal(BaseModel):
@@ -69,6 +88,50 @@ class ReportMember(BaseModel):
     reconciled: bool = False
 
 
+class ImageNearDupSignal(BaseModel):
+    """Metadata attached to a ``kind="image-near-dup"`` :class:`ReportGroup`.
+
+    v0.7 image near-duplicate detection.  Carries the worst pairwise Hamming
+    distance inside the cluster (higher = looser match, lower = tighter),
+    the total bit budget of the underlying pHash (256 for hash_size=16), and
+    the min/max file size in bytes across members so a reviewer can spot
+    "these five copies range from a 50 KB thumbnail to a 3 MB original".
+    """
+
+    max_pairwise_distance: int
+    hash_bits: int = 256
+    min_size: int
+    max_size: int
+
+
+class AudioNearDupSignal(BaseModel):
+    """Metadata attached to a ``kind="audio-near-dup"`` :class:`ReportGroup`.
+
+    v0.8 audio near-duplicate detection.  ``min_similarity`` is the worst
+    pairwise Chromaprint similarity inside the cluster (closer to 1.0 =
+    tighter match).  ``duration_range`` captures the min/max duration in
+    seconds across members so a reviewer can spot a 3:12 song clustered
+    with a 30-second sample preview.
+    """
+
+    min_similarity: float
+    duration_min_seconds: float
+    duration_max_seconds: float
+
+
+class VideoNearDupSignal(BaseModel):
+    """Metadata attached to a ``kind="video-near-dup"`` :class:`ReportGroup`.
+
+    v0.8 video near-duplicate detection.  ``min_similarity`` is the worst
+    pairwise keyframe-pHash similarity inside the cluster.
+    ``duration_range`` captures min/max duration in seconds across members.
+    """
+
+    min_similarity: float
+    duration_min_seconds: float
+    duration_max_seconds: float
+
+
 class ReportGroup(BaseModel):
     id: str
     kind: GroupKind = "exact"
@@ -82,6 +145,15 @@ class ReportGroup(BaseModel):
     identical_file_count: int | None = None
     tree_diff: list[TreeDiffEntry] | None = None
     similarity_pct: float | None = None
+    # v0.7 image near-duplicate metadata.  Populated only for
+    # ``kind="image-near-dup"`` groups; ``None`` on every other kind so
+    # v0.4+ reports round-trip unchanged.
+    image_near_dup: ImageNearDupSignal | None = None
+    # v0.8 audio + video near-duplicate metadata.  Populated only for the
+    # matching ``kind="audio-near-dup"`` / ``"video-near-dup"`` groups;
+    # ``None`` on every other kind so pre-v0.8 reports round-trip cleanly.
+    audio_near_dup: AudioNearDupSignal | None = None
+    video_near_dup: VideoNearDupSignal | None = None
 
 
 class ArchiveSkipEntry(BaseModel):
@@ -141,6 +213,18 @@ class Report(BaseModel):
     # local-only scans and for scans whose reconciliation stayed under the
     # cap.
     not_yet_hashed_buckets: list[NotYetHashedBucket] = Field(default_factory=list)
+    # v0.7: perceptual-hash image near-duplicate groups.  Flow through the
+    # same per-file trash rail as ``exact`` groups but live in a dedicated
+    # list so consumers (mover, HTML renderer) can dispatch on the kind
+    # without walking every ``groups`` entry.  Empty list keeps pre-v0.7
+    # reports round-trip clean.
+    image_near_dup_groups: list[ReportGroup] = Field(default_factory=list)
+    # v0.8: audio near-duplicate groups (Chromaprint fingerprint matches)
+    # and video near-duplicate groups (ffmpeg keyframe pHash matches).
+    # Same per-file trash rail as ``exact`` groups; dedicated lists so
+    # consumers dispatch by family without walking every ``groups`` entry.
+    audio_near_dup_groups: list[ReportGroup] = Field(default_factory=list)
+    video_near_dup_groups: list[ReportGroup] = Field(default_factory=list)
     # ``discover`` mode: no keeper is proposed on any group. ``dc apply``
     # refuses to run a discover-mode report so nothing accidentally deletes.
     discover: bool = False

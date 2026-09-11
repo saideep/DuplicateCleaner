@@ -49,12 +49,26 @@ from duplicate_cleaner.compare.archive import (
     is_archive_path,
     scan_archive,
 )
+from duplicate_cleaner.compare.audio import (
+    AudioNearDupGroup,
+    find_audio_near_duplicates,
+    is_fpcalc_available,
+)
 from duplicate_cleaner.compare.exact import group_by_hash
+from duplicate_cleaner.compare.image import (
+    ImageNearDupGroup,
+    find_image_near_duplicates,
+)
 from duplicate_cleaner.compare.tree import (
     ProjectDuplicateGroup,
     ProjectInfo,
     aggregate_project_duplicates,
     detect_project_dirs,
+)
+from duplicate_cleaner.compare.video import (
+    VideoNearDupGroup,
+    find_video_near_duplicates,
+    is_ffmpeg_available,
 )
 from duplicate_cleaner.config import (
     CONFIG_PATH,
@@ -73,12 +87,15 @@ from duplicate_cleaner.paths import validate_scan_root_candidate
 from duplicate_cleaner.report.render import render_report
 from duplicate_cleaner.report.schema import (
     ArchiveSkipEntry,
+    AudioNearDupSignal,
+    ImageNearDupSignal,
     Report,
     ReportGroup,
     ReportMember,
     ReportSignal,
     SingletonEntry,
     TreeDiffEntry,
+    VideoNearDupSignal,
 )
 from duplicate_cleaner.scan.walk import FileRecord, WalkStats
 from duplicate_cleaner.score.rules import (
@@ -386,6 +403,241 @@ def _lexical_contains(parent: Path, child: Path) -> bool:
         return False
 
 
+def _build_image_near_dup_report_groups(
+    near_dup_groups: list[ImageNearDupGroup],
+) -> list[ReportGroup]:
+    """Convert every :class:`ImageNearDupGroup` into a :class:`ReportGroup`.
+
+    v0.7: near-dup groups discard the largest-Hamming-distance-from-the-
+    keeper member(s) via the exact-duplicate rail.  Keeper heuristic:
+    the largest file (in bytes) wins.  This is deliberately simple —
+    photo re-encodes almost always shrink the file, so "keep the biggest"
+    picks the original in the overwhelming majority of cases and avoids
+    reaching into the full scorer for a marginal-quality signal.
+    """
+    out: list[ReportGroup] = []
+    for i, ng in enumerate(near_dup_groups):
+        keeper_idx = max(
+            range(len(ng.members)), key=lambda j: (ng.members[j].size, str(ng.members[j].path))
+        )
+        similarity_pct = 100.0 * (1.0 - ng.max_distance / ng.phash_bits)
+        members: list[ReportMember] = []
+        keeper_size = ng.members[keeper_idx].size
+        reclaim = 0
+        for j, rec in enumerate(ng.members):
+            is_keeper = j == keeper_idx
+            signals: list[ReportSignal] = []
+            score = 0.0
+            if is_keeper:
+                signals.append(
+                    ReportSignal(
+                        name="keeper: largest byte size",
+                        contribution=0.0,
+                    )
+                )
+            else:
+                # Score penalty scales with how much smaller the discard
+                # is than the keeper — a heavily-compressed re-encode
+                # gets a steeper penalty than a mild rewrite so the
+                # order in the report matches intuition.
+                shrink_ratio = 1.0 - (rec.size / keeper_size) if keeper_size else 0.0
+                w = -1.0 - shrink_ratio
+                signals.append(
+                    ReportSignal(
+                        name=f"perceptual near-dup (distance {ng.max_distance}/{ng.phash_bits})",
+                        contribution=w,
+                    )
+                )
+                score = w
+                reclaim += rec.size
+            members.append(
+                ReportMember(
+                    path=rec.path,
+                    size=rec.size,
+                    mtime=rec.mtime,
+                    hash=rec.full_hash,
+                    score=score,
+                    signals=signals,
+                    is_proposed_keeper=is_keeper,
+                    is_informational=False,
+                    source_id=rec.source_id,
+                )
+            )
+        out.append(
+            ReportGroup(
+                id=f"image-near-dup-{i:04d}",
+                kind="image-near-dup",
+                size=keeper_size,
+                hash=f"image-near-dup-{i:04d}",
+                reclaim_bytes=reclaim,
+                members=members,
+                similarity_pct=similarity_pct,
+                image_near_dup=ImageNearDupSignal(
+                    max_pairwise_distance=ng.max_distance,
+                    hash_bits=ng.phash_bits,
+                    min_size=ng.size_range[0],
+                    max_size=ng.size_range[1],
+                ),
+            )
+        )
+    return out
+
+
+def _build_audio_near_dup_report_groups(
+    near_dup_groups: list[AudioNearDupGroup],
+) -> list[ReportGroup]:
+    """Convert every :class:`AudioNearDupGroup` into a :class:`ReportGroup`.
+
+    v0.8: keeper heuristic is the same "largest byte size wins" rule the
+    image-near-dup builder uses — same-song re-encodes at lower bitrates
+    almost always shrink the file, so keeping the biggest picks the
+    original in the overwhelming majority of cases.
+    """
+    out: list[ReportGroup] = []
+    for i, ng in enumerate(near_dup_groups):
+        keeper_idx = max(
+            range(len(ng.members)),
+            key=lambda j: (ng.members[j].size, str(ng.members[j].path)),
+        )
+        similarity_pct = 100.0 * ng.min_similarity
+        keeper_size = ng.members[keeper_idx].size
+        members: list[ReportMember] = []
+        reclaim = 0
+        for j, rec in enumerate(ng.members):
+            is_keeper = j == keeper_idx
+            signals: list[ReportSignal] = []
+            score = 0.0
+            if is_keeper:
+                signals.append(
+                    ReportSignal(
+                        name="keeper: largest byte size",
+                        contribution=0.0,
+                    )
+                )
+            else:
+                shrink_ratio = 1.0 - (rec.size / keeper_size) if keeper_size else 0.0
+                w = -1.0 - shrink_ratio
+                signals.append(
+                    ReportSignal(
+                        name=(
+                            "chromaprint near-dup "
+                            f"(similarity {ng.min_similarity:.3f})"
+                        ),
+                        contribution=w,
+                    )
+                )
+                score = w
+                reclaim += rec.size
+            members.append(
+                ReportMember(
+                    path=rec.path,
+                    size=rec.size,
+                    mtime=rec.mtime,
+                    hash=rec.full_hash,
+                    score=score,
+                    signals=signals,
+                    is_proposed_keeper=is_keeper,
+                    is_informational=False,
+                    source_id=rec.source_id,
+                )
+            )
+        out.append(
+            ReportGroup(
+                id=f"audio-near-dup-{i:04d}",
+                kind="audio-near-dup",
+                size=keeper_size,
+                hash=f"audio-near-dup-{i:04d}",
+                reclaim_bytes=reclaim,
+                members=members,
+                similarity_pct=similarity_pct,
+                audio_near_dup=AudioNearDupSignal(
+                    min_similarity=ng.min_similarity,
+                    duration_min_seconds=ng.duration_range[0],
+                    duration_max_seconds=ng.duration_range[1],
+                ),
+            )
+        )
+    return out
+
+
+def _build_video_near_dup_report_groups(
+    near_dup_groups: list[VideoNearDupGroup],
+) -> list[ReportGroup]:
+    """Convert every :class:`VideoNearDupGroup` into a :class:`ReportGroup`.
+
+    v0.8: keeper heuristic same as audio / image — largest byte size
+    wins.  A re-encoded video typically compresses to a smaller file, so
+    the biggest member is almost always the original.
+    """
+    out: list[ReportGroup] = []
+    for i, ng in enumerate(near_dup_groups):
+        keeper_idx = max(
+            range(len(ng.members)),
+            key=lambda j: (ng.members[j].size, str(ng.members[j].path)),
+        )
+        similarity_pct = 100.0 * ng.min_similarity
+        keeper_size = ng.members[keeper_idx].size
+        members: list[ReportMember] = []
+        reclaim = 0
+        for j, rec in enumerate(ng.members):
+            is_keeper = j == keeper_idx
+            signals: list[ReportSignal] = []
+            score = 0.0
+            if is_keeper:
+                signals.append(
+                    ReportSignal(
+                        name="keeper: largest byte size",
+                        contribution=0.0,
+                    )
+                )
+            else:
+                shrink_ratio = 1.0 - (rec.size / keeper_size) if keeper_size else 0.0
+                w = -1.0 - shrink_ratio
+                signals.append(
+                    ReportSignal(
+                        name=(
+                            "keyframe-pHash near-dup "
+                            f"(similarity {ng.min_similarity:.3f})"
+                        ),
+                        contribution=w,
+                    )
+                )
+                score = w
+                reclaim += rec.size
+            members.append(
+                ReportMember(
+                    path=rec.path,
+                    size=rec.size,
+                    mtime=rec.mtime,
+                    hash=rec.full_hash,
+                    score=score,
+                    signals=signals,
+                    is_proposed_keeper=is_keeper,
+                    is_informational=False,
+                    source_id=rec.source_id,
+                )
+            )
+        out.append(
+            ReportGroup(
+                id=f"video-near-dup-{i:04d}",
+                kind="video-near-dup",
+                size=keeper_size,
+                hash=f"video-near-dup-{i:04d}",
+                reclaim_bytes=reclaim,
+                members=members,
+                similarity_pct=similarity_pct,
+                video_near_dup=VideoNearDupSignal(
+                    min_similarity=ng.min_similarity,
+                    duration_min_seconds=ng.duration_range[0],
+                    duration_max_seconds=ng.duration_range[1],
+                ),
+            )
+        )
+    return out
+
+
+
+
 @app.command()
 def scan(
     roots: Annotated[
@@ -464,6 +716,85 @@ def scan(
             ),
         ),
     ] = None,
+    include_image_near_dup: Annotated[
+        bool,
+        typer.Option(
+            "--include-image-near-dup/--no-include-image-near-dup",
+            help=(
+                "Cluster images that render the same but are not byte-"
+                "identical (perceptual hash + Hamming distance). Default "
+                "on; pass --no-include-image-near-dup to skip."
+            ),
+        ),
+    ] = True,
+    image_near_dup_distance: Annotated[
+        int,
+        typer.Option(
+            "--image-near-dup-distance",
+            help=(
+                "Maximum pHash Hamming distance (out of 256 bits) at which "
+                "two images cluster as near-duplicates. Default 8 (≈3%%)."
+            ),
+        ),
+    ] = 8,
+    image_near_dup_min_size: Annotated[
+        int,
+        typer.Option(
+            "--image-near-dup-min-size",
+            help=(
+                "Minimum file size (bytes) below which an image is dropped "
+                "from near-duplicate clustering. Default 10000 — filters "
+                "thumbnails and favicons whose pHash collapses too aggressively."
+            ),
+        ),
+    ] = 10_000,
+    include_audio_near_dup: Annotated[
+        bool,
+        typer.Option(
+            "--include-audio-near-dup/--no-include-audio-near-dup",
+            help=(
+                "Cluster audio files that encode to the same song at "
+                "different bitrates / containers via Chromaprint "
+                "fingerprints (requires the `fpcalc` binary from the "
+                "Homebrew `chromaprint` package). Default on; pass "
+                "--no-include-audio-near-dup to skip."
+            ),
+        ),
+    ] = True,
+    audio_similarity_threshold: Annotated[
+        float,
+        typer.Option(
+            "--audio-similarity-threshold",
+            help=(
+                "Minimum Chromaprint fingerprint similarity (0.0-1.0) at "
+                "which two audio files cluster as near-duplicates. "
+                "Default 0.95."
+            ),
+        ),
+    ] = 0.95,
+    include_video_near_dup: Annotated[
+        bool,
+        typer.Option(
+            "--include-video-near-dup/--no-include-video-near-dup",
+            help=(
+                "Cluster videos re-encoded in different containers via "
+                "ffmpeg keyframe pHash signatures (requires the `ffmpeg` "
+                "binary at /opt/homebrew/bin/ffmpeg or "
+                "/usr/local/bin/ffmpeg). Default on; pass "
+                "--no-include-video-near-dup to skip."
+            ),
+        ),
+    ] = True,
+    video_similarity_threshold: Annotated[
+        float,
+        typer.Option(
+            "--video-similarity-threshold",
+            help=(
+                "Minimum keyframe-pHash similarity (0.0-1.0) at which "
+                "two videos cluster as near-duplicates. Default 0.90."
+            ),
+        ),
+    ] = 0.90,
 ) -> None:
     """Walk, hash, group, score, and write a report."""
     # v0.2 sub-milestone 5e: cross-source scan is enabled.  The 5b refusal
@@ -535,6 +866,10 @@ def scan(
     # cache clear.  Cheap SQL DELETE; rows only get "stale" 90+ days after
     # their last successful hash so warm entries are not touched.
     store.purge_stale_cloud_hashes(max_age_days=cloud_hash_ttl_days)
+    # v0.7: mirror the sweep for perceptual-hash cache rows.  Same 90-day
+    # TTL default so warm entries survive while the table cannot grow
+    # without bound after a long stretch without ``dc cache clear``.
+    store.purge_stale_phashes(max_age_days=cloud_hash_ttl_days)
 
     file_count = 0
     archive_paths: list[Path] = []
@@ -823,6 +1158,140 @@ def scan(
                 report_groups.append(trg)
                 total_reclaim += trg.reclaim_bytes
 
+    # v0.7 image near-duplicate aggregation.  Skipped in discover mode
+    # (a discovery inventory should not propose keepers) and gated by
+    # the --include-image-near-dup flag so users can opt out of the
+    # extra decode pass.  Runs AFTER the tree pass so images that live
+    # inside a project-tree discard are not re-clustered — the tree
+    # discard already covers them.
+    image_near_dup_report_groups: list[ReportGroup] = []
+    if not discover and include_image_near_dup:
+        near_dup_input: list[HashedRecord] = all_hashed
+        # Exclude records inside a detected project tree — the tree
+        # aggregate is the atomic discard unit; per-image near-dups
+        # inside it would fight cohesion invariants.
+        if project_roots_detected:
+            near_dup_input = [
+                r
+                for r in near_dup_input
+                if not any(_lexical_contains(root, r.path) for root in project_roots_detected)
+            ]
+        near_dup = find_image_near_duplicates(
+            near_dup_input,
+            distance_threshold=image_near_dup_distance,
+            min_size=image_near_dup_min_size,
+            store=store,
+        )
+        if near_dup:
+            image_near_dup_report_groups = _build_image_near_dup_report_groups(near_dup)
+            store.record_group(
+                "image-near-dup",
+                [
+                    (
+                        Path(m.path),
+                        m.score,
+                        m.is_proposed_keeper,
+                        m.is_informational,
+                    )
+                    for g in image_near_dup_report_groups
+                    for m in g.members
+                ],
+            )
+            for ing in image_near_dup_report_groups:
+                total_reclaim += ing.reclaim_bytes
+
+    # v0.8 audio near-duplicate aggregation.  Chromaprint fingerprints via
+    # ``fpcalc`` — a missing binary short-circuits every candidate to
+    # ``None`` and the pass ends up with zero groups.  Same cohesion rail
+    # as image-near-dup: records inside a detected project tree are
+    # excluded so the tree aggregate stays the atomic discard unit.
+    audio_near_dup_report_groups: list[ReportGroup] = []
+    if not discover and include_audio_near_dup:
+        if not is_fpcalc_available():
+            console.print(
+                "[yellow]--include-audio-near-dup[/yellow] requested but "
+                "the [cyan]fpcalc[/cyan] binary is not on $PATH — install "
+                "the Homebrew [cyan]chromaprint[/cyan] package or pass "
+                "[cyan]--no-include-audio-near-dup[/cyan] to silence this "
+                "warning."
+            )
+        audio_input: list[HashedRecord] = all_hashed
+        if project_roots_detected:
+            audio_input = [
+                r
+                for r in audio_input
+                if not any(_lexical_contains(root, r.path) for root in project_roots_detected)
+            ]
+        audio_near_dup = find_audio_near_duplicates(
+            audio_input,
+            similarity_threshold=audio_similarity_threshold,
+            store=store,
+        )
+        if audio_near_dup:
+            audio_near_dup_report_groups = _build_audio_near_dup_report_groups(
+                audio_near_dup
+            )
+            store.record_group(
+                "audio-near-dup",
+                [
+                    (
+                        Path(m.path),
+                        m.score,
+                        m.is_proposed_keeper,
+                        m.is_informational,
+                    )
+                    for g in audio_near_dup_report_groups
+                    for m in g.members
+                ],
+            )
+            for ang in audio_near_dup_report_groups:
+                total_reclaim += ang.reclaim_bytes
+
+    # v0.8 video near-duplicate aggregation.  ffmpeg keyframe pHashes via
+    # a hardcoded absolute path — never resolved through $PATH.  Same
+    # cohesion rail as audio / image.
+    video_near_dup_report_groups: list[ReportGroup] = []
+    if not discover and include_video_near_dup:
+        if not is_ffmpeg_available():
+            console.print(
+                "[yellow]--include-video-near-dup[/yellow] requested but "
+                "no [cyan]ffmpeg[/cyan] binary was found at "
+                "/opt/homebrew/bin/ffmpeg or /usr/local/bin/ffmpeg — "
+                "install Homebrew [cyan]ffmpeg[/cyan] or pass "
+                "[cyan]--no-include-video-near-dup[/cyan] to silence."
+            )
+        video_input: list[HashedRecord] = all_hashed
+        if project_roots_detected:
+            video_input = [
+                r
+                for r in video_input
+                if not any(_lexical_contains(root, r.path) for root in project_roots_detected)
+            ]
+        video_near_dup = find_video_near_duplicates(
+            video_input,
+            similarity_threshold=video_similarity_threshold,
+            store=store,
+        )
+        if video_near_dup:
+            video_near_dup_report_groups = _build_video_near_dup_report_groups(
+                video_near_dup
+            )
+            store.record_group(
+                "video-near-dup",
+                [
+                    (
+                        Path(m.path),
+                        m.score,
+                        m.is_proposed_keeper,
+                        m.is_informational,
+                    )
+                    for g in video_near_dup_report_groups
+                    for m in g.members
+                ],
+            )
+            for vng in video_near_dup_report_groups:
+                total_reclaim += vng.reclaim_bytes
+
     # Singletons — hashes that appear exactly once across the whole scan,
     # excluding archive members (which are informational by construction).
     hash_counts: dict[str, int] = {}
@@ -852,12 +1321,20 @@ def scan(
     report = Report(
         roots=[Path(r).expanduser().resolve() for r in roots],
         total_files_scanned=file_count,
-        total_groups=len(report_groups),
+        total_groups=(
+            len(report_groups)
+            + len(image_near_dup_report_groups)
+            + len(audio_near_dup_report_groups)
+            + len(video_near_dup_report_groups)
+        ),
         total_reclaim_bytes=total_reclaim,
         groups=report_groups,
         singletons=singletons,
         archive_skips=archive_skips,
         not_yet_hashed_buckets=not_yet_hashed,
+        image_near_dup_groups=image_near_dup_report_groups,
+        audio_near_dup_groups=audio_near_dup_report_groups,
+        video_near_dup_groups=video_near_dup_report_groups,
         discover=discover,
     )
     html_path, json_path = render_report(report, report_dir)
@@ -874,6 +1351,18 @@ def scan(
         tbl.add_row(
             "Per-file groups collapsed",
             str(exact_groups_covered_dropped),
+        )
+    if image_near_dup_report_groups:
+        tbl.add_row(
+            "Image near-dup groups", str(len(image_near_dup_report_groups))
+        )
+    if audio_near_dup_report_groups:
+        tbl.add_row(
+            "Audio near-dup groups", str(len(audio_near_dup_report_groups))
+        )
+    if video_near_dup_report_groups:
+        tbl.add_row(
+            "Video near-dup groups", str(len(video_near_dup_report_groups))
         )
     tbl.add_row("Unique files", str(len(singletons)))
     tbl.add_row("Skipped archives", str(len(archive_skips)))

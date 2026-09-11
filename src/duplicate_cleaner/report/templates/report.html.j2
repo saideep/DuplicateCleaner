@@ -38,12 +38,24 @@
   .badge.info    { background: #ef6c00; }
   .badge.recon   { background: #1565c0; margin-left: 0.3em; }
   .badge.tree    { background: #6a1b9a; margin-left: 0.3em; }
+  .badge.imgdup    { background: #00838f; margin-left: 0.3em; }
+  .badge.audio-dup { background: #ad1457; margin-left: 0.3em; }
+  .badge.video-dup { background: #4527a0; margin-left: 0.3em; }
   .tree-group    { border-left: 5px solid #6a1b9a; }
   .tree-meta     { background: #f3e5f5; padding: 0.6em 0.9em; border-radius: 4px;
                    margin: 0.5em 0 0.9em 0; font-size: 0.9em; }
   .tree-diff     { margin-top: 0.5em; font-size: 0.85em; color: #444; }
   .tree-diff table { margin-top: 0.3em; }
   .tree-diff td, .tree-diff th { font-size: 0.8em; }
+  .imgdup-group    { border-left: 5px solid #00838f; }
+  .audio-dup-group { border-left: 5px solid #ad1457; }
+  .video-dup-group { border-left: 5px solid #4527a0; }
+  .audio-dup-meta  { background: #fce4ec; padding: 0.6em 0.9em; border-radius: 4px;
+                     margin: 0.5em 0 0.9em 0; font-size: 0.9em; }
+  .video-dup-meta  { background: #ede7f6; padding: 0.6em 0.9em; border-radius: 4px;
+                     margin: 0.5em 0 0.9em 0; font-size: 0.9em; }
+  .imgdup-meta   { background: #e0f7fa; padding: 0.6em 0.9em; border-radius: 4px;
+                   margin: 0.5em 0 0.9em 0; font-size: 0.9em; }
   footer { margin-top: 3em; font-size: 0.85em; color: #888; }
   code { background: #f2f2f4; padding: 0.05em 0.35em; border-radius: 3px; }
 </style>
@@ -149,6 +161,191 @@
     </table>
   </details>
   {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
+{% set image_near_dup_groups = report.image_near_dup_groups %}
+{% if image_near_dup_groups %}
+<h2>Image near-duplicates ({{ image_near_dup_groups | length }})</h2>
+<p>Two or more images that render as the same picture but do not match byte-for-byte —
+   typical causes are a re-encode, resize, colour-space tweak, or metadata rewrite.
+   Discards flow through the same per-file trash rail as exact duplicates.</p>
+
+{% for g in image_near_dup_groups %}
+<div class="group imgdup-group">
+  <h3><span class="badge imgdup">IMAGE NEAR-DUP</span> Group {{ g.id }}</h3>
+  <div class="imgdup-meta">
+    {% if g.image_near_dup %}
+      Hamming distance <strong>{{ g.image_near_dup.max_pairwise_distance }}/{{ g.image_near_dup.hash_bits }}</strong>
+      · similarity <strong>{{ (g.similarity_pct or 0) | round(1) }}%</strong>
+      · size range <strong>{{ g.image_near_dup.min_size | human_bytes }}</strong>
+      – <strong>{{ g.image_near_dup.max_size | human_bytes }}</strong>
+      · reclaim <strong>{{ g.reclaim_bytes | human_bytes }}</strong>
+    {% else %}
+      reclaim <strong>{{ g.reclaim_bytes | human_bytes }}</strong>
+    {% endif %}
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:64px;"></th>
+        <th>Path</th>
+        <th style="width:100px;">Size</th>
+        <th style="width:70px;">Score</th>
+        <th>Signals</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for m in g.members %}
+      <tr class="{% if m.is_proposed_keeper %}keeper{% endif %}">
+        <td>
+          {% if m.is_proposed_keeper %}
+            <span class="badge keep">KEEP</span>
+          {% else %}
+            <span class="badge discard">TRASH</span>
+          {% endif %}
+        </td>
+        <td class="path {% if not m.is_proposed_keeper %}discard{% endif %}">
+          <span class="path-text">{{ m.path }}</span>
+        </td>
+        <td>{{ m.size | human_bytes }}</td>
+        <td class="score">{{ m.score | signed }}</td>
+        <td class="signals">
+          <ul>
+            {% for s in m.signals %}
+              <li>{{ s.name }}{% if s.contribution != 0 %}: {{ s.contribution | signed }}{% endif %}</li>
+            {% endfor %}
+          </ul>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endfor %}
+{% endif %}
+
+{% set audio_near_dup_groups = report.audio_near_dup_groups %}
+{% if audio_near_dup_groups %}
+<h2>Audio near-duplicates ({{ audio_near_dup_groups | length }})</h2>
+<p>Two or more audio files that fingerprint (via Chromaprint) to the same song
+   but do not match byte-for-byte — typical causes are a re-encode at a lower
+   bitrate, a container swap (MP3 vs M4A), or a tag rewrite.  Discards flow
+   through the same per-file trash rail as exact duplicates.</p>
+
+{% for g in audio_near_dup_groups %}
+<div class="group audio-dup-group">
+  <h3><span class="badge audio-dup">AUDIO NEAR-DUP</span> Group {{ g.id }}</h3>
+  <div class="audio-dup-meta">
+    {% if g.audio_near_dup %}
+      similarity <strong>{{ (g.similarity_pct or 0) | round(1) }}%</strong>
+      · duration range
+      <strong>{{ g.audio_near_dup.duration_min_seconds | round(1) }}s</strong>
+      – <strong>{{ g.audio_near_dup.duration_max_seconds | round(1) }}s</strong>
+      · reclaim <strong>{{ g.reclaim_bytes | human_bytes }}</strong>
+    {% else %}
+      reclaim <strong>{{ g.reclaim_bytes | human_bytes }}</strong>
+    {% endif %}
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:64px;"></th>
+        <th>Path</th>
+        <th style="width:100px;">Size</th>
+        <th style="width:70px;">Score</th>
+        <th>Signals</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for m in g.members %}
+      <tr class="{% if m.is_proposed_keeper %}keeper{% endif %}">
+        <td>
+          {% if m.is_proposed_keeper %}
+            <span class="badge keep">KEEP</span>
+          {% else %}
+            <span class="badge discard">TRASH</span>
+          {% endif %}
+        </td>
+        <td class="path {% if not m.is_proposed_keeper %}discard{% endif %}">
+          <span class="path-text">{{ m.path }}</span>
+        </td>
+        <td>{{ m.size | human_bytes }}</td>
+        <td class="score">{{ m.score | signed }}</td>
+        <td class="signals">
+          <ul>
+            {% for s in m.signals %}
+              <li>{{ s.name }}{% if s.contribution != 0 %}: {{ s.contribution | signed }}{% endif %}</li>
+            {% endfor %}
+          </ul>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endfor %}
+{% endif %}
+
+{% set video_near_dup_groups = report.video_near_dup_groups %}
+{% if video_near_dup_groups %}
+<h2>Video near-duplicates ({{ video_near_dup_groups | length }})</h2>
+<p>Two or more videos whose evenly-spaced keyframes render as the same footage
+   but that do not match byte-for-byte — typical causes are a re-encode,
+   container swap, or resolution downscale.  Discards flow through the same
+   per-file trash rail as exact duplicates.</p>
+
+{% for g in video_near_dup_groups %}
+<div class="group video-dup-group">
+  <h3><span class="badge video-dup">VIDEO NEAR-DUP</span> Group {{ g.id }}</h3>
+  <div class="video-dup-meta">
+    {% if g.video_near_dup %}
+      similarity <strong>{{ (g.similarity_pct or 0) | round(1) }}%</strong>
+      · duration range
+      <strong>{{ g.video_near_dup.duration_min_seconds | round(1) }}s</strong>
+      – <strong>{{ g.video_near_dup.duration_max_seconds | round(1) }}s</strong>
+      · reclaim <strong>{{ g.reclaim_bytes | human_bytes }}</strong>
+    {% else %}
+      reclaim <strong>{{ g.reclaim_bytes | human_bytes }}</strong>
+    {% endif %}
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:64px;"></th>
+        <th>Path</th>
+        <th style="width:100px;">Size</th>
+        <th style="width:70px;">Score</th>
+        <th>Signals</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for m in g.members %}
+      <tr class="{% if m.is_proposed_keeper %}keeper{% endif %}">
+        <td>
+          {% if m.is_proposed_keeper %}
+            <span class="badge keep">KEEP</span>
+          {% else %}
+            <span class="badge discard">TRASH</span>
+          {% endif %}
+        </td>
+        <td class="path {% if not m.is_proposed_keeper %}discard{% endif %}">
+          <span class="path-text">{{ m.path }}</span>
+        </td>
+        <td>{{ m.size | human_bytes }}</td>
+        <td class="score">{{ m.score | signed }}</td>
+        <td class="signals">
+          <ul>
+            {% for s in m.signals %}
+              <li>{{ s.name }}{% if s.contribution != 0 %}: {{ s.contribution | signed }}{% endif %}</li>
+            {% endfor %}
+          </ul>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
 </div>
 {% endfor %}
 {% endif %}

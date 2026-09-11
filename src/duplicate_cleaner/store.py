@@ -115,6 +115,51 @@ CREATE TABLE IF NOT EXISTS file_signals (
 );
 CREATE INDEX IF NOT EXISTS idx_file_signals_path
     ON file_signals(source_id, path);
+
+-- v0.7 image near-duplicate detection.  Perceptual hashes (imagehash pHash
+-- at hash_size=16 → 256 bits → 64 hex chars) are cached per local path so
+-- a repeat scan on an unchanged image reuses the hash rather than re-
+-- opening the file and re-running the DCT.  Keyed on (path, size, mtime)
+-- to invalidate the same way ``files`` does.  TTL sweep at scan start
+-- mirrors ``cloud_hash_cache``.
+CREATE TABLE IF NOT EXISTS image_phash_cache (
+    path         TEXT PRIMARY KEY,
+    size         INTEGER NOT NULL,
+    mtime        REAL NOT NULL,
+    phash        TEXT NOT NULL,
+    computed_ts  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_image_phash_cache_computed_ts
+    ON image_phash_cache(computed_ts);
+
+-- v0.8 audio near-duplicate detection.  Chromaprint fingerprints (via
+-- pyacoustid / the ``fpcalc`` binary) are stored as ``"duration:fingerprint"``
+-- text so downstream comparators can duration-filter before running the
+-- more expensive fingerprint compare.  Keyed on (path, size, mtime); TTL
+-- sweep mirrors ``cloud_hash_cache`` / ``image_phash_cache``.
+CREATE TABLE IF NOT EXISTS audio_fingerprint_cache (
+    path         TEXT PRIMARY KEY,
+    size         INTEGER NOT NULL,
+    mtime        REAL NOT NULL,
+    fingerprint  TEXT NOT NULL,
+    computed_ts  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audio_fingerprint_cache_computed_ts
+    ON audio_fingerprint_cache(computed_ts);
+
+-- v0.8 video near-duplicate detection.  N keyframe pHashes joined into
+-- ``"duration:phash1,phash2,..."`` — captured via ffmpeg + imagehash.
+-- Cached per local path with (size, mtime) invalidation like the audio
+-- table.  TTL sweep at scan start.
+CREATE TABLE IF NOT EXISTS video_signature_cache (
+    path         TEXT PRIMARY KEY,
+    size         INTEGER NOT NULL,
+    mtime        REAL NOT NULL,
+    signature    TEXT NOT NULL,
+    computed_ts  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_video_signature_cache_computed_ts
+    ON video_signature_cache(computed_ts);
 """
 
 # v0.2 schema version — bumped whenever ``files`` picks up new columns or
@@ -503,7 +548,10 @@ class Store:
         """Truncate all cache tables."""
         self._conn.executescript(
             "DELETE FROM files; DELETE FROM groups; DELETE FROM group_members; "
-            "DELETE FROM scan_stage; DELETE FROM cloud_hash_cache;"
+            "DELETE FROM scan_stage; DELETE FROM cloud_hash_cache; "
+            "DELETE FROM image_phash_cache; "
+            "DELETE FROM audio_fingerprint_cache; "
+            "DELETE FROM video_signature_cache;"
         )
         self._conn.commit()
 
@@ -611,6 +659,52 @@ class Store:
         )
         self._conn.commit()
 
+    def get_cached_phash(
+        self, path: Path, size: int, mtime: float
+    ) -> str | None:
+        """Return the cached perceptual hash for ``path`` if stats match, else None.
+
+        v0.7 image near-duplicate detection.  Same eps-tolerant mtime match
+        as :meth:`get_cached_hash` — SQLite REAL round-trip can lose the
+        last bit of a float, so an exact match check would silently drop
+        cache hits.
+        """
+        cur = self._conn.execute(
+            "SELECT phash FROM image_phash_cache "
+            "WHERE path = ? AND size = ? AND ABS(mtime - ?) <= ?",
+            (str(path), size, mtime, _MTIME_EPS),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        h = row["phash"]
+        return h if isinstance(h, str) else None
+
+    def put_phash(
+        self, path: Path, size: int, mtime: float, phash: str
+    ) -> None:
+        """Persist a computed perceptual hash for a local image path.  Idempotent."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO image_phash_cache "
+            "(path, size, mtime, phash, computed_ts) VALUES (?, ?, ?, ?, ?)",
+            (str(path), size, mtime, phash, time.time()),
+        )
+        self._conn.commit()
+
+    def purge_stale_phashes(self, max_age_days: float = 90.0) -> int:
+        """Drop image_phash_cache rows older than ``max_age_days``.
+
+        Mirror of :meth:`purge_stale_cloud_hashes` — cheap disk hygiene at
+        scan start so the cache DB never grows without bound.  Rows for
+        still-live images are re-populated on the next scan.
+        """
+        cutoff = time.time() - (max_age_days * 86400.0)
+        cur = self._conn.execute(
+            "DELETE FROM image_phash_cache WHERE computed_ts < ?", (cutoff,)
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
+
     def purge_stale_cloud_hashes(self, max_age_days: float = 90.0) -> int:
         """Drop cloud_hash_cache rows older than ``max_age_days``.
 
@@ -621,6 +715,100 @@ class Store:
         cutoff = time.time() - (max_age_days * 86400.0)
         cur = self._conn.execute(
             "DELETE FROM cloud_hash_cache WHERE computed_ts < ?", (cutoff,)
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
+
+    # ------------------------------------------------------------------ #
+    # v0.8 — audio + video near-duplicate caches.                        #
+    # ------------------------------------------------------------------ #
+
+    def get_cached_audio_fingerprint(
+        self, path: Path, size: int, mtime: float
+    ) -> str | None:
+        """Return the cached ``"duration:fingerprint"`` string or None.
+
+        v0.8 audio near-duplicate detection.  Same eps-tolerant mtime match
+        as :meth:`get_cached_hash` — SQLite REAL round-trip can lose the
+        last bit of a float, so an exact match check would silently drop
+        cache hits.  A miss returns None; :func:`compare.audio.compute_audio_fingerprint`
+        recomputes and (when a store is passed) re-populates the row.
+        """
+        cur = self._conn.execute(
+            "SELECT fingerprint FROM audio_fingerprint_cache "
+            "WHERE path = ? AND size = ? AND ABS(mtime - ?) <= ?",
+            (str(path), size, mtime, _MTIME_EPS),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        fp = row["fingerprint"]
+        return fp if isinstance(fp, str) else None
+
+    def put_audio_fingerprint(
+        self, path: Path, size: int, mtime: float, fingerprint: str
+    ) -> None:
+        """Persist a Chromaprint fingerprint for a local audio path.  Idempotent."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO audio_fingerprint_cache "
+            "(path, size, mtime, fingerprint, computed_ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(path), size, mtime, fingerprint, time.time()),
+        )
+        self._conn.commit()
+
+    def purge_stale_audio_fingerprints(self, max_age_days: float = 90.0) -> int:
+        """Drop audio_fingerprint_cache rows older than ``max_age_days``.
+
+        Mirror of :meth:`purge_stale_phashes` — cheap disk hygiene at scan
+        start so the cache DB never grows without bound.  Rows for still-
+        live audio files are re-populated on the next scan.
+        """
+        cutoff = time.time() - (max_age_days * 86400.0)
+        cur = self._conn.execute(
+            "DELETE FROM audio_fingerprint_cache WHERE computed_ts < ?",
+            (cutoff,),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
+
+    def get_cached_video_signature(
+        self, path: Path, size: int, mtime: float
+    ) -> str | None:
+        """Return the cached ``"duration:phash1,phash2,..."`` signature or None.
+
+        v0.8 video near-duplicate detection.  Same eps-tolerant mtime match
+        as :meth:`get_cached_hash`.
+        """
+        cur = self._conn.execute(
+            "SELECT signature FROM video_signature_cache "
+            "WHERE path = ? AND size = ? AND ABS(mtime - ?) <= ?",
+            (str(path), size, mtime, _MTIME_EPS),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        sig = row["signature"]
+        return sig if isinstance(sig, str) else None
+
+    def put_video_signature(
+        self, path: Path, size: int, mtime: float, signature: str
+    ) -> None:
+        """Persist a video signature (duration + keyframe pHashes) for a local path."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO video_signature_cache "
+            "(path, size, mtime, signature, computed_ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(path), size, mtime, signature, time.time()),
+        )
+        self._conn.commit()
+
+    def purge_stale_video_signatures(self, max_age_days: float = 90.0) -> int:
+        """Drop video_signature_cache rows older than ``max_age_days``."""
+        cutoff = time.time() - (max_age_days * 86400.0)
+        cur = self._conn.execute(
+            "DELETE FROM video_signature_cache WHERE computed_ts < ?",
+            (cutoff,),
         )
         self._conn.commit()
         return int(cur.rowcount or 0)
