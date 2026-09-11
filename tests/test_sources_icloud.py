@@ -371,5 +371,126 @@ def test_upload_refused() -> None:
         src.upload("dest/x", iter([b""]), 0)
 
 
+def test_icloud_read_bytes_refuses_excluded_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.6-patch M2: read_bytes refuses a Photos.path pointing at /etc/*.
+
+    Defense-in-depth against a corrupt / tampered Photos database.  A
+    hostile SQLite blob returning ``path='/etc/hosts'`` for a photo would,
+    without validation, have those bytes read and hashed into the BLAKE3
+    cache.  The check applies the same EXCLUDED_ROOTS rail the walker
+    already uses on real filesystem paths.
+    """
+    library = tmp_path / "Photos Library.photoslibrary"
+    library.mkdir()
+    # ``/etc/hosts`` exists on macOS and is inside an excluded root.
+    photos = [
+        _FakePhoto(
+            uuid="POISONED-1234-5678-9ABC",
+            path="/etc/hosts",
+            original_filename="hosts",
+        )
+    ]
+    _install_fake_osxphotos(monkeypatch, photos)
+    src = iCloudPhotosSource(
+        account_id="icloud:x",
+        photos_library_path=library,
+    )
+    rec = FileRecord(
+        path=Path("iclouddrive:icloud:x://hosts"),
+        size=1,
+        mtime=0.0,
+        inode=0,
+        dev=0,
+        nlink=1,
+        source_id="icloud:x",
+        cloud_file_id="POISONED-1234-5678-9ABC",
+    )
+    with pytest.raises(SourceError) as exc:
+        list(src.read_bytes(rec))
+    msg = str(exc.value).lower()
+    assert "excluded" in msg or "outside" in msg or "refusing" in msg
+
+
+def test_open_db_permission_denied_raises_source_error_with_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.6-patch M6: PermissionError from PhotosDB gets typed + hinted.
+
+    A macOS host without Full Disk Access granted to Terminal.app raises
+    a raw ``PermissionError`` from the SQLite open call.  Surface as
+    SourceError with the actionable FDA hint so the CLI can print
+    something the user can act on instead of a raw stack trace.
+    """
+    library = tmp_path / "Photos Library.photoslibrary"
+    library.mkdir()
+
+    mod = types.ModuleType("osxphotos")
+
+    def _PhotosDB(dbfile: str) -> object:
+        _ = dbfile
+        raise PermissionError("Operation not permitted")
+
+    mod.PhotosDB = _PhotosDB  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "osxphotos", mod)
+
+    src = iCloudPhotosSource(
+        account_id="icloud:x",
+        photos_library_path=library,
+    )
+    with pytest.raises(SourceError) as exc:
+        list(src.list_files())
+    msg = str(exc.value)
+    assert "Full Disk Access" in msg
+
+
+def test_stub_warning_fires_on_early_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """v0.6-patch M9: stub warning fires even when the caller reads one record.
+
+    ``dc auth test icloud:*`` reads only the first record via
+    ``next(iter(...))``, which triggers ``GeneratorExit`` on the generator.
+    Before v0.6-patch the warning was outside the loop so it never fired
+    on early close; the try/finally now guarantees the log line surfaces.
+    """
+    library = tmp_path / "Photos Library.photoslibrary"
+    library.mkdir()
+    downloaded = tmp_path / "downloaded.HEIC"
+    downloaded.write_bytes(b"abc")
+    photos = [
+        _FakePhoto(uuid="STUB-1", path=None, original_filename="stub-1.HEIC"),
+        _FakePhoto(uuid="STUB-2", path=None, original_filename="stub-2.HEIC"),
+        _FakePhoto(
+            uuid="LOCAL-1",
+            path=str(downloaded),
+            original_filename="downloaded.HEIC",
+        ),
+        _FakePhoto(uuid="STUB-3", path=None, original_filename="stub-3.HEIC"),
+    ]
+    _install_fake_osxphotos(monkeypatch, photos)
+    src = iCloudPhotosSource(
+        account_id="icloud:x",
+        photos_library_path=library,
+    )
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        gen = iter(src.list_files())
+        first = next(gen)
+        # Close the generator immediately — triggers the try/finally.
+        gen.close()  # type: ignore[attr-defined]
+
+    assert first.cloud_file_id == "LOCAL-1"
+    # Two stubs preceded the local record, so at close time stub_count>=2.
+    warn_msgs = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("skipped" in m and "stub" in m for m in warn_msgs), (
+        f"expected stub warning, got: {warn_msgs}"
+    )
+
+
 # Silences unused-import warnings for MagicMock / Any (kept for future extension).
 _ = MagicMock, Any

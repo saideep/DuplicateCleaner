@@ -21,10 +21,16 @@ user at the Photos.app / the underlying filesystem.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from duplicate_cleaner.paths import (
+    is_within,
+    resolve_for_check,
+    validate_not_excluded,
+)
 from duplicate_cleaner.scan.walk import FileRecord
 from duplicate_cleaner.sources.base import (
     SourceDriftError,
@@ -107,85 +113,107 @@ class iCloudPhotosSource:
                 "Pass --library-path or ensure Photos.app has run at least "
                 "once."
             )
-        self._db = osxphotos.PhotosDB(dbfile=str(self._library_path))
+        # v0.6-patch: broaden error handling around ``PhotosDB(...)`` — a
+        # macOS host without Full Disk Access granted to Terminal.app raises
+        # a raw ``PermissionError`` / ``OSError`` from the SQLite open call,
+        # and a locked / corrupt Photos database raises
+        # ``sqlite3.DatabaseError``.  Surface every case as a typed
+        # ``SourceError`` with the FDA hint so the CLI can print an
+        # actionable message instead of a raw stack trace.
+        try:
+            self._db = osxphotos.PhotosDB(dbfile=str(self._library_path))
+        except (OSError, PermissionError, sqlite3.DatabaseError) as exc:
+            raise SourceError(
+                f"Cannot open Photos library at {self._library_path}: {exc}. "
+                "If you see 'Operation not permitted', grant Full Disk "
+                "Access to Terminal.app (or the app running dc) in System "
+                "Settings -> Privacy & Security -> Full Disk Access."
+            ) from exc
         return self._db
 
     def list_files(self) -> Iterator[FileRecord]:
         """Enumerate downloaded photos; skip iCloud-only stubs."""
         db = self._open_db()
         self._stub_count = 0
-        for photo in db.photos():
-            path_raw = getattr(photo, "path", None)
-            if not path_raw:
-                # ``photo.path is None`` → iCloud-only stub (not downloaded
-                # to this Mac).  Count and log without yielding a record so
-                # the report never contains a size=0 phantom.
-                self._stub_count += 1
-                continue
-            local_path = Path(str(path_raw))
-            try:
-                size = int(local_path.stat().st_size)
-            except OSError as exc:
-                log.debug(
-                    "iCloud Photos: skipping %s (stat failed: %s)",
-                    local_path,
-                    exc,
-                )
-                continue
-            uuid = str(getattr(photo, "uuid", "") or "")
-            if not uuid:
-                # osxphotos always populates uuid; missing uuid is a corrupt
-                # library entry — skip rather than fabricate.
-                continue
-            date_obj = getattr(photo, "date", None)
-            mtime = 0.0
-            if date_obj is not None:
+        try:
+            for photo in db.photos():
+                path_raw = getattr(photo, "path", None)
+                if not path_raw:
+                    # ``photo.path is None`` → iCloud-only stub (not
+                    # downloaded to this Mac).  Count and log without yielding
+                    # a record so the report never contains a size=0 phantom.
+                    self._stub_count += 1
+                    continue
+                local_path = Path(str(path_raw))
                 try:
-                    mtime = float(date_obj.timestamp())
-                except (AttributeError, OSError, ValueError):
-                    mtime = 0.0
-            date_modified = getattr(photo, "date_modified", None)
-            # ``date_modified`` may be None for photos never edited after
-            # import; fall back to a stable "unedited" marker so the etag
-            # stays deterministic across scans.
-            date_modified_repr = (
-                date_modified.isoformat()
-                if date_modified is not None and hasattr(date_modified, "isoformat")
-                else "unedited"
-            )
-            etag = f"{uuid}:{date_modified_repr}"
-            filename = str(
-                getattr(photo, "original_filename", None) or local_path.name
-            )
-            virtual = f"iclouddrive:{self.id}://{filename}"
-            yield FileRecord(
-                path=Path(virtual),
-                size=size,
-                mtime=mtime,
-                inode=0,
-                dev=0,
-                nlink=1,
-                source_id=self.id,
-                # No provider-side hash — reconciliation MUST read the local
-                # bytes and BLAKE3 them.  Cached identically to Google Photos
-                # by (source_id, cloud_file_id, etag).
-                foreign_hash=None,
-                etag=etag,
-                cloud_file_id=uuid,
-                # No OAuth identity → owner is unknown.  Every emitted item
-                # is is_shared=False because the local library only contains
-                # this user's own photos.
-                owner=None,
-                is_shared=False,
-            )
-        if self._stub_count:
-            log.warning(
-                "iCloud Photos: skipped %d stubs (files not downloaded "
-                "locally).  Toggle 'Download Originals to This Mac' in "
-                "Photos → Preferences → iCloud to make them "
-                "scannable.",
-                self._stub_count,
-            )
+                    size = int(local_path.stat().st_size)
+                except OSError as exc:
+                    log.debug(
+                        "iCloud Photos: skipping %s (stat failed: %s)",
+                        local_path,
+                        exc,
+                    )
+                    continue
+                uuid = str(getattr(photo, "uuid", "") or "")
+                if not uuid:
+                    # osxphotos always populates uuid; missing uuid is a
+                    # corrupt library entry — skip rather than fabricate.
+                    continue
+                date_obj = getattr(photo, "date", None)
+                mtime = 0.0
+                if date_obj is not None:
+                    try:
+                        mtime = float(date_obj.timestamp())
+                    except (AttributeError, OSError, ValueError):
+                        mtime = 0.0
+                date_modified = getattr(photo, "date_modified", None)
+                # ``date_modified`` may be None for photos never edited after
+                # import; fall back to a stable "unedited" marker so the etag
+                # stays deterministic across scans.
+                date_modified_repr = (
+                    date_modified.isoformat()
+                    if date_modified is not None
+                    and hasattr(date_modified, "isoformat")
+                    else "unedited"
+                )
+                etag = f"{uuid}:{date_modified_repr}"
+                filename = str(
+                    getattr(photo, "original_filename", None) or local_path.name
+                )
+                virtual = f"iclouddrive:{self.id}://{filename}"
+                yield FileRecord(
+                    path=Path(virtual),
+                    size=size,
+                    mtime=mtime,
+                    inode=0,
+                    dev=0,
+                    nlink=1,
+                    source_id=self.id,
+                    # No provider-side hash — reconciliation MUST read the
+                    # local bytes and BLAKE3 them.  Cached identically to
+                    # Google Photos by (source_id, cloud_file_id, etag).
+                    foreign_hash=None,
+                    etag=etag,
+                    cloud_file_id=uuid,
+                    # No OAuth identity → owner is unknown.  Every emitted
+                    # item is is_shared=False because the local library only
+                    # contains this user's own photos.
+                    owner=None,
+                    is_shared=False,
+                )
+        finally:
+            # v0.6-patch: fire the stub-count warning even if the caller
+            # closes the generator early (``next(iter(...))`` from
+            # ``dc auth test``).  Without the try/finally the warning would
+            # only surface after full iteration.
+            if self._stub_count:
+                log.warning(
+                    "iCloud Photos: skipped %d stubs (files not downloaded "
+                    "locally).  Toggle 'Download Originals to This Mac' in "
+                    "Photos -> Preferences -> iCloud to make them "
+                    "scannable.",
+                    self._stub_count,
+                )
 
     def _fetch_photo_by_uuid(self, uuid: str) -> Any:
         """Return the osxphotos ``PhotoInfo`` for ``uuid`` or raise not-found."""
@@ -220,7 +248,35 @@ class iCloudPhotosSource:
                 "no local path (iCloud-only stub)."
             )
         local_path = Path(str(path_raw))
-        with local_path.open("rb") as fh:
+        # v0.6-patch: defense-in-depth against a tampered / corrupt Photos
+        # database.  ``photo.path`` comes from a SQLite blob inside the
+        # .photoslibrary bundle; a hostile database could point at
+        # ``/etc/passwd`` or a symlink into ``/System``.  Apply the same
+        # EXCLUDED_ROOTS rail the walker uses on real filesystem paths and
+        # require containment inside the Photos library bundle so a rogue
+        # entry cannot exfiltrate arbitrary bytes into the report cache.
+        resolved = resolve_for_check(local_path)
+        try:
+            validate_not_excluded(resolved)
+        except ValueError as exc:
+            raise SourceError(
+                f"{record.path}: Photos library returned an excluded path "
+                f"{resolved} for uuid {record.cloud_file_id!r}: {exc}. "
+                "Refusing to read a path outside the safe scan envelope."
+            ) from exc
+        # Photos.app typically stores originals under
+        # ``<Library>.photoslibrary/originals/...`` but referenced files can
+        # sit anywhere in the library's parent directory (usually
+        # ``~/Pictures``).  Require containment inside that parent as the
+        # least-restrictive check that still refuses ``/etc/passwd``.
+        library_parent = resolve_for_check(self._library_path.parent)
+        if not is_within(resolved, library_parent):
+            raise SourceError(
+                f"{record.path}: Photos library returned a path {resolved} "
+                f"outside the library parent {library_parent}. "
+                "Refusing to read; the Photos database may be tampered."
+            )
+        with resolved.open("rb") as fh:
             while True:
                 buf = fh.read(chunk_size)
                 if not buf:

@@ -243,9 +243,22 @@ _GDRIVE_CLOUD_FILE_ID_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_-]{20,}$")
 # so ``root:/../foo`` fails the shape check even before URL-encoding.
 _ONEDRIVE_CLOUD_FILE_ID_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9!]{20,}$")
 
+# Google Photos media item ids are Base64url with ``_`` / ``-``, empirically
+# ~80 chars.  Mirrors ``sources.gphotos._GPHOTOS_ID_RE`` so the mover-level
+# gate refuses the same shape the source itself refuses before a URL is
+# built.  20-char minimum keeps parity with the other cloud providers.
+_GPHOTOS_CLOUD_FILE_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+
+# iCloud Photos uses osxphotos UUIDs (hyphen-separated hex) — accept the
+# 20+ char shape that spans real UUID formats without pinning a strict
+# 36-char UUID pattern (some versions expose bare hex strings).
+_ICLOUD_CLOUD_FILE_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9-]{20,}$")
+
 _PROVIDER_ID_PATTERNS: dict[str, re.Pattern[str]] = {
     "gdrive": _GDRIVE_CLOUD_FILE_ID_RE,
     "onedrive": _ONEDRIVE_CLOUD_FILE_ID_RE,
+    "gphotos": _GPHOTOS_CLOUD_FILE_ID_RE,
+    "icloud": _ICLOUD_CLOUD_FILE_ID_RE,
 }
 
 

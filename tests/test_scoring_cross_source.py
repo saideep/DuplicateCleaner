@@ -81,6 +81,68 @@ def test_local_wins_over_cloud_in_same_group(tmp_path: Path) -> None:
     assert weights_map["cloud entry when local copy exists"] == -3.0
 
 
+def test_gphotos_source_marked_informational(tmp_path: Path) -> None:
+    """v0.6-patch M1: a gphotos: member never becomes a discard candidate.
+
+    Google Photos is read-only in v0.6 (permanently until v0.6.1 escalates
+    scope).  Without informational marking the scorer proposes the gphotos
+    entry as a discard and ``dc apply --commit`` trips the read-only
+    pre-flight tripwire, refusing the whole run.  This test locks in the
+    fix — the gphotos member is marked informational so the local peer
+    remains the sole keeper and no discard is emitted for the group.
+    """
+    active = tmp_path / "Users" / "me"
+    (active / "Documents").mkdir(parents=True)
+    local_path = active / "Documents" / "photo.HEIC"
+    local_path.write_bytes(b"x")
+    gphotos_path = Path("gphotos:personal://photo.HEIC")
+
+    group = Group(
+        hash="H",
+        size=1,
+        members=[
+            _hr(local_path, source_id="local"),
+            _hr(gphotos_path, source_id="gphotos:personal"),
+        ],
+    )
+    cfg = Config(active_homes=[active])
+    members = score_group(group, cfg, DEFAULT_WEIGHTS)
+    by_source = {m.source_id: m for m in members}
+
+    assert by_source["gphotos:personal"].is_informational is True
+    assert by_source["gphotos:personal"].is_proposed_keeper is False
+    assert by_source["local"].is_proposed_keeper is True
+
+
+def test_icloud_source_marked_informational(tmp_path: Path) -> None:
+    """v0.6-patch M1: an icloud: member never becomes a discard candidate.
+
+    iCloud Photos is permanently read-only — deletion goes via Photos.app,
+    not this source.  Symmetric to the gphotos test above.
+    """
+    active = tmp_path / "Users" / "me"
+    (active / "Pictures").mkdir(parents=True)
+    local_path = active / "Pictures" / "photo.HEIC"
+    local_path.write_bytes(b"y")
+    icloud_path = Path("iclouddrive:icloud:personal://photo.HEIC")
+
+    group = Group(
+        hash="H",
+        size=1,
+        members=[
+            _hr(local_path, source_id="local"),
+            _hr(icloud_path, source_id="icloud:personal"),
+        ],
+    )
+    cfg = Config(active_homes=[active])
+    members = score_group(group, cfg, DEFAULT_WEIGHTS)
+    by_source = {m.source_id: m for m in members}
+
+    assert by_source["icloud:personal"].is_informational is True
+    assert by_source["icloud:personal"].is_proposed_keeper is False
+    assert by_source["local"].is_proposed_keeper is True
+
+
 def test_shared_cloud_file_is_informational(tmp_path: Path) -> None:
     """A cloud member with is_shared=True is informational, never a discard."""
     active = tmp_path / "Users" / "me"

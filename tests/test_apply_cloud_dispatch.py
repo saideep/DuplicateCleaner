@@ -392,6 +392,170 @@ def test_apply_cloud_entry_local_only_mode_refuses(tmp_path: Path) -> None:
     assert "local-only" in str(exc.value).lower() or "sources" in str(exc.value)
 
 
+def test_apply_refuses_gphotos_discards(tmp_path: Path) -> None:
+    """v0.6-patch M8: hand-crafted gphotos discard is refused at apply time.
+
+    In production the scorer marks gphotos: entries informational (v0.6-patch
+    M1) so they never surface as proposed discards.  But a hand-edited or
+    downgraded report may still carry one; the mover MUST refuse the whole
+    run before any HTTP call fires — the read-only pre-flight tripwire is
+    the third line of defense (source-side + scorer + mover).
+    """
+    keeper = tmp_path / "keep.bin"
+    keeper.write_bytes(b"x" * 8)
+    disc = ReportMember(
+        path=Path("gphotos:personal://foo.HEIC"),
+        size=8,
+        mtime=1000.0,
+        hash="H" * 32,
+        score=-1.0,
+        signals=[],
+        is_proposed_keeper=False,
+        source_id="gphotos:personal",
+        # Realistic gphotos id — passes shape gate.
+        cloud_file_id="ABCDEFGHIJKLMNOPQRST",
+        etag="ABCDEFGHIJKLMNOPQRST:2026-09-05T12:00:00Z",
+        is_shared=False,
+    )
+    report = Report(
+        roots=[tmp_path],
+        total_files_scanned=2,
+        total_groups=1,
+        total_reclaim_bytes=8,
+        groups=[
+            ReportGroup(
+                id="g1",
+                hash="H" * 32,
+                size=8,
+                reclaim_bytes=8,
+                members=[
+                    ReportMember(
+                        path=keeper,
+                        size=keeper.stat().st_size,
+                        mtime=keeper.stat().st_mtime,
+                        hash="H" * 32,
+                        score=1.0,
+                        signals=[],
+                        is_proposed_keeper=True,
+                    ),
+                    disc,
+                ],
+            )
+        ],
+    )
+    p = tmp_path / "report.json"
+    p.write_text(report.model_dump_json())
+
+    class _FakeGPhotosRegistry:
+        def load(self) -> list[AccountEntry]:
+            return [
+                AccountEntry(
+                    id="gphotos:personal",
+                    type="gphotos",
+                    label="personal",
+                    user="test",
+                    added_ts="",
+                )
+            ]
+
+    # A read-only source — matches how ``_build_sources_for_apply``
+    # constructs GooglePhotosSource in v0.6.
+    src = MagicMock()
+    src.id = "gphotos:personal"
+    src.is_read_only_scan = True
+
+    with pytest.raises(ApplyError) as exc:
+        apply_report(
+            p,
+            commit=True,
+            runs_dir=tmp_path / "runs",
+            registry=_FakeGPhotosRegistry(),  # type: ignore[arg-type]
+            sources={"gphotos:personal": src},
+        )
+    msg = str(exc.value).lower()
+    assert "read-only" in msg or "read_only" in msg or "is_read_only" in msg
+    # No source method was invoked.
+    assert src.check_drift.call_count == 0
+    assert src.move_to_trash.call_count == 0
+
+
+def test_apply_refuses_icloud_discards(tmp_path: Path) -> None:
+    """v0.6-patch M8: symmetric refusal for a hand-crafted icloud discard."""
+    keeper = tmp_path / "keep.bin"
+    keeper.write_bytes(b"x" * 8)
+    disc = ReportMember(
+        path=Path("iclouddrive:icloud:personal://foo.HEIC"),
+        size=8,
+        mtime=1000.0,
+        hash="H" * 32,
+        score=-1.0,
+        signals=[],
+        is_proposed_keeper=False,
+        source_id="icloud:personal",
+        # UUID shape — 20+ chars of [A-Za-z0-9-].
+        cloud_file_id="AAAA-BBBB-CCCC-DDDD-EEEE",
+        etag="AAAA-BBBB-CCCC-DDDD-EEEE:2026-09-05T12:00:00",
+        is_shared=False,
+    )
+    report = Report(
+        roots=[tmp_path],
+        total_files_scanned=2,
+        total_groups=1,
+        total_reclaim_bytes=8,
+        groups=[
+            ReportGroup(
+                id="g1",
+                hash="H" * 32,
+                size=8,
+                reclaim_bytes=8,
+                members=[
+                    ReportMember(
+                        path=keeper,
+                        size=keeper.stat().st_size,
+                        mtime=keeper.stat().st_mtime,
+                        hash="H" * 32,
+                        score=1.0,
+                        signals=[],
+                        is_proposed_keeper=True,
+                    ),
+                    disc,
+                ],
+            )
+        ],
+    )
+    p = tmp_path / "report.json"
+    p.write_text(report.model_dump_json())
+
+    class _FakeIcloudRegistry:
+        def load(self) -> list[AccountEntry]:
+            return [
+                AccountEntry(
+                    id="icloud:personal",
+                    type="icloud",
+                    label="personal",
+                    user="/tmp/lib.photoslibrary",
+                    added_ts="",
+                )
+            ]
+
+    src = MagicMock()
+    src.id = "icloud:personal"
+    src.is_read_only_scan = True
+
+    with pytest.raises(ApplyError) as exc:
+        apply_report(
+            p,
+            commit=True,
+            runs_dir=tmp_path / "runs",
+            registry=_FakeIcloudRegistry(),  # type: ignore[arg-type]
+            sources={"icloud:personal": src},
+        )
+    msg = str(exc.value).lower()
+    assert "read-only" in msg or "read_only" in msg or "is_read_only" in msg
+    assert src.check_drift.call_count == 0
+    assert src.move_to_trash.call_count == 0
+
+
 def test_mid_batch_drift_abort_flushes_prior_entries(tmp_path: Path) -> None:
     """Audit pass 10 finding #3: 3 cloud entries; entry 2 drifts; assert on-disk
     manifest has entry[0] stamped with cloud_trash_id (a successful move) and

@@ -253,6 +253,18 @@ def score_group(
         if m.is_shared:
             m.is_informational = True
 
+    # v0.6-patch — Google Photos + iCloud Photos are read-only sources
+    # (gphotos permanently until v0.6.1 escalates scope; icloud permanently
+    # because osxphotos is a reader library, not a writer).  Marking their
+    # members informational-only here prevents the ``cloud_when_local_exists``
+    # penalty from scoring the read-only member lower than a local peer and
+    # proposing the read-only entry as a discard — which would trip
+    # ``apply/mover.py`` pre-flight and refuse the WHOLE run.  Symmetric to
+    # the ``is_shared`` marking above.
+    for m in members:
+        if m.source_id.startswith(("gphotos:", "icloud:")):
+            m.is_informational = True
+
     # Hard-link detection: two-pass so every member of an inode family is
     # marked informational (not just the second-seen ones). Archive members
     # are excluded — they don't map to a real inode.

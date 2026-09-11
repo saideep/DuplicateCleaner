@@ -89,6 +89,33 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
     return code == 429 or 500 <= code < 600
 
 
+def _is_retryable_cdn_error(exc: BaseException) -> bool:
+    """Return True for transient httpx failures on the Photos CDN stream.
+
+    Symmetric with :func:`_is_retryable_http_error` for the Photos API path,
+    but covers the storage host used by ``read_bytes``.  Google's CDN
+    throttles large libraries with 429s and returns 5xx during transient
+    overload; ``httpx.TransportError`` covers DNS blips, TCP resets, and
+    read timeouts on the same host.
+    """
+    try:
+        import httpx  # type: ignore[import-not-found,import-untyped]
+    except ImportError:
+        return False
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status is None:
+            return False
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            return False
+        return code == 429 or 500 <= code < 600
+    return False
+
+
 def _gphotos_call(callable_: Callable[[], Any]) -> Any:
     """Invoke ``callable_`` with tenacity backoff on 429 / 5xx."""
     from tenacity import (  # type: ignore[import-not-found,import-untyped]
@@ -305,37 +332,84 @@ class GooglePhotosSource:
         # signed storage URL — do NOT forward the OAuth bearer token to
         # that host.
         original_url = base_url + "=d"
-        import httpx  # type: ignore[import-not-found,import-untyped]
+        yield from self._stream_cdn_bytes(record, original_url, chunk_size)
 
-        with (
-            httpx.Client(follow_redirects=True, timeout=60.0) as cli,
-            cli.stream("GET", original_url) as resp,
+    def _stream_cdn_bytes(
+        self, record: FileRecord, original_url: str, chunk_size: int
+    ) -> Iterator[bytes]:
+        """Retry-wrapped CDN stream with content-type and empty-body guards.
+
+        v0.6-patch: wraps the outgoing ``httpx.stream`` in tenacity backoff
+        over 429 / 5xx / transport errors (audit finding M4) and refuses
+        200-with-HTML or zero-byte responses (M5) so a session-expired
+        redirect page can't be hashed as image bytes.
+        """
+        import httpx  # type: ignore[import-not-found,import-untyped]
+        from tenacity import (  # type: ignore[import-not-found,import-untyped]
+            Retrying,
+            retry_if_exception,
+            stop_after_attempt,
+            wait_exponential,
+        )
+
+        def _fetch_chunks() -> list[bytes]:
+            """Perform one CDN stream attempt; retried by the outer loop.
+
+            The chunk list is materialised eagerly so a 429 raised mid-stream
+            still trips the retry classifier — a yielding generator would
+            leak the httpx context out from under tenacity.
+            """
+            with (
+                httpx.Client(follow_redirects=True, timeout=60.0) as cli,
+                cli.stream("GET", original_url) as resp,
+            ):
+                status = getattr(resp, "status_code", 0)
+                if status and status >= 400:
+                    # Raise the httpx status error so tenacity can classify
+                    # 429 / 5xx as retry-worthy.
+                    resp.raise_for_status()
+                content_type = str(resp.headers.get("content-type", "") or "")
+                top = content_type.split("/", 1)[0].lower() if content_type else ""
+                if top not in {"image", "video"}:
+                    raise SourceError(
+                        f"{record.path}: Photos CDN returned unexpected "
+                        f"content-type {content_type!r}; refusing to hash "
+                        "a non-media response (session-expired redirect?)."
+                    )
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes(chunk_size=chunk_size):
+                    if chunk:
+                        total += len(chunk)
+                        chunks.append(chunk)
+                if total == 0:
+                    raise SourceError(
+                        f"{record.path}: Photos CDN returned an empty body "
+                        f"(status {status}); refusing to hash zero bytes."
+                    )
+                return chunks
+
+        chunks: list[bytes] = []
+        for attempt in Retrying(
+            retry=retry_if_exception(_is_retryable_cdn_error),
+            wait=wait_exponential(multiplier=1, min=1, max=60),
+            stop=stop_after_attempt(5),
+            reraise=True,
         ):
-            status = getattr(resp, "status_code", 0)
-            if status and status >= 400:
-                raise SourceError(
-                    f"{record.path}: Photos download failed with "
-                    f"status {status}."
-                )
-            for chunk in resp.iter_bytes(chunk_size=chunk_size):
-                if chunk:
-                    yield chunk
+            with attempt:
+                chunks = _fetch_chunks()
+        yield from chunks
 
     def move_to_trash(self, record: FileRecord) -> TrashedLocation:
-        """Refuse the call — Google Photos trash is deferred to v0.6.1."""
-        # Even before the scope-escalation guard, defense-in-depth: the
-        # read-only tripwire fires when the source is constructed for a
-        # scan.  A caller that has already flipped the flag off still hits
-        # the deferral guard below.
-        if self.is_read_only_scan:
-            raise PermissionError(
-                f"GooglePhotosSource(id={self.id!r}) is read-only during scan; "
-                "construct with is_read_only_scan=False to attempt trashing."
-            )
-        # Even with the flag off, v0.6 does not implement trash — the OAuth
-        # scope obtained via ``dc auth add gphotos`` is
-        # ``photoslibrary.readonly`` which cannot mutate the library.  v0.6.1
-        # will wire a full-access flow and revisit this method.
+        """Refuse the call — Google Photos trash is deferred to v0.6.1.
+
+        v0.6-patch: the redundant ``is_read_only_scan`` tripwire was dropped.
+        The outer construction path pins the flag to ``True`` at every apply
+        site (see ``cli._build_sources_for_apply``), so the branch could
+        never fire in production.  Unconditional ``SourceError`` mirrors the
+        iCloud Photos shape; v0.6.1 will reintroduce a flag-gated write path
+        when scope escalation actually flips.
+        """
         _ = record
         raise SourceError(
             "Google Photos trash deferred to v0.6.1; scope escalation "

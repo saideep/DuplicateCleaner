@@ -259,6 +259,78 @@ def test_cloud_entry_refused_when_is_shared_true(tmp_path: Path) -> None:
     assert "shared" in str(exc.value).lower()
 
 
+def test_gphotos_cloud_file_id_shape_validated_by_mover(tmp_path: Path) -> None:
+    """v0.6-patch M3: mover-level cloud_file_id shape gate covers gphotos.
+
+    Before v0.6-patch ``_PROVIDER_ID_PATTERNS`` had entries only for gdrive
+    and onedrive; a poisoned report with
+    ``source_id='gphotos:personal', cloud_file_id='../evil'`` silently
+    passed the mover's validation.  The source-side gate would still
+    catch it before a URL was interpolated, but the mover-level rail is
+    load-bearing once v0.6.1 wires trash on the source side.
+    """
+    keeper = tmp_path / "keep.bin"
+    keeper.write_bytes(b"x" * 8)
+
+    disc_member = ReportMember(
+        path=Path("gphotos:personal://foo.HEIC"),
+        size=8,
+        mtime=1000.0,
+        hash="H" * 32,
+        score=-1.0,
+        signals=[],
+        is_proposed_keeper=False,
+        source_id="gphotos:personal",
+        cloud_file_id="../evil/foo",
+        etag="e:1",
+        is_shared=False,
+    )
+    report = Report(
+        roots=[tmp_path],
+        total_files_scanned=2,
+        total_groups=1,
+        total_reclaim_bytes=8,
+        groups=[
+            ReportGroup(
+                id="g1",
+                hash="H" * 32,
+                size=8,
+                reclaim_bytes=8,
+                members=[
+                    ReportMember(
+                        path=keeper,
+                        size=keeper.stat().st_size,
+                        mtime=keeper.stat().st_mtime,
+                        hash="H" * 32,
+                        score=1.0,
+                        signals=[],
+                        is_proposed_keeper=True,
+                    ),
+                    disc_member,
+                ],
+            )
+        ],
+    )
+    p = tmp_path / "report.json"
+    p.write_text(report.model_dump_json())
+
+    from unittest.mock import MagicMock
+
+    stub_src = MagicMock()
+    stub_src.is_read_only_scan = False
+    reg = _FakeRegistry(ids=["gphotos:personal"])
+    with pytest.raises(ApplyError) as exc:
+        apply_report(
+            p,
+            commit=False,
+            runs_dir=tmp_path / "runs",
+            registry=reg,  # type: ignore[arg-type]
+            sources={"gphotos:personal": stub_src},
+        )
+    # The gphotos shape regex fires at the mover level (paths.py).
+    assert "shape" in str(exc.value) or "gphotos" in str(exc.value)
+
+
 def test_cloud_path_never_resolved(tmp_path: Path) -> None:
     """Alt-C invariant: cloud ``Path`` is never ``.resolve()``d in the mover.
 

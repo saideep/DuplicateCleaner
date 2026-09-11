@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file. Format: Kee
 
 ## [Unreleased]
 
+### v0.6-patch — closes pass-16 audit findings (2026-09-11)
+
+Sub-milestone patch closing all 9 audit pass-16 findings on top of v0.6 in a single release. Every finding lands with a matching test.
+
+Fixed:
+
+- Scorer marks `gphotos:` / `icloud:` records as informational (M1, must-fix). Without this, `dc apply --commit` refused the entire run on any mixed local + gphotos/icloud scan — the scorer proposed the read-only member as a discard, then the mover pre-flight tripwire aborted the whole run. Symmetric to the existing `is_shared` invariant.
+- iCloud `read_bytes` validates the local file path against EXCLUDED_ROOTS and library-bundle containment before opening it (M2, must-fix). Defense-in-depth against a tampered Photos SQLite database returning `/etc/passwd` or a symlink into `/System`.
+- `paths._PROVIDER_ID_PATTERNS` gains gphotos + icloud entries (M3). The mover-level `cloud_file_id` shape gate now covers all four cloud providers; a poisoned report with `cloud_file_id="../evil"` on gphotos/icloud is refused at `apply_report` pre-flight.
+- Google Photos CDN stream is retried on 429 / 5xx / `httpx.TransportError` (M4). Symmetric to the `mediaItems.get` retry already in place; matches `sources/onedrive.py::_is_retryable_http_error`.
+- Google Photos CDN stream checks `content-type` and cumulative byte count (M5). A 200 response with `content-type: text/html` (session-expired redirect) or an empty body is refused instead of silently BLAKE3-hashed.
+- iCloud `_open_db` catches `OSError`, `PermissionError`, and `sqlite3.DatabaseError` (M6). Surfaces a typed `SourceError` with the actionable Full Disk Access hint instead of a raw stack trace.
+- Google Photos `move_to_trash` raises `SourceError` unconditionally, matching the simpler iCloud shape (M7, simplification). The dropped `is_read_only_scan` `PermissionError` branch was unreachable in production since every apply-time construction site hard-codes `is_read_only_scan=True`.
+- iCloud `list_files` uses try/finally so the "skipped N stubs" warning fires even when the caller closes the generator early (M9). `dc auth test icloud:*` reads only the first record; without this the stub-count warning was silent for the common case.
+
+Added:
+
+- Integration tests for the apply-time refusal of hand-crafted gphotos / icloud discards (M8). Locks in the read-only pre-flight tripwire against a future refactor that flips `is_read_only_scan` off.
+
+Tests: 487 → 497 (10 new tests across `test_scoring_cross_source.py`, `test_sources_gphotos.py`, `test_sources_icloud.py`, `test_mover_source_id_dispatch.py`, `test_apply_cloud_dispatch.py`).
+
 ### v0.6 — Google Photos + iCloud Photos (2026-09-11)
 
 Two new photo-native sources scan alongside Drive / OneDrive / local. Both are read-only in v0.6. Google Photos trashing lands in v0.6.1 (scope escalation from `photoslibrary.readonly` requires user re-consent); iCloud Photos deletion goes via the Photos.app permanently.
