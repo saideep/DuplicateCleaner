@@ -35,6 +35,8 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Migration cleanup refuses without verify** (v0.5-b): `dc migrate cleanup` iterates every `state="done"` entry up-front and raises `CleanupError` before any `Source.move_to_trash` call fires if any entry has `verified=False` OR `verified_ts=None`. Points the operator at `dc migrate verify`. Structural — a mid-batch failure on entry N cannot leave entries 1..(N-1) trashed against an unverified copy.
 - **Cross-algo copies persist a canonical BLAKE3 for strict verify** (v0.5-c): `dc migrate copy` tees the outgoing byte stream through BLAKE3 and stamps `source_blake3` on every successful manifest entry. `dc migrate verify --full` then streams the destination through BLAKE3 to compute `dest_blake3` and compares the two — a real byte-level integrity check even for cross-algo pairs (md5 gdrive → sha256 onedrive). Before v0.5-c, `--full` on a cross-algo pair only streamed the destination and discarded the result; the entry was flipped to `verified=True` on the strength of the etag check alone. Same-algo pairs still take the fast path (compared at copy time via `_hashes_match`); cross-algo pairs are the ones this invariant protects.
 - **Self-copy refusal** (v0.5-c): `plan_migration` raises `ValueError` and `execute_migration` raises `MigrationError` when `source_id == dest_id`. Same-account migration cannot cross an ownership boundary, would burn quota on a duplicate upload, and violates the assumption every downstream tripwire makes about distinct ids.
+- **Google Photos source is read-only in v0.6; move_to_trash refused pending v0.6.1 scope escalation** (v0.6): `GooglePhotosSource` scans via `photoslibrary.readonly` — a scope that cannot mutate the library. `move_to_trash` raises a typed `SourceError` referencing v0.6.1 (which will wire the escalation to the full `photoslibrary` scope via a user re-consent flow). Trashing Google Photos in v0.6 goes through the Google Photos app or web UI at https://photos.google.com.
+- **iCloud Photos source is read-only permanently; deletion goes via the Photos.app** (v0.6): `iCloudPhotosSource` reads the local `~/Pictures/Photos Library.photoslibrary` bundle via `osxphotos`. `osxphotos` is a reader library, not a writer — there is no supported programmatic write path. `move_to_trash` and `restore_from_trash` raise a typed `SourceError` directing the operator to the Photos.app. Users who want to trash the underlying local file can run `dc scan` on `~/Pictures` and go through the normal local-mover rails.
 
 ## Rejected alternatives (do not reopen without new info)
 
@@ -45,6 +47,81 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Perceptual near-dup ahead of organizer** — DROPPED sequencing. Reshuffled: organizer to v0.3, near-dup pushed to v0.7/v0.8.
 
 ## Round-by-round history
+
+### v0.6 — Google Photos + iCloud Photos (2026-09-11)
+
+Ships two new photo-native sources so photos scattered across Google Photos and the local iCloud Photos library scan alongside Drive / OneDrive / local trees.  Both are READ-ONLY at scan time (`is_read_only_scan=True` default); v0.6 does NOT wire trash on either.  Google Photos trash lands in v0.6.1 (scope escalation from `photoslibrary.readonly` to the full `photoslibrary` scope requires user re-consent), iCloud Photos trash is permanently deferred to the Photos.app (osxphotos is a reader library, not a writer).
+
+All 487 tests pass (455 pre-existing + 32 new); `test_no_forbidden_calls.py` still green; ruff clean on every changed file (the pre-existing SIM102 in `organize/mover.py:143` documented in v0.4 unchanged); mypy `--strict` clean on every new file modulo the same pre-existing `unused-ignore` warnings on 3rd-party stubs (googleapiclient / osxphotos) documented in v0.2 sub-milestone 2 and v0.5-a.
+
+Shipped:
+
+- `src/duplicate_cleaner/auth/clients.py` — new Google Photos endpoints: `BUNDLED_GPHOTOS_CLIENT_ID` (BYO refuse sentinel), `GPHOTOS_AUTH_URL` / `GPHOTOS_TOKEN_URL` / `GPHOTOS_REVOKE_URL` reuse the Google OAuth endpoints; `GPHOTOS_DEFAULT_SCOPES = (photoslibrary.readonly,)` for v0.6, `GPHOTOS_TRASH_SCOPES = (photoslibrary,)` reserved for v0.6.1.
+- `src/duplicate_cleaner/sources/gphotos.py` — new `GooglePhotosSource`.  Enumerates via `mediaItems.list` (Photos Library v1); pagination via `nextPageToken`; skips nothing (readonly scope only sees own items).  `foreign_hash=None` on every record (Photos API does not expose MD5/SHA-256 — reconciliation MUST download + BLAKE3).  Composite etag = `f"{id}:{creationTime}"`.  `read_bytes` re-fetches the media item to obtain a fresh `baseUrl` (they expire in ~60 min) and streams the `=d`-suffixed original bytes via an UNAUTH httpx client so the OAuth bearer never lands on Google's signed storage host.  `move_to_trash` / `restore_from_trash` raise typed `SourceError` pointing at v0.6.1.  `upload` raises `NotImplementedError` — Google Photos is not a supported migrate destination.  Retry piggy-backs on tenacity (429 + 5xx backoff, same shape as gdrive).  `_raise_mapped` translates 401/403/404/429/5xx to typed errors identical to gdrive.  Cloud file id shape gate refuses any id not matching `^[A-Za-z0-9_-]{20,}$` BEFORE URL interpolation.
+- `src/duplicate_cleaner/sources/iclouddrive_photos.py` — new `iCloudPhotosSource`.  Reads the local `~/Pictures/Photos Library.photoslibrary` bundle via `osxphotos.PhotosDB`.  No OAuth, no cloud API.  Skips `photo.path is None` entries (iCloud-only stubs — user has "Optimize Mac Storage" enabled), counts them in `stub_count`, and logs the total with an actionable hint ("Toggle 'Download Originals to This Mac' in Photos → Preferences → iCloud").  `foreign_hash=None`; reconciliation reads the local file directly and BLAKE3s it.  Composite etag = `f"{uuid}:{date_modified_iso}"` (or `"unedited"` when a photo has no post-import edits).  `read_bytes` streams `Path(photo.path).open('rb')`.  `move_to_trash` / `restore_from_trash` / `upload` all raise typed `SourceError` — the source is permanently read-only (osxphotos is a reader).  osxphotos is imported lazily inside `_open_db` so the module `py_compile`s and unit tests run without the (heavyweight, macOS-only) dep.
+- `src/duplicate_cleaner/sources/__init__.py` — re-exports `GooglePhotosSource` + `iCloudPhotosSource`.
+- `src/duplicate_cleaner/auth/__init__.py` — re-exports the Photos client constants alongside the Drive / OneDrive set.
+- `src/duplicate_cleaner/cli.py`:
+  - `_resolve_client_credentials` gains a `type_ == "gphotos"` branch mirroring the gdrive one; BYO placeholder refusal names "Google Photos Library API" (the API the user must enable in Cloud Console, distinct from Drive).
+  - `dc auth add gphotos --client-secret path.json --label personal` runs the localhost OAuth flow with `GPHOTOS_DEFAULT_SCOPES`.  `--full` is a Google-only flag; for `gphotos` we surface a deferred-to-v0.6.1 warning and stay on the readonly scope.
+  - `dc auth add icloud [--library-path PATH] [--label LABEL]` — no OAuth flow; verifies the Photos.photoslibrary bundle exists, registers an accounts.toml row with `type="icloud"` and stashes the bundle path in the `user` field (repurposed — this source has no OAuth identity by design).
+  - `_build_scan_sources` and `_build_migrate_sources` grow gphotos + icloud branches.  iCloud is short-circuited early (no TokenStore lookup) since it has no token file.  Both sources are constructed with `is_read_only_scan=True` even in migrate contexts — they cannot be migrate destinations.
+  - `_build_sources_for_apply` grows gphotos + icloud branches with the same read-only construction.  Google Photos apply-time source stays read-only because v0.6 refuses trash on this source unconditionally.
+  - `dc auth test <id>` handles both new types (icloud is checked via a raw `list_files()` call against the local bundle; gphotos via a real Photos Library API round-trip on the readonly scope).
+  - `dc auth remove <id>` runs the Google revoke endpoint for `type=="gphotos"` alongside the existing gdrive branch.
+  - `_google_credentials_from_token` gains a `default_scopes` parameter so gphotos-typed token blobs missing an explicit `scopes` list fall back to the readonly scope rather than the Drive default.
+- `pyproject.toml` — new `[icloud]` optional-extra pinning `osxphotos>=0.72.0,<0.73`; the `all` extra grows to include it.
+- `docs/cloud-oauth-setup.md` — rewritten Google Photos and iCloud sections.  Google Photos: parallel to Google Drive but enables "Google Photos Library API" instead; scope explanation for v0.6 (`photoslibrary.readonly`) vs the v0.6.1 escalation path.  iCloud: `dc auth add icloud` verifies the local Photos library exists; note about "Optimize Mac Storage" causing stubs; note that iCloud Photos is read-only and trashing goes via Photos.app.
+- `README.md` — v0.6 marked shipped in the roadmap; v0.7 (image near-dup) marked next.
+- `CHANGELOG.md` — v0.6 entry with Google Photos + iCloud Photos additions; v0.6.1 called out as the next milestone for GPhotos trash scope escalation.
+
+Tests shipped (32 net-new):
+
+- `tests/test_sources_gphotos.py` (17 tests):
+  - `test_list_files_produces_expected_records` — happy path: single-item response yields one FileRecord with the expected owner / etag / cloud_file_id.
+  - `test_list_files_pages_via_nextPageToken` — pagination follows `nextPageToken` across two pages.
+  - `test_list_files_populates_foreign_hash_None` — Google Photos gives no hash → `foreign_hash=None` MUST be preserved.
+  - `test_cloud_path_scheme_locked_in` — v0.6 spec's `f"gphotos:{account_id}://{filename}"` shape.
+  - `test_read_bytes_refetches_base_url` — read_bytes calls `mediaItems.get(mediaItemId=...)` first (baseUrl expires) and the streaming URL carries the `=d` original-quality suffix.
+  - `test_read_bytes_requires_cloud_file_id` / `test_read_bytes_refuses_bad_cloud_file_id_shape` — shape gate fires BEFORE any Photos API call.
+  - `test_move_to_trash_raises_deferred` — SourceError, not NotImplementedError; message names v0.6.1 / escalation.
+  - `test_move_to_trash_raises_when_read_only` — read-only tripwire fires with `PermissionError` (same shape as gdrive).
+  - `test_check_drift_matches` / `test_check_drift_creation_time_changed` — composite etag on creationTime.
+  - `test_raise_mapped_401_403_404` / `test_raise_mapped_429_exhausts_retries` — typed errors symmetric with gdrive.
+  - `test_source_id_stamped_on_records` / `test_get_metadata_reflects_record`.
+- `tests/test_sources_icloud.py` (12 tests):
+  - `test_list_files_yields_local_photos` — photos with `path` set → FileRecord emitted.
+  - `test_list_files_skips_stubs` — photos with `path=None` → not emitted; `stub_count` incremented.
+  - `test_move_to_trash_raises` / `test_is_read_only_scan_permanent` — read-only permanently; message points at Photos.app.
+  - `test_check_drift_matches` / `test_check_drift_date_modified_changed` — composite etag on `date_modified.isoformat()`.
+  - `test_read_bytes_streams_local_file` — read_bytes yields the actual local file bytes in chunks.
+  - `test_library_missing_raises` / `test_osxphotos_missing_raises_source_error` — typed errors when the bundle or dep is absent.
+  - `test_get_metadata_reflects_record` / `test_cloud_path_scheme_locked_in` / `test_upload_refused`.
+- `tests/test_cli_auth.py` (3 new tests):
+  - `test_auth_add_gphotos_refuses_when_bundled_client_id_is_placeholder` — BYO refusal for the gphotos type.
+  - `test_auth_add_icloud_registers_stub_account_no_oauth` — icloud registration is accounts.toml-only; no token file written.
+  - `test_auth_add_icloud_refuses_missing_library` — bundle-not-found → exit 2 with actionable message.
+
+Invariants preserved (all AUDIT_LOG items above):
+
+- All 455 pre-existing tests still pass unchanged; 32 new tests added (487 total).
+- `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`.
+- BYO OAuth ONLY for Google Photos.  Bundled placeholder guard identical to gdrive.
+- iCloud Photos has NO OAuth surface — accounts.toml is the only side effect of registration.
+- Cloud paths never `.resolve()`d in the new modules.
+- `is_read_only_scan=True` default on both new sources.  Google Photos also refuses trash at the source layer (SourceError) irrespective of the flag; iCloud Photos refuses trash unconditionally.
+- Ruff clean on every new file; mypy `--strict` clean on every new file modulo the pre-existing `unused-ignore` warnings on 3rd-party stubs.
+- New invariants added at the top of this document ("Google Photos source is read-only in v0.6; move_to_trash refused pending v0.6.1 scope escalation" + "iCloud Photos source is read-only permanently").
+
+Explicitly deferred to v0.6.1 and later:
+
+- Google Photos trash escalation via `photoslibrary` scope + user re-consent flow.
+- Google Photos `mediaItems.list` filters (mediaType, album membership) — v0.6 enumerates every visible item.
+- Google Photos size population via HEAD on baseUrl — v0.6 leaves `size=0` on every record and notes this in the report.
+- iCloud shared albums / library — v0.6 reads only the primary local library.
+- Cross-source deduplication of Google Photos vs iCloud Photos vs local (a rescaled JPG in Google Photos vs the original HEIC in iCloud) — v0.7's image near-dup work will land the perceptual hash comparator.
+
+**v0.6 clears ship.**  Google Photos + iCloud Photos live (read-only).  Ready for v0.6.1 (GPhotos trash scope escalation) or v0.7 (image near-dup).
 
 ### v0.5-c — migrate hardening bundle closing pass-15 deferrables (2026-09-10)
 

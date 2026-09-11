@@ -20,6 +20,8 @@ from duplicate_cleaner.auth import (
     ACCOUNTS_PATH,
     BUNDLED_GDRIVE_CLIENT_ID,
     BUNDLED_GDRIVE_CLIENT_SECRET,
+    BUNDLED_GPHOTOS_CLIENT_ID,
+    BUNDLED_GPHOTOS_CLIENT_SECRET,
     BUNDLED_ONEDRIVE_CLIENT_ID,
     BUNDLED_ONEDRIVE_CLIENT_SECRET,
     GDRIVE_AUTH_URL,
@@ -27,6 +29,9 @@ from duplicate_cleaner.auth import (
     GDRIVE_FULL_SCOPES,
     GDRIVE_REVOKE_URL,
     GDRIVE_TOKEN_URL,
+    GPHOTOS_AUTH_URL,
+    GPHOTOS_DEFAULT_SCOPES,
+    GPHOTOS_TOKEN_URL,
     ONEDRIVE_AUTH_URL,
     ONEDRIVE_DEFAULT_SCOPES,
     ONEDRIVE_TOKEN_URL,
@@ -1018,6 +1023,22 @@ def _build_sources_for_apply(
     tokens = TokenStore()
     out: dict[str, Any] = {}
     for entry in registry.load():
+        # v0.6: iCloud has no token file — it's an accounts.toml-only entry
+        # pointing at the local Photos.photoslibrary bundle.  Build the
+        # source without touching TokenStore.
+        if entry.type == "icloud":
+            from duplicate_cleaner.sources.iclouddrive_photos import (
+                iCloudPhotosSource,
+            )
+
+            out[entry.id] = iCloudPhotosSource(
+                account_id=entry.id,
+                photos_library_path=Path(entry.user) if entry.user else None,
+                # Read-only permanently; the source refuses trash regardless
+                # of this flag but we keep the tripwire pattern for parity.
+                is_read_only_scan=True,
+            )
+            continue
         try:
             data = tokens.load(entry.id)
         except TokenPermissionError as e:
@@ -1035,6 +1056,10 @@ def _build_sources_for_apply(
         kind = str(data.get("type", entry.type))
         if kind == "gdrive":
             out[entry.id] = _build_gdrive_source(
+                entry.id, data, force_refresh=force_refresh
+            )
+        elif kind == "gphotos":
+            out[entry.id] = _build_gphotos_source(
                 entry.id, data, force_refresh=force_refresh
             )
         elif kind == "onedrive":
@@ -1079,6 +1104,21 @@ def _build_scan_sources(source_ids: list[str]) -> list[Any]:
                 f"source {sid!r} not registered — run "
                 f"`dc auth add {sid.split(':', 1)[0]} <label>`"
             )
+        kind_from_entry = str(entry.type or "")
+        # iCloud has no token file — it's registered in accounts.toml only.
+        if kind_from_entry == "icloud":
+            from duplicate_cleaner.sources.iclouddrive_photos import (
+                iCloudPhotosSource,
+            )
+
+            out.append(
+                iCloudPhotosSource(
+                    account_id=sid,
+                    photos_library_path=Path(entry.user) if entry.user else None,
+                    is_read_only_scan=True,
+                )
+            )
+            continue
         data = tokens.load(sid)
         if data is None:
             raise typer.BadParameter(
@@ -1094,6 +1134,20 @@ def _build_scan_sources(source_ids: list[str]) -> list[Any]:
                 GoogleDriveSource(
                     account_id=sid,
                     credentials=creds,
+                    is_read_only_scan=True,
+                )
+            )
+        elif kind == "gphotos":
+            from duplicate_cleaner.sources.gphotos import GooglePhotosSource
+
+            creds = _google_credentials_from_token(
+                data, default_scopes=list(GPHOTOS_DEFAULT_SCOPES)
+            )
+            out.append(
+                GooglePhotosSource(
+                    account_id=sid,
+                    credentials=creds,
+                    client_config={"user_email": str(data.get("user_email") or "")},
                     is_read_only_scan=True,
                 )
             )
@@ -1152,6 +1206,43 @@ def _build_gdrive_source(
         account_id=account_id,
         credentials=creds,
         is_read_only_scan=False,
+    )
+
+
+def _build_gphotos_source(
+    account_id: str, data: dict[str, object], *, force_refresh: bool
+) -> object:
+    """Instantiate a GooglePhotosSource — read-only in v0.6.
+
+    Symmetric with :func:`_build_gdrive_source`: same
+    ``google.oauth2.credentials.Credentials`` refresh semantics.  v0.6
+    keeps ``is_read_only_scan=True`` even at apply time — the source
+    refuses trash calls until v0.6.1 wires the scope escalation.
+    """
+    from duplicate_cleaner.sources.gphotos import GooglePhotosSource
+
+    creds = _google_credentials_from_token(
+        data, default_scopes=list(GPHOTOS_DEFAULT_SCOPES)
+    )
+    if force_refresh:
+        try:
+            from google.auth.transport.requests import (  # type: ignore[import-not-found]
+                Request,
+            )
+
+            creds.refresh(Request())  # type: ignore[attr-defined]
+        except Exception as e:
+            raise ApplyError(
+                f"--force-refresh: failed to refresh Google Photos token for "
+                f"{account_id!r}: {e}. Run `dc auth add gphotos --force`."
+            ) from e
+    return GooglePhotosSource(
+        account_id=account_id,
+        credentials=creds,
+        client_config={"user_email": str(data.get("user_email") or "")},
+        # v0.6: still read-only at apply time.  ``move_to_trash`` refuses
+        # with a v0.6.1 deferral message either way.
+        is_read_only_scan=True,
     )
 
 
@@ -1489,6 +1580,25 @@ def _resolve_client_credentials(
             )
             raise typer.Exit(1)
         return client_id, BUNDLED_ONEDRIVE_CLIENT_SECRET
+    if type_ == "gphotos":
+        client_id = BUNDLED_GPHOTOS_CLIENT_ID
+        # v0.6: BYO-only refusal identical in shape to the gdrive branch.
+        # Google Photos uses the same Cloud Console OAuth surface but a
+        # DIFFERENT enabled API — the message tells the user to enable
+        # "Google Photos Library API" instead of Drive.
+        if client_id.endswith("_TO_REPLACE"):
+            console.print(
+                "[red]DuplicateCleaner is BYO-only for cloud OAuth[/red] "
+                "(the public repo does not bundle a personal Google client "
+                "ID to avoid shared-quota / shared-revocation risk). Register "
+                "your own OAuth client at [cyan]https://console.cloud.google.com"
+                "[/cyan] (Desktop app type; enable [bold]Google Photos "
+                "Library API[/bold]) and pass the downloaded JSON via "
+                "[cyan]--client-secret path/to/oauth.json[/cyan]. "
+                "See docs/cloud-oauth-setup.md."
+            )
+            raise typer.Exit(1)
+        return client_id, BUNDLED_GPHOTOS_CLIENT_SECRET
     raise typer.BadParameter(f"Unknown auth type: {type_}")
 
 
@@ -1505,13 +1615,75 @@ def _default_account_id(type_: str, label: str | None, existing_ids: list[str]) 
     return f"{base}-{i}"
 
 
+def _auth_add_icloud(
+    *,
+    label: str | None,
+    library_path: Path | None,
+    force: bool,
+) -> None:
+    """Register a local Photos.photoslibrary bundle as an ``icloud`` account.
+
+    Verifies the bundle exists and appends an accounts.toml row with the
+    resolved path.  No OAuth, no token file — every future ``dc scan
+    --sources icloud:<label>`` reads the bundle directly via osxphotos.
+    """
+    registry = AccountsRegistry()
+    existing_ids = [e.id for e in registry.load()]
+    account_id = _default_account_id("icloud", label, existing_ids)
+    resolved = (
+        Path(library_path).expanduser()
+        if library_path is not None
+        else Path.home() / "Pictures" / "Photos Library.photoslibrary"
+    )
+    if not resolved.exists():
+        console.print(
+            f"[red]Refusing to register[/red]: Photos library not found at "
+            f"{resolved}.  Pass [cyan]--library-path[/cyan] or ensure "
+            "Photos.app has run at least once so the bundle exists."
+        )
+        raise typer.Exit(2)
+    if account_id in existing_ids and not force:
+        console.print(
+            f"[red]Account {account_id!r} already exists.[/red] "
+            f"Use [cyan]dc auth remove {account_id}[/cyan] first, "
+            "or pass [cyan]--force[/cyan] to overwrite."
+        )
+        raise typer.Exit(2)
+    if account_id in existing_ids:
+        registry.remove(account_id)
+    try:
+        registry.add(
+            AccountEntry(
+                id=account_id,
+                type="icloud",
+                label=label or account_id.split(":", 1)[-1],
+                # ``user`` reused to carry the library path so a later
+                # ``dc scan`` can reconstruct the source without a
+                # separate side-table.  Not a real user identity — this
+                # source has no OAuth identity by design.
+                user=str(resolved),
+                # Instance-relative call so tests that monkeypatch
+                # ``duplicate_cleaner.cli.AccountsRegistry`` to a factory
+                # (lambda) still reach the real staticmethod through the
+                # constructed instance.
+                added_ts=registry.now_ts(),
+            )
+        )
+    except DuplicateAccountError as e:
+        console.print(f"[yellow]Warning[/yellow]: {e}")
+    console.print(
+        f"[green]Registered[/green] {account_id} at {resolved} "
+        "(no OAuth; iCloud Photos is read-only)."
+    )
+
+
 @auth_app.command("add")
 def auth_add(
     type_: Annotated[
         str,
         typer.Argument(
             metavar="TYPE",
-            help="Cloud provider type — 'gdrive' or 'onedrive'.",
+            help="Cloud provider type — 'gdrive', 'onedrive', 'gphotos', or 'icloud'.",
         ),
     ],
     label: Annotated[
@@ -1552,12 +1724,25 @@ def auth_add(
             ),
         ),
     ] = False,
+    library_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--library-path",
+            help=(
+                "iCloud only.  Path to the Photos Library.photoslibrary "
+                "bundle (default: ~/Pictures/Photos Library.photoslibrary)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Register a cloud account by running the OAuth localhost flow."""
-    if type_ not in {"gdrive", "onedrive"}:
+    if type_ == "icloud":
+        _auth_add_icloud(label=label, library_path=library_path, force=force)
+        return
+    if type_ not in {"gdrive", "onedrive", "gphotos"}:
         console.print(
             f"[red]Unsupported auth type[/red]: {type_}. "
-            "Supported: 'gdrive', 'onedrive'."
+            "Supported: 'gdrive', 'onedrive', 'gphotos', 'icloud'."
         )
         raise typer.Exit(2)
     registry = AccountsRegistry()
@@ -1596,6 +1781,23 @@ def auth_add(
         token_url = GDRIVE_TOKEN_URL
         scopes = list(GDRIVE_FULL_SCOPES if full else GDRIVE_DEFAULT_SCOPES)
         extra_auth_params: dict[str, str] = {
+            "access_type": "offline",
+            "prompt": "consent",
+            "include_granted_scopes": "true",
+        }
+    elif type_ == "gphotos":
+        if full:
+            # v0.6 deliberately locks the read-only scope; the full scope
+            # (photoslibrary) requires a v0.6.1 escalation.  Surface the
+            # request loudly so users can find the v0.6.1 upgrade path.
+            console.print(
+                "[yellow]Warning[/yellow]: --full for gphotos is deferred "
+                "to v0.6.1; using photoslibrary.readonly for v0.6."
+            )
+        auth_url_base = GPHOTOS_AUTH_URL
+        token_url = GPHOTOS_TOKEN_URL
+        scopes = list(GPHOTOS_DEFAULT_SCOPES)
+        extra_auth_params = {
             "access_type": "offline",
             "prompt": "consent",
             "include_granted_scopes": "true",
@@ -1685,6 +1887,31 @@ def auth_test(
     account_id: Annotated[str, typer.Argument(help="Account id from `dc auth list`.")],
 ) -> None:
     """Verify a token still works by reading a single file from the provider."""
+    # v0.6: icloud has no token file; treat it separately.
+    registry_for_test = AccountsRegistry()
+    entry = registry_for_test.get(account_id)
+    if entry is not None and entry.type == "icloud":
+        from duplicate_cleaner.sources.iclouddrive_photos import iCloudPhotosSource
+
+        try:
+            src_ic = iCloudPhotosSource(
+                account_id=account_id,
+                photos_library_path=Path(entry.user) if entry.user else None,
+            )
+            it_ic = src_ic.list_files()
+            first_ic = next(iter(it_ic), None)
+            console.print(
+                f"[green]OK[/green]: {account_id} — "
+                + (
+                    f"first photo: {first_ic.path}"
+                    if first_ic is not None
+                    else "empty library"
+                )
+            )
+        except Exception as e:
+            console.print(f"[red]{account_id} check failed[/red]: {e}")
+            raise typer.Exit(1) from e
+        return
     tokens = TokenStore()
     try:
         data = tokens.load(account_id)
@@ -1708,6 +1935,31 @@ def auth_test(
             console.print(
                 f"[green]OK[/green]: {account_id} — "
                 + (f"first file: {first.path}" if first is not None else "empty drive")
+            )
+        except Exception as e:
+            console.print(f"[red]{account_id} check failed[/red]: {e}")
+            raise typer.Exit(1) from e
+    elif kind == "gphotos":
+        try:
+            creds = _google_credentials_from_token(
+                data, default_scopes=list(GPHOTOS_DEFAULT_SCOPES)
+            )
+            from duplicate_cleaner.sources.gphotos import GooglePhotosSource
+
+            src_gp = GooglePhotosSource(
+                account_id=account_id,
+                credentials=creds,
+                client_config={"user_email": str(data.get("user_email") or "")},
+            )
+            it_gp = src_gp.list_files()
+            first_gp = next(iter(it_gp), None)
+            console.print(
+                f"[green]OK[/green]: {account_id} — "
+                + (
+                    f"first photo: {first_gp.path}"
+                    if first_gp is not None
+                    else "empty photo library"
+                )
             )
         except Exception as e:
             console.print(f"[red]{account_id} check failed[/red]: {e}")
@@ -1762,7 +2014,7 @@ def auth_remove(
     if data is not None:
         refresh = str(data.get("refresh_token") or data.get("access_token") or "")
         kind = str(data.get("type", ""))
-        if refresh and kind == "gdrive":
+        if refresh and (kind == "gdrive" or kind == "gphotos"):
             ok = revoke_token(GDRIVE_REVOKE_URL, refresh)
             if not ok:
                 console.print(
@@ -2241,6 +2493,21 @@ def _build_migrate_sources(
                 f"source {sid!r} not registered — run "
                 f"`dc auth add {sid.split(':', 1)[0]} <label>`"
             )
+        # v0.6: icloud + gphotos are read-only sources; migrate can enumerate
+        # them as source but never as destination.  The mover / cleanup
+        # tripwires refuse a read-only source with a typed error, so we
+        # construct them with the read-only flag on.
+        if entry.type == "icloud":
+            from duplicate_cleaner.sources.iclouddrive_photos import (
+                iCloudPhotosSource,
+            )
+
+            out[sid] = iCloudPhotosSource(
+                account_id=sid,
+                photos_library_path=Path(entry.user) if entry.user else None,
+                is_read_only_scan=True,
+            )
+            continue
         data = tokens.load(sid)
         if data is None:
             raise typer.BadParameter(
@@ -2250,6 +2517,10 @@ def _build_migrate_sources(
         kind = str(data.get("type", entry.type))
         if kind == "gdrive":
             out[sid] = _build_gdrive_source(
+                sid, data, force_refresh=force_refresh
+            )
+        elif kind == "gphotos":
+            out[sid] = _build_gphotos_source(
                 sid, data, force_refresh=force_refresh
             )
         elif kind == "onedrive":
@@ -2514,15 +2785,20 @@ def migrate_undo(
             console.print(f"  • {msg}")
 
 
-def _google_credentials_from_token(data: dict[str, object]) -> object:
+def _google_credentials_from_token(
+    data: dict[str, object],
+    *,
+    default_scopes: list[str] | None = None,
+) -> object:
     """Build a google.oauth2 Credentials object from a stored token blob."""
     from google.oauth2.credentials import Credentials  # type: ignore[import-not-found]
 
     raw_scopes = data.get("scopes")
+    fallback = default_scopes if default_scopes is not None else list(GDRIVE_DEFAULT_SCOPES)
     scopes: list[str] = (
         [str(s) for s in raw_scopes]
         if isinstance(raw_scopes, list)
-        else list(GDRIVE_DEFAULT_SCOPES)
+        else fallback
     )
     return Credentials(
         token=str(data.get("access_token") or ""),

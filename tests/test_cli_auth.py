@@ -222,6 +222,103 @@ def test_auth_add_gdrive_refuses_existing_account_in_non_interactive_mode(
     assert "already exists" in result.stdout
 
 
+def test_auth_add_gphotos_refuses_when_bundled_client_id_is_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.6: BYO refusal fires for gphotos exactly like gdrive."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["auth", "add", "gphotos"])
+    assert result.exit_code == 1, result.stdout
+    # The message must name Google Photos Library API so the user knows
+    # which API to enable, distinct from the Drive branch.
+    lower = result.stdout.lower()
+    assert (
+        "photos library" in lower
+        or "gphotos" in lower
+        or "google photos" in lower
+        or "client" in lower
+    )
+
+
+def test_auth_add_icloud_registers_stub_account_no_oauth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iCloud registration is filesystem-only — no OAuth, no token file."""
+    accounts_path = tmp_path / "accounts.toml"
+    tokens_dir = tmp_path / "tokens"
+    library = tmp_path / "Photos Library.photoslibrary"
+    library.mkdir()
+
+    from duplicate_cleaner.auth.accounts import AccountsRegistry
+    from duplicate_cleaner.auth.tokens import TokenStore
+
+    monkeypatch.setattr(
+        "duplicate_cleaner.cli.AccountsRegistry",
+        lambda: AccountsRegistry(path=accounts_path),
+    )
+    monkeypatch.setattr(
+        "duplicate_cleaner.cli.TokenStore",
+        lambda: TokenStore(base_dir=tokens_dir),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "add",
+            "icloud",
+            "--library-path",
+            str(library),
+            "--label",
+            "personal",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "registered" in result.stdout.lower() or "authorized" in result.stdout.lower()
+    # accounts.toml has the icloud row; no token file exists.
+    registry = AccountsRegistry(path=accounts_path)
+    entries = registry.load()
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.id == "icloud:personal"
+    assert e.type == "icloud"
+    assert e.user == str(library)
+    # No token file for icloud.
+    assert not (tokens_dir / "icloud:personal.json").exists()
+
+
+def test_auth_add_icloud_refuses_missing_library(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing Photos.photoslibrary bundle exits 2 with an actionable message."""
+    accounts_path = tmp_path / "accounts.toml"
+    tokens_dir = tmp_path / "tokens"
+    missing = tmp_path / "does-not-exist.photoslibrary"
+
+    from duplicate_cleaner.auth.accounts import AccountsRegistry
+    from duplicate_cleaner.auth.tokens import TokenStore
+
+    monkeypatch.setattr(
+        "duplicate_cleaner.cli.AccountsRegistry",
+        lambda: AccountsRegistry(path=accounts_path),
+    )
+    monkeypatch.setattr(
+        "duplicate_cleaner.cli.TokenStore",
+        lambda: TokenStore(base_dir=tokens_dir),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["auth", "add", "icloud", "--library-path", str(missing)],
+    )
+    assert result.exit_code == 2, result.stdout
+    assert "not found" in result.stdout.lower() or "library-path" in result.stdout.lower()
+
+
 def test_scan_calls_purge_stale_cloud_hashes(
     tmp_path: Path,
     with_active_home_config: Path,

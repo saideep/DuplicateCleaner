@@ -66,6 +66,28 @@ ONEDRIVE_DEFAULT_SCOPES: tuple[str, ...] = (
 # Microsoft Graph v1.0 root — used by ``sources/onedrive.py``.
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 
+# ---- Google Photos ---------------------------------------------------------
+# v0.6: Google Photos uses the same OAuth 2.0 endpoints as Google Drive (both
+# are Google-hosted).  Only the API scope differs — see
+# ``GPHOTOS_DEFAULT_SCOPES`` (read-only in v0.6) vs ``GPHOTOS_TRASH_SCOPES``
+# (full access; deferred to v0.6.1 because it requires user re-consent).
+BUNDLED_GPHOTOS_CLIENT_ID = "BUNDLED_GPHOTOS_CLIENT_ID_TO_REPLACE"
+BUNDLED_GPHOTOS_CLIENT_SECRET = ""
+
+GPHOTOS_AUTH_URL = GDRIVE_AUTH_URL
+GPHOTOS_TOKEN_URL = GDRIVE_TOKEN_URL
+GPHOTOS_REVOKE_URL = GDRIVE_REVOKE_URL
+
+GPHOTOS_DEFAULT_SCOPES: tuple[str, ...] = (
+    "https://www.googleapis.com/auth/photoslibrary.readonly",
+)
+# Reserved for v0.6.1 scope escalation flow — required to actually trash a
+# Google Photos media item programmatically.  v0.6 refuses trash calls with
+# an actionable SourceError message and defers the escalation.
+GPHOTOS_TRASH_SCOPES: tuple[str, ...] = (
+    "https://www.googleapis.com/auth/photoslibrary",
+)
+
 
 def load_client_secret_json(path: Path) -> tuple[str, str]:
     """Return ``(client_id, client_secret)`` from a Cloud Console download.

@@ -46,6 +46,11 @@ gps = [
     "geopy>=2.4,<3",
 ]
 ocr = ["pytesseract>=0.3,<0.4"]
+# v0.6 — iCloud Photos scanning via the local Photos.photoslibrary bundle.
+# osxphotos is a macOS-only reader library; keeping it optional avoids
+# forcing the dep on Linux CI runners that will never scan a Photos
+# library.
+icloud = ["osxphotos>=0.72.0,<0.73"]
 all = [
     "imagehash>=4.3.1,<5",
     "Pillow>=10.4.0,<11",
@@ -58,6 +63,7 @@ all = [
     "piexif>=1.1,<2",
     "geopy>=2.4,<3",
     "pytesseract>=0.3,<0.4",
+    "osxphotos>=0.72.0,<0.73",
 ]
 
 [project.scripts]

@@ -15,12 +15,15 @@ from duplicate_cleaner.sources.base import (
     UploadResult,
 )
 from duplicate_cleaner.sources.gdrive import GoogleDriveSource
+from duplicate_cleaner.sources.gphotos import GooglePhotosSource
+from duplicate_cleaner.sources.iclouddrive_photos import iCloudPhotosSource
 from duplicate_cleaner.sources.local import LocalFileSystemSource
 from duplicate_cleaner.sources.onedrive import OneDriveSource
 
 __all__ = [
     "ForeignHash",
     "GoogleDriveSource",
+    "GooglePhotosSource",
     "LocalFileSystemSource",
     "OneDriveSource",
     "Source",
@@ -33,4 +36,5 @@ __all__ = [
     "SourceRateLimitError",
     "TrashedLocation",
     "UploadResult",
+    "iCloudPhotosSource",
 ]

@@ -94,13 +94,36 @@ That grants read and write access **only to files the tool itself created or tha
 
 DuplicateCleaner does not request `drive.readonly` or the broad `drive` scope. The scopes it does hold are read-and-trash — it literally cannot hard-delete a file even if a bug tried to.
 
-## Google Photos (coming in v0.6)
+## Google Photos
+
+### Add a Google Photos account
 
 ```shell
-dc auth add gphotos
+dc auth add gphotos --client-secret ~/Downloads/client_secret_YOUR_ID.apps.googleusercontent.com.json --label personal
 ```
 
-Reserved for v0.6. In v0.2 through v0.5 this command prints a "coming soon" notice and exits. Full walk-through, scope details (`photoslibrary.readonly`), and the Photos-vs-Drive dedupe interaction land in the v0.6 docs.
+Same Google Cloud Console setup as Google Drive, but you enable the **Google Photos Library API** for the project instead of (or in addition to) the Drive API. See "Register your Google client" at the bottom of this page for the full 10-minute walk-through; the only difference for Photos is the "APIs & Services → Library" page — search for and enable "Google Photos Library API".
+
+The flow is identical in shape to the Google Drive one — local callback server, browser to `accounts.google.com`, consent screen, tokens written to `~/.config/duplicate_cleaner/tokens/gphotos:personal.json` at mode `0600`.
+
+### Scopes
+
+DuplicateCleaner v0.6 requests exactly one scope:
+
+- `https://www.googleapis.com/auth/photoslibrary.readonly`
+
+That grants read-only access to the photos the app can see (your own uploads, i.e. everything under `photoslibrary.readonly`). Under this scope the source can detect duplicates but cannot trash them — Google Photos trash requires the broader `https://www.googleapis.com/auth/photoslibrary` scope, which needs a user re-consent flow. That escalation is deliberately deferred to v0.6.1. Until then, `dc apply` refuses to trash Google Photos entries with a clear message pointing you at [https://photos.google.com](https://photos.google.com) for manual deletion.
+
+The Google Photos API also does not expose a per-item MD5 or SHA-256. To detect cross-source duplicates (a JPEG in Google Photos vs. the same JPEG on your local disk), DuplicateCleaner reads the media item's `baseUrl` (re-fetched at reconcile time because these URLs expire in ~60 minutes), streams the `=d`-suffixed original-quality bytes, and computes a BLAKE3 hash locally. Cross-source reconciliation is gated by `--max-cloud-download-mb` (same knob as Drive / OneDrive) so a full-library scan does not silently blow through your data cap.
+
+### Multi-account Google Photos
+
+Same pattern as Google Drive:
+
+```shell
+dc auth add gphotos --label personal --client-secret ~/oauth.json
+dc auth add gphotos --label family --client-secret ~/oauth.json
+```
 
 ## OneDrive
 
@@ -156,20 +179,43 @@ DuplicateCleaner requests exactly:
 
 Microsoft Graph documents `POST /me/drive/items/{id}/restore` as OneDrive Business only. OneDrive Personal historically returns HTTP 501 or an error body with `code: "notSupported"` for the same call. When `dc undo` encounters this on a OneDrive Personal manifest entry, the entry is reported as failed with a message pointing at your Recycle Bin at `https://onedrive.live.com/?id=recyclebin`. Successful entries in the same manifest still complete. This is a provider limitation — no changes on our side can bypass it.
 
-## iCloud (coming in v0.6)
+## iCloud Photos
 
 ```shell
-dc auth add icloud
+dc auth add icloud --label personal
 ```
 
-No OAuth is involved. iCloud content is scanned through the local Photos library at `~/Pictures/Photos Library.photoslibrary`, so `dc auth add icloud` just verifies:
+Optionally pass `--library-path` to point at a Photos library outside the default location:
 
-1. The library file exists.
-2. It is readable by the current user (Terminal or your shell needs Full Disk Access granted in System Settings, Privacy & Security, Full Disk Access).
+```shell
+dc auth add icloud --library-path /Volumes/OldMac/Users/me/Pictures/Photos\ Library.photoslibrary --label oldmac
+```
 
-If either check fails the command prints the fix.
+No OAuth is involved. `dc auth add icloud` just:
 
-Full v0.6 doc will cover iCloud Photos separately.
+1. Verifies the `Photos Library.photoslibrary` bundle exists at the given path (default `~/Pictures/Photos Library.photoslibrary`).
+2. Registers the account in `~/.config/duplicate_cleaner/accounts.toml` with `type="icloud"` and the resolved library path.
+
+No token file is written. Terminal or your shell needs Full Disk Access granted in System Settings → Privacy & Security → Full Disk Access to actually read the bundle — the first `dc scan` will surface the OS's permission prompt if that grant is missing.
+
+### How iCloud Photos scanning works
+
+The library is read via [`osxphotos`](https://github.com/RhetTbull/osxphotos), a Python reader for the local Photos database. Every photo's `original_filepath` is opened directly; DuplicateCleaner reads the bytes, computes a BLAKE3 hash, and caches it per `(source_id, uuid, date_modified)` so unchanged photos aren't re-hashed on rescan.
+
+### Optimize Mac Storage caveat
+
+If you have "Optimize Mac Storage" enabled in Photos → Preferences → iCloud, some photos are represented locally as stubs — the metadata exists but the original bytes are only on iCloud. DuplicateCleaner skips these (they have no local `path` for us to hash) and logs the skipped count on every scan:
+
+```
+iCloud Photos: skipped 342 stubs (files not downloaded locally).
+Toggle 'Download Originals to This Mac' in Photos → Preferences → iCloud to make them scannable.
+```
+
+### Deletion
+
+iCloud Photos is **read-only permanently** in DuplicateCleaner. `osxphotos` is a reader library, not a writer — the safe path to delete an iCloud photo is through the Photos.app itself (which also handles the iCloud sync side of the deletion). `dc apply` refuses to trash iCloud Photos entries with a message pointing you at the Photos.app.
+
+If you want to bypass the Photos.app and trash the underlying local file directly, run `dc scan` on `~/Pictures` (or the relevant folder inside the Photos library bundle) — the standard local-mover rails then apply. This is a power-user path and is not recommended: Photos.app maintains its own database that will not reconcile with a raw filesystem delete.
 
 ## Listing, testing, removing accounts
 

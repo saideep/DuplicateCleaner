@@ -290,11 +290,12 @@ Shipped:
 - [x] **v0.3 — Organizer.** `dc organize discover → review → apply → undo`. Nine-domain taxonomy, PDF content classification, EXIF event clustering, cohesion preservation for albums / book series / git projects / photo events, rename policy user-locked to `preserve` by default.
 - [x] **v0.4 — Project-tree aggregation.** Whole-directory dedup for two copies of the same git repo / npm project / Cargo crate. Jaccard similarity ≥ 0.90 default; dirty git repos refuse discard; connected-component grouping.
 - [x] **v0.5 — Cloud consolidation (`dc migrate`).** `plan → copy → verify → cleanup → undo`. Post-upload hash verify, cleanup refuses without verify, bandwidth throttle, resume-from-manifest.
+- [x] **v0.6 — Google Photos and iCloud Photos.** Read-only sources scan alongside Drive / OneDrive / local. Google Photos via BYO OAuth (`photoslibrary.readonly`); iCloud via the local `~/Pictures/Photos Library.photoslibrary` bundle through `osxphotos`. No provider-side hash on either → reconciliation downloads bytes and BLAKE3s them, cached per `(source_id, cloud_file_id, etag)`. Google Photos trash is deferred to v0.6.1 (scope escalation required); iCloud Photos deletion goes via the Photos.app.
 
 Upcoming:
 
 - [ ] **v0.3-f — Interactive HTML review UI.** Click-to-override in the browser as an alternative to the Rich TUI. Today: edit the plan JSON directly (the apply step re-validates the schema).
-- [ ] **v0.6 — Google Photos and iCloud Photos.** Unified photo metadata across sources for the organizer's event clustering.
+- [ ] **v0.6.1 — Google Photos trash scope escalation.** Requests the full `photoslibrary` scope via user re-consent, enabling `dc apply` to trash Google Photos duplicates alongside Drive / OneDrive.
 - [ ] **v0.7 — Image near-duplicate.** Perceptual hash comparator (`imagehash.phash` / `dhash`) plus thumbnails in the report.
 - [ ] **v0.8 — Audio and video near-duplicate.** Chromaprint fingerprints and keyframe pHash.
 
