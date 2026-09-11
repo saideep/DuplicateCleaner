@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file. Format: Kee
 
 ## [Unreleased]
 
+### v0.6.1 — Google Photos trash scope escalation (2026-09-11)
+
+Per-account escalation flow so users can re-consent Google Photos accounts from `photoslibrary.readonly` (v0.6 default) to the full `photoslibrary` scope.  Adding trash for `gphotos:personal` doesn't grant it for `gphotos:family` — each token file carries its own `has_trash` flag.
+
+Added:
+
+- `dc auth grant-gphotos-trash <account_id>` — re-runs OAuth against the full `photoslibrary` scope, updates the account's token file with the new scopes and `has_trash=True`.  Refuses on non-gphotos accounts (exit 2) and on missing tokens (exit 1).
+- `dc auth revoke-gphotos-trash <account_id>` — mirror flow that downgrades back to `photoslibrary.readonly` and flips `has_trash=False`.
+- `dc auth list` grows a `scope` column showing `read-only` / `trash-enabled` / `read-only (permanent)` per account.
+- `has_trash: bool = False` param on `GooglePhotosSource.__init__` (default preserves v0.6 behaviour).  Threaded from the token file via `_build_gphotos_source(for_apply=True)` at every apply-time / migrate construction site.
+- `trash_enabled_source_ids: frozenset[str] | set[str] | None = None` kwarg on `score.rules.score_group` and `score_groups`.  Gphotos accounts in the set are NOT marked informational; they flow through the normal cross-source scoring so a trashable-but-currently-cloud photo can be proposed as a discard.  iCloud is unconditionally informational (permanently read-only, no escalation path).
+- 10 new tests in `tests/test_gphotos_trash_escalation.py` covering the three-layer gate, the CLI grant flow, the scorer's trash-enabled bypass, and the auth-list scope column.
+
+Changed:
+
+- `GooglePhotosSource.move_to_trash` refactored into a three-layer gate: (1) `is_read_only_scan=True` refuses at scan time; (2) `has_trash=False` refuses with an actionable `SourceError` naming `dc auth grant-gphotos-trash <id>`; (3) trash-enabled account raises a distinct `SourceError` naming the Google Photos Library API v1 limitation and pointing at [https://photos.google.com/trash](https://photos.google.com/trash) for the manual step.  Google Photos Library API v1 does NOT expose a library-wide trash endpoint — the escalation infrastructure is live but the final API call is blocked by Google's own capability surface.  When Google reintroduces a library-scoped delete, the API call drops in between layer 2 and layer 3 with no surrounding-rail changes needed.
+- `dc auth add gphotos` stamps `has_trash: False` on the freshly-written token so v0.6 and v0.6.1 token blobs share the same shape.
+- `docs/cloud-oauth-setup.md` — new "Scope escalation (v0.6.1)" section covers the grant/revoke commands and the Google API-capability wall.
+
+Tests: 497 → 507 (10 new, 1 updated in `tests/test_sources_gphotos.py`).
+
 ### v0.6-patch — closes pass-16 audit findings (2026-09-11)
 
 Sub-milestone patch closing all 9 audit pass-16 findings on top of v0.6 in a single release. Every finding lands with a matching test.

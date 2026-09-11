@@ -231,16 +231,24 @@ def test_read_bytes_requires_cloud_file_id() -> None:
 
 
 def test_move_to_trash_raises_deferred() -> None:
-    """v0.6: move_to_trash raises SourceError (deferred to v0.6.1 scope escalation)."""
+    """v0.6.1: move_to_trash without ``has_trash`` names the escalation command.
+
+    Was v0.6 "deferred to v0.6.1"; v0.6.1 replaces that with a
+    per-account actionable escalation pointer.  The read-only default
+    now surfaces ``dc auth grant-gphotos-trash <id>`` instead of the
+    old milestone-name placeholder.
+    """
     service = _mk_service([{"mediaItems": []}])
     src = GooglePhotosSource(
         "gphotos:x",
         credentials=None,
-        # Flag off so we bypass the read-only tripwire and reach the
-        # deferral branch (SourceError, not PermissionError).
+        # Flag off so we bypass the scan tripwire and reach the
+        # per-account has_trash check.
         is_read_only_scan=False,
         service_factory=lambda _c: service,
     )
+    # v0.6.1: default has_trash=False.
+    assert src.has_trash is False
     rec = FileRecord(
         path=Path("gphotos:x://foo.HEIC"),
         size=0,
@@ -253,8 +261,9 @@ def test_move_to_trash_raises_deferred() -> None:
     )
     with pytest.raises(SourceError) as exc:
         src.move_to_trash(rec)
-    msg = str(exc.value).lower()
-    assert "v0.6.1" in msg or "escalation" in msg or "deferred" in msg
+    msg = str(exc.value)
+    assert "grant-gphotos-trash" in msg
+    assert "gphotos:x" in msg
 
 
 def test_move_to_trash_raises_when_read_only() -> None:

@@ -35,7 +35,7 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Migration cleanup refuses without verify** (v0.5-b): `dc migrate cleanup` iterates every `state="done"` entry up-front and raises `CleanupError` before any `Source.move_to_trash` call fires if any entry has `verified=False` OR `verified_ts=None`. Points the operator at `dc migrate verify`. Structural — a mid-batch failure on entry N cannot leave entries 1..(N-1) trashed against an unverified copy.
 - **Cross-algo copies persist a canonical BLAKE3 for strict verify** (v0.5-c): `dc migrate copy` tees the outgoing byte stream through BLAKE3 and stamps `source_blake3` on every successful manifest entry. `dc migrate verify --full` then streams the destination through BLAKE3 to compute `dest_blake3` and compares the two — a real byte-level integrity check even for cross-algo pairs (md5 gdrive → sha256 onedrive). Before v0.5-c, `--full` on a cross-algo pair only streamed the destination and discarded the result; the entry was flipped to `verified=True` on the strength of the etag check alone. Same-algo pairs still take the fast path (compared at copy time via `_hashes_match`); cross-algo pairs are the ones this invariant protects.
 - **Self-copy refusal** (v0.5-c): `plan_migration` raises `ValueError` and `execute_migration` raises `MigrationError` when `source_id == dest_id`. Same-account migration cannot cross an ownership boundary, would burn quota on a duplicate upload, and violates the assumption every downstream tripwire makes about distinct ids.
-- **Google Photos source is read-only in v0.6; move_to_trash refused pending v0.6.1 scope escalation** (v0.6): `GooglePhotosSource` scans via `photoslibrary.readonly` — a scope that cannot mutate the library. `move_to_trash` raises a typed `SourceError` referencing v0.6.1 (which will wire the escalation to the full `photoslibrary` scope via a user re-consent flow). Trashing Google Photos in v0.6 goes through the Google Photos app or web UI at https://photos.google.com.
+- **Google Photos source escalation is per-account and API-capability-gated** (v0.6.1): `GooglePhotosSource` accepts a `has_trash: bool = False` param stamped from the token file. `dc auth grant-gphotos-trash <account_id>` re-runs OAuth against `GPHOTOS_TRASH_SCOPES` (full `photoslibrary`) and flips the flag; `dc auth revoke-gphotos-trash <account_id>` downgrades back to `photoslibrary.readonly`. `move_to_trash` is three-layer-gated: (1) `is_read_only_scan=True` refuses at scan time; (2) `has_trash=False` refuses with an actionable message naming the grant command; (3) even a trash-enabled account raises `SourceError` because the Google Photos Library API v1 does NOT expose a library-wide trash endpoint — the message points at photos.google.com/trash for the manual step. The scorer (`score.rules.score_group`) accepts a `trash_enabled_source_ids` set: gphotos accounts in the set are NOT marked informational and can be proposed as discards; iCloud is unconditionally informational (permanently read-only, no escalation path).
 - **iCloud Photos source is read-only permanently; deletion goes via the Photos.app** (v0.6): `iCloudPhotosSource` reads the local `~/Pictures/Photos Library.photoslibrary` bundle via `osxphotos`. `osxphotos` is a reader library, not a writer — there is no supported programmatic write path. `move_to_trash` and `restore_from_trash` raise a typed `SourceError` directing the operator to the Photos.app. Users who want to trash the underlying local file can run `dc scan` on `~/Pictures` and go through the normal local-mover rails.
 
 ## Rejected alternatives (do not reopen without new info)
@@ -47,6 +47,59 @@ These properties are load-bearing. Any change that weakens one of them is a ship
 - **Perceptual near-dup ahead of organizer** — DROPPED sequencing. Reshuffled: organizer to v0.3, near-dup pushed to v0.7/v0.8.
 
 ## Round-by-round history
+
+### v0.6.1 — Google Photos trash scope escalation (2026-09-11)
+
+Per-account escalation from the v0.6 read-only default to the full `photoslibrary` scope, gated on user re-consent. Adding trash for `gphotos:personal` does NOT grant it for `gphotos:family` — each account's token file records its own `has_trash` flag.  The Google Photos Library API v1 turned out not to expose a library-wide trash endpoint (only album-scoped `batchRemoveMediaItems` and album/media-item creation), so v0.6.1 ships the ESCALATION INFRASTRUCTURE (token-file flag + CLI grant/revoke + scorer trash-enabled bypass + source three-layer gate) and surfaces an actionable `SourceError` at the API-capability wall pointing users at photos.google.com/trash for the manual step.  When Google reintroduces a library-scoped delete on the Photos API, the actual API call drops in between the has_trash check and the current raise with no surrounding-rail changes needed.
+
+All 507 tests pass (497 pre-existing + 10 new); `test_no_forbidden_calls.py` still green; ruff clean on every changed file; mypy `--strict` clean on every changed source file modulo the pre-existing `unused-ignore` warnings on 3rd-party stubs (googleapiclient / msal / google-auth) documented in v0.2 sub-milestone 2 and v0.5-a.
+
+Shipped:
+
+- `src/duplicate_cleaner/sources/gphotos.py`:
+  - New `has_trash: bool = False` param on `GooglePhotosSource.__init__`.  Stored as `self.has_trash`.
+  - `move_to_trash` refactored into a three-layer gate: (1) `is_read_only_scan=True` refuses; (2) `has_trash=False` refuses with `SourceError` naming `dc auth grant-gphotos-trash <id>`; (3) trash-enabled account raises a distinct `SourceError` naming the Google Photos Library API v1 limitation and pointing at https://photos.google.com/trash.  Symmetric refactor on `restore_from_trash`.
+  - Module docstring rewritten to describe the API-capability wall so a future refactor doesn't strip the fallback raise.
+- `src/duplicate_cleaner/score/rules.py`:
+  - `score_group` and `score_groups` accept a new `trash_enabled_source_ids: frozenset[str] | set[str] | None = None` kwarg.
+  - The M1 informational-marking block for cloud read-only sources now branches: `icloud:*` always informational (permanent); `gphotos:*` informational IFF `source_id not in trash_enabled_source_ids`.  Trash-enabled accounts flow through the normal cross-source scoring — the `cloud_when_local_exists=-3` penalty then scores them below the local peer so local stays keeper AND the gphotos member is a legitimate discard candidate.
+- `src/duplicate_cleaner/cli.py`:
+  - `dc auth grant-gphotos-trash <account_id>` — re-runs the localhost OAuth flow against `GPHOTOS_TRASH_SCOPES`, preserves the existing `client_id` / `client_secret` from the token blob, and writes the fresh token with `has_trash=True` + `scopes=[photoslibrary]`.  Refuses when the account isn't registered or isn't of type `gphotos` (exit 2) and when the token file is missing (exit 1).
+  - `dc auth revoke-gphotos-trash <account_id>` — mirror flow against `GPHOTOS_DEFAULT_SCOPES`; token stamped with `has_trash=False`.  Google's OAuth does not narrow an existing grant; the practical effect is the tool stops honouring the write paths.
+  - `dc auth list` grows a `scope` column: `read-only` / `trash-enabled` / `read-only (permanent)` for gphotos / trash-enabled gphotos / icloud rows respectively.
+  - `dc auth add gphotos` stamps `has_trash: False` on the freshly-written token so old (v0.6) blobs and new (v0.6.1) blobs share the same shape.
+  - `_build_gphotos_source` gains a `for_apply: bool = False` param.  When `for_apply=True` AND the token carries `has_trash=True`, the source is constructed with `is_read_only_scan=False` — the only construction site that flips the flag off.  `_build_sources_for_apply` and `_build_migrate_sources` pass `for_apply=True`; `_build_scan_sources` never does (scan is read-only structurally).
+  - `_collect_trash_enabled_source_ids()` — new helper that walks the registry + token store once at scan time to build the scorer's trash-enabled set.  Failures reading a single token file default to "not trash-enabled".
+  - `dc scan` threads `trash_enabled_source_ids` through to `score_groups`.
+- `docs/AUDIT_LOG.md` — invariants updated: the v0.6 read-only invariant is replaced with the v0.6.1 per-account escalation invariant (three-layer gate + scorer trash-enabled bypass + API-capability wall).
+
+Tests shipped (10 net-new in `tests/test_gphotos_trash_escalation.py`):
+
+- `test_move_to_trash_refuses_without_has_trash` — v0.6.1 default (`has_trash=False`) surfaces `SourceError` naming `dc auth grant-gphotos-trash` and the account id.
+- `test_move_to_trash_investigate_api_capability` — trash-enabled account (`has_trash=True`) still refuses with `SourceError` naming the Google API limitation and pointing at `photos.google.com`.  No Photos API method calls fire.
+- `test_move_to_trash_read_only_scan_still_wins` — ordering lock: `is_read_only_scan=True` refuses BEFORE the has_trash check even for a trash-enabled account.
+- `test_grant_gphotos_trash_updates_token_scopes` — end-to-end CLI: mocked `run_localhost_flow` returns a full-scope token; the on-disk token file carries `has_trash=True`, `scopes=[photoslibrary]`, new `access_token`, and the preserved `client_id` / `client_secret`.
+- `test_grant_gphotos_trash_refuses_non_gphotos_account` — command exits 2 on a `gdrive:*` account with an actionable message.
+- `test_scorer_treats_trash_enabled_gphotos_as_normal_source` — trash-enabled gphotos member NOT informational; local stays keeper; gphotos is a legitimate discard candidate.
+- `test_scorer_treats_readonly_gphotos_as_informational` — mirror: default gphotos IS informational; symmetric to the v0.6-patch M1 test.
+- `test_scorer_icloud_still_informational_even_with_trash_map` — iCloud is unconditionally informational regardless of the trash_enabled set (permanent read-only invariant).
+- `test_auth_list_surfaces_trash_enabled_scope` — `dc auth list` renders `trash-enabled` on the personal row and `read-only` on the family row (mixed-state registry).
+- `test_token_saved_by_grant_has_trash_true` — round-trip through `TokenStore.save` / `.load`: `has_trash=True` survives the JSON write + re-read.
+
+Existing test update:
+
+- `tests/test_sources_gphotos.py::test_move_to_trash_raises_deferred` — was: asserted the v0.6 "deferred to v0.6.1" placeholder in the message.  Now: asserts the v0.6.1 replacement — `dc auth grant-gphotos-trash <id>` naming the account id.
+
+Invariants preserved:
+
+- 497 pre-existing tests still pass unchanged; 10 new tests added (total 507).
+- `test_no_forbidden_calls.py` still green; `shutil.move` still confined to `apply/undo.py` + `organize/undo.py`.
+- Cloud paths still never `.resolve()`d.
+- iCloud read-only invariant unchanged and locked in structurally (unconditional branch in the scorer + unconditional refuse in the source).
+- Three-layer defense preserved for non-escalated gphotos accounts: source-side (`has_trash=False` refuses) + apply-time construction (`_build_gphotos_source(for_apply=True)` only flips `is_read_only_scan=False` for trash-enabled tokens) + mover pre-flight (`apply/mover.py:501` refuses on `is_read_only_scan=True`).  For trash-enabled accounts the mover pre-flight passes through and the API-capability wall raises inside `move_to_trash`.
+- BYO OAuth still enforced — the grant/revoke commands reuse the token's stored `client_id` / `client_secret` and do NOT touch the bundled placeholder guard.
+
+**v0.6.1 DONE.**  GPhotos trash scope escalation live.  Trash-enabled Google Photos accounts flow through the normal cross-source scoring; the actual trash operation is constrained by the Google Photos Library API v1's lack of a library-scoped delete endpoint — surfaced as an actionable error pointing at the web UI, ready to drop in a real API call the moment Google exposes one.
 
 ### v0.6-patch — closes pass-16 findings (2026-09-11)
 

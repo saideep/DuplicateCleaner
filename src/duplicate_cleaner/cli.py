@@ -684,8 +684,18 @@ def scan(
             ),
         )
 
+    # v0.6.1: gphotos accounts flagged trash-enabled (via ``dc auth
+    # grant-gphotos-trash``) skip the informational marking in the
+    # scorer so they can be proposed as discards.  Read the token store
+    # once; a missing token file / non-gphotos type simply drops out of
+    # the set.
+    trash_enabled_source_ids = _collect_trash_enabled_source_ids()
     scored = score_groups(
-        groups, cfg, weights, clone_id_lookup=get_clone_id
+        groups,
+        cfg,
+        weights,
+        clone_id_lookup=get_clone_id,
+        trash_enabled_source_ids=trash_enabled_source_ids,
     )
 
     # Real (on-disk, non-archive-member) hashes are the alternative pool
@@ -1060,7 +1070,7 @@ def _build_sources_for_apply(
             )
         elif kind == "gphotos":
             out[entry.id] = _build_gphotos_source(
-                entry.id, data, force_refresh=force_refresh
+                entry.id, data, force_refresh=force_refresh, for_apply=True
             )
         elif kind == "onedrive":
             out[entry.id] = _build_onedrive_source(
@@ -1143,12 +1153,17 @@ def _build_scan_sources(source_ids: list[str]) -> list[Any]:
             creds = _google_credentials_from_token(
                 data, default_scopes=list(GPHOTOS_DEFAULT_SCOPES)
             )
+            # Scan-time construction is always read-only.  ``has_trash``
+            # is threaded through so the scorer / mover can see the
+            # per-account escalation state even though the scan pipeline
+            # itself never mutates the library.
             out.append(
                 GooglePhotosSource(
                     account_id=sid,
                     credentials=creds,
                     client_config={"user_email": str(data.get("user_email") or "")},
                     is_read_only_scan=True,
+                    has_trash=_token_has_trash(data),
                 )
             )
         elif kind == "onedrive":
@@ -1209,15 +1224,32 @@ def _build_gdrive_source(
     )
 
 
+def _token_has_trash(data: dict[str, object]) -> bool:
+    """Return ``True`` iff a gphotos token blob is trash-enabled.
+
+    v0.6.1: the ``has_trash`` field is stamped on the token by
+    ``dc auth grant-gphotos-trash``.  Old (v0.6) token files predate
+    the field and default to ``False`` — the safe, read-only default.
+    """
+    return bool(data.get("has_trash", False))
+
+
 def _build_gphotos_source(
-    account_id: str, data: dict[str, object], *, force_refresh: bool
+    account_id: str,
+    data: dict[str, object],
+    *,
+    force_refresh: bool,
+    for_apply: bool = False,
 ) -> object:
-    """Instantiate a GooglePhotosSource — read-only in v0.6.
+    """Instantiate a GooglePhotosSource — v0.6.1 trash-escalation aware.
 
     Symmetric with :func:`_build_gdrive_source`: same
-    ``google.oauth2.credentials.Credentials`` refresh semantics.  v0.6
-    keeps ``is_read_only_scan=True`` even at apply time — the source
-    refuses trash calls until v0.6.1 wires the scope escalation.
+    ``google.oauth2.credentials.Credentials`` refresh semantics.
+    ``for_apply=True`` flips ``is_read_only_scan`` off IFF the token
+    file carries ``has_trash=True`` (the user has run
+    ``dc auth grant-gphotos-trash``).  Read-only tokens stay pinned to
+    ``is_read_only_scan=True`` at every construction site so the mover
+    pre-flight tripwire refuses them symmetrically with v0.6.
     """
     from duplicate_cleaner.sources.gphotos import GooglePhotosSource
 
@@ -1236,14 +1268,45 @@ def _build_gphotos_source(
                 f"--force-refresh: failed to refresh Google Photos token for "
                 f"{account_id!r}: {e}. Run `dc auth add gphotos --force`."
             ) from e
+    has_trash = _token_has_trash(data)
+    # Apply-time + trash-enabled: flip the scan flag off so the source
+    # can reach its ``move_to_trash`` path.  Scan-time and everywhere
+    # else keep the flag on — v0.6 behaviour preserved for the default.
+    read_only_scan = not (for_apply and has_trash)
     return GooglePhotosSource(
         account_id=account_id,
         credentials=creds,
         client_config={"user_email": str(data.get("user_email") or "")},
-        # v0.6: still read-only at apply time.  ``move_to_trash`` refuses
-        # with a v0.6.1 deferral message either way.
-        is_read_only_scan=True,
+        is_read_only_scan=read_only_scan,
+        has_trash=has_trash,
     )
+
+
+def _collect_trash_enabled_source_ids() -> frozenset[str]:
+    """Return every gphotos account id whose token has ``has_trash=True``.
+
+    Called at scan time to build the scorer's trash-enabled set — a
+    trash-enabled gphotos member skips the informational marking so it
+    can be proposed as a discard.  Failures reading a single token file
+    surface as debug logs; the safe default is "not trash-enabled".
+    """
+    log = logging.getLogger(__name__)
+    tokens = TokenStore()
+    registry = AccountsRegistry()
+    out: set[str] = set()
+    for entry in registry.load():
+        if entry.type != "gphotos":
+            continue
+        try:
+            data = tokens.load(entry.id)
+        except TokenPermissionError as e:
+            log.warning("Skipping trash-enabled check for %s: %s", entry.id, e)
+            continue
+        if data is None:
+            continue
+        if _token_has_trash(data):
+            out.add(entry.id)
+    return frozenset(out)
 
 
 
@@ -1839,6 +1902,11 @@ def auth_add(
             "client_secret": secret,
         }
     )
+    # v0.6.1: stamp ``has_trash=False`` on freshly-added gphotos tokens
+    # so the field exists explicitly (the field is additive so older
+    # files without it still parse — see ``_token_has_trash``).
+    if type_ == "gphotos":
+        token_data.setdefault("has_trash", False)
     tokens.save(account_id, token_data)
     user_email = str(token_data.get("user_email") or token_data.get("email") or "")
     # B4: when re-authorising an existing id (interactive confirm or --force),
@@ -1866,20 +1934,209 @@ def auth_add(
 
 @auth_app.command("list")
 def auth_list() -> None:
-    """Print all configured accounts (no token values)."""
+    """Print all configured accounts (no token values).
+
+    v0.6.1: the ``scope`` column shows ``read-only`` for the default
+    photoslibrary.readonly scope and ``trash-enabled`` after a
+    successful ``dc auth grant-gphotos-trash``.  Non-photos accounts
+    display ``-`` in that column.
+    """
     registry = AccountsRegistry()
     accounts = registry.load()
     if not accounts:
         console.print(f"No accounts registered at {ACCOUNTS_PATH}.")
         return
+    tokens = TokenStore()
     tbl = Table(title="Configured accounts")
     tbl.add_column("id")
     tbl.add_column("type")
     tbl.add_column("user")
     tbl.add_column("added")
+    tbl.add_column("scope")
     for e in accounts:
-        tbl.add_row(e.id, e.type, e.user or "-", e.added_ts or "-")
+        scope_col = "-"
+        if e.type == "gphotos":
+            scope_col = "read-only"
+            try:
+                data = tokens.load(e.id)
+            except TokenPermissionError:
+                data = None
+            if data is not None and _token_has_trash(data):
+                scope_col = "trash-enabled"
+        elif e.type == "icloud":
+            # Permanently read-only — surface the fact so operators
+            # remember the deletion path is Photos.app.
+            scope_col = "read-only (permanent)"
+        tbl.add_row(e.id, e.type, e.user or "-", e.added_ts or "-", scope_col)
     console.print(tbl)
+
+
+def _run_gphotos_scope_flow(
+    *,
+    account_id: str,
+    scopes: list[str],
+    has_trash: bool,
+    port_hint: int,
+    action_label: str,
+) -> None:
+    """Shared body of the gphotos grant/revoke commands.
+
+    Re-runs the OAuth flow with the given scope list, overwrites the
+    token file with the new blob (preserving the client_id/secret and
+    stamping ``has_trash``), and prints a green confirmation.  Refuses
+    when the account is not registered or is not of type ``gphotos``.
+    """
+    from duplicate_cleaner.auth.clients import GPHOTOS_AUTH_URL, GPHOTOS_TOKEN_URL
+
+    registry = AccountsRegistry()
+    entry = registry.get(account_id)
+    if entry is None:
+        console.print(
+            f"[red]Account not registered[/red]: {account_id}. "
+            "Run [cyan]dc auth list[/cyan] to see configured accounts."
+        )
+        raise typer.Exit(2)
+    if entry.type != "gphotos":
+        console.print(
+            f"[red]{action_label} is Google Photos-only[/red]: "
+            f"account {account_id} is of type {entry.type!r}, expected 'gphotos'."
+        )
+        raise typer.Exit(2)
+    tokens = TokenStore()
+    try:
+        existing = tokens.load(account_id)
+    except TokenPermissionError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+    if existing is None:
+        console.print(
+            f"[red]No token for[/red] {account_id}. "
+            "Run [cyan]dc auth add gphotos[/cyan] first."
+        )
+        raise typer.Exit(1)
+    client_id = str(existing.get("client_id") or "")
+    client_secret = str(existing.get("client_secret") or "") or None
+    if not client_id:
+        console.print(
+            f"[red]Token for {account_id} is missing client_id[/red]. "
+            "Re-run [cyan]dc auth add gphotos --force[/cyan] to fix, "
+            "then retry the scope change."
+        )
+        raise typer.Exit(1)
+    console.print(
+        f"Starting OAuth flow to {action_label.lower()} for "
+        f"[cyan]{account_id}[/cyan]…"
+    )
+    try:
+        token_data = run_localhost_flow(
+            auth_url_base=GPHOTOS_AUTH_URL,
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=scopes,
+            token_url=GPHOTOS_TOKEN_URL,
+            port_hint=port_hint,
+            extra_auth_params={
+                "access_type": "offline",
+                "prompt": "consent",
+                "include_granted_scopes": "true",
+            },
+        )
+    except OAuthFlowError as e:
+        console.print(f"[red]OAuth flow failed[/red]: {e}")
+        raise typer.Exit(1) from e
+    token_data.update(
+        {
+            "account_id": account_id,
+            "type": "gphotos",
+            "client_id": client_id,
+            "client_secret": client_secret or "",
+            "has_trash": has_trash,
+        }
+    )
+    # Preserve user_email from the existing blob when the new response
+    # omits it — some Google flows only surface the id_token on the
+    # first exchange.
+    if "user_email" not in token_data and existing.get("user_email"):
+        token_data["user_email"] = existing["user_email"]
+    tokens.save(account_id, token_data)
+    if has_trash:
+        console.print(
+            f"[green]Escalated[/green] {account_id} to the full "
+            "photoslibrary scope.  Note: the Google Photos Library API "
+            "v1 does not currently expose a library-wide trash "
+            "endpoint, so `dc apply` will still refuse to trash items "
+            "and point at https://photos.google.com."
+        )
+    else:
+        console.print(
+            f"[green]Downgraded[/green] {account_id} back to the "
+            "photoslibrary.readonly scope."
+        )
+
+
+@auth_app.command("grant-gphotos-trash")
+def auth_grant_gphotos_trash(
+    account_id: Annotated[
+        str, typer.Argument(help="Account id from `dc auth list` (must be gphotos:*).")
+    ],
+    port_hint: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            help="OAuth callback port hint (0 = random). For testing only.",
+        ),
+    ] = 0,
+) -> None:
+    """Escalate a Google Photos account from read-only to the full photoslibrary scope.
+
+    v0.6.1 escalation flow.  Re-runs OAuth with the full
+    ``photoslibrary`` scope (requires user re-consent) and marks the
+    token file ``has_trash=True``.  After a successful grant the
+    scorer stops marking this account's members informational; they
+    flow through the normal cross-source scoring.  The actual trash
+    step is still constrained by the Google Photos Library API's
+    lack of a library-scoped trash endpoint — see the message that
+    prints on success for the manual fallback.
+    """
+    from duplicate_cleaner.auth.clients import GPHOTOS_TRASH_SCOPES
+
+    _run_gphotos_scope_flow(
+        account_id=account_id,
+        scopes=list(GPHOTOS_TRASH_SCOPES),
+        has_trash=True,
+        port_hint=port_hint,
+        action_label="grant-gphotos-trash",
+    )
+
+
+@auth_app.command("revoke-gphotos-trash")
+def auth_revoke_gphotos_trash(
+    account_id: Annotated[
+        str, typer.Argument(help="Account id from `dc auth list` (must be gphotos:*).")
+    ],
+    port_hint: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            help="OAuth callback port hint (0 = random). For testing only.",
+        ),
+    ] = 0,
+) -> None:
+    """Downgrade a Google Photos account back to the read-only scope.
+
+    Practical effect of a downgrade: the new token requests only the
+    ``photoslibrary.readonly`` scope so the API layer stops honoring
+    write attempts, and ``has_trash=False`` flips off the scorer /
+    source guards.  Google's OAuth does not "narrow" an existing
+    grant; the user must complete a fresh consent screen.
+    """
+    _run_gphotos_scope_flow(
+        account_id=account_id,
+        scopes=list(GPHOTOS_DEFAULT_SCOPES),
+        has_trash=False,
+        port_hint=port_hint,
+        action_label="revoke-gphotos-trash",
+    )
 
 
 @auth_app.command("test")
@@ -2520,8 +2777,16 @@ def _build_migrate_sources(
                 sid, data, force_refresh=force_refresh
             )
         elif kind == "gphotos":
+            # Migrate never uses gphotos as a write destination
+            # (``upload`` raises NotImplementedError).  A trash-enabled
+            # gphotos SOURCE could theoretically supply cleanup via
+            # ``move_to_trash`` — v0.6.1's API-capability wall still
+            # applies (Google exposes no library-trash endpoint).  We
+            # pass ``for_apply=True`` so the source knows it's in a
+            # mutation-capable context; the actual capability check
+            # fires inside ``move_to_trash``.
             out[sid] = _build_gphotos_source(
-                sid, data, force_refresh=force_refresh
+                sid, data, force_refresh=force_refresh, for_apply=True
             )
         elif kind == "onedrive":
             out[sid] = _build_onedrive_source(

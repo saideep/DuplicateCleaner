@@ -108,11 +108,24 @@ The flow is identical in shape to the Google Drive one — local callback server
 
 ### Scopes
 
-DuplicateCleaner v0.6 requests exactly one scope:
+DuplicateCleaner v0.6 requests exactly one scope on `dc auth add gphotos`:
 
 - `https://www.googleapis.com/auth/photoslibrary.readonly`
 
-That grants read-only access to the photos the app can see (your own uploads, i.e. everything under `photoslibrary.readonly`). Under this scope the source can detect duplicates but cannot trash them — Google Photos trash requires the broader `https://www.googleapis.com/auth/photoslibrary` scope, which needs a user re-consent flow. That escalation is deliberately deferred to v0.6.1. Until then, `dc apply` refuses to trash Google Photos entries with a clear message pointing you at [https://photos.google.com](https://photos.google.com) for manual deletion.
+That grants read-only access to the photos the app can see (your own uploads, i.e. everything under `photoslibrary.readonly`). Under this scope the source can detect duplicates but cannot trash them.
+
+### Scope escalation (v0.6.1)
+
+Google Photos trash requires the broader `https://www.googleapis.com/auth/photoslibrary` scope, which needs a user re-consent flow. Escalation is per-account: granting trash on `gphotos:personal` does NOT grant it for `gphotos:family`.
+
+```shell
+dc auth grant-gphotos-trash gphotos:personal   # re-consent to full scope
+dc auth revoke-gphotos-trash gphotos:personal  # downgrade back to read-only
+```
+
+`dc auth list` shows `read-only` or `trash-enabled` in the `scope` column so you can see the current state at a glance. A trash-enabled account's members flow through the normal cross-source scoring instead of being marked informational-only, so they can be proposed as discards in a mixed local + gphotos scan.
+
+**Google Photos Library API limitation.** Even after a successful `grant-gphotos-trash` escalation, the actual trash step fails with an actionable `SourceError` pointing at [https://photos.google.com/trash](https://photos.google.com/trash) for the manual step. This is because Google Photos Library API v1 does NOT expose a library-wide trash / delete endpoint — the full `photoslibrary` scope grants write access only to app-created content (album creation, `batchAddMediaItems`, `batchRemoveMediaItems`), not arbitrary library items. This is a documented Google API limitation, not a DuplicateCleaner constraint; if Google reintroduces a library-scoped delete on the Photos API, `move_to_trash` will start working without further config changes. Until then, use the web UI at [https://photos.google.com](https://photos.google.com) → select item → Delete.
 
 The Google Photos API also does not expose a per-item MD5 or SHA-256. To detect cross-source duplicates (a JPEG in Google Photos vs. the same JPEG on your local disk), DuplicateCleaner reads the media item's `baseUrl` (re-fetched at reconcile time because these URLs expire in ~60 minutes), streams the `=d`-suffixed original-quality bytes, and computes a BLAKE3 hash locally. Cross-source reconciliation is gated by `--max-cloud-download-mb` (same knob as Drive / OneDrive) so a full-library scan does not silently blow through your data cap.
 

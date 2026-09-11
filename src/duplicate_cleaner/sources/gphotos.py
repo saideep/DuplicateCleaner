@@ -1,11 +1,19 @@
-"""GooglePhotosSource — read-only Photos Library API v1 backed source.
+"""GooglePhotosSource — Photos Library API v1 backed source (v0.6.1 trash escalation).
 
-v0.6: Google Photos scans over the ``mediaItems`` endpoint of the Photos
-Library API v1.  Read-only by design in this milestone — the trash flow
-requires a scope escalation from ``photoslibrary.readonly`` to the full
-``photoslibrary`` scope, which needs user re-consent.  That flow lands in
-v0.6.1; until then :meth:`GooglePhotosSource.move_to_trash` raises a typed
-``SourceError`` pointing the user at the escalation.
+v0.6 shipped this source read-only; v0.6.1 adds a per-account
+``has_trash`` flag threaded from the token file.  When the flag is False
+(default, v0.6 behaviour) :meth:`move_to_trash` refuses with an
+actionable ``SourceError`` pointing at ``dc auth grant-gphotos-trash``.
+When True the source is authorised for the full ``photoslibrary`` scope
+and would attempt a library-trash call — but the Google Photos Library
+API v1 does NOT expose a library-wide trash endpoint (only album-scoped
+removals via ``albums.batchRemoveMediaItems``).  The escalated call
+therefore still raises ``SourceError`` naming the API constraint and
+pointing at https://photos.google.com/trash for the manual step.  The
+escalation infrastructure (token-file scopes + CLI grant/revoke commands
++ scorer-side trash-enabled bypass) is nevertheless live so future
+provider capability, or an out-of-band per-item workaround, can drop
+into the same place without touching the surrounding rails.
 
 Google Photos does NOT expose per-item MD5/SHA-256 in the list response,
 so the reconcile pipeline is the only path to a canonical hash for these
@@ -180,10 +188,18 @@ def _parse_rfc3339(value: str) -> float:
 
 
 class GooglePhotosSource:
-    """Source over one Google account's Photos library.  Read-only in v0.6."""
+    """Source over one Google account's Photos library.
+
+    v0.6.1: ``has_trash`` is threaded per-account so a trash-enabled
+    account (grant-gphotos-trash was run for it) skips the informational
+    marking in :func:`score.rules.score_group` and can reach
+    :meth:`move_to_trash` — which then honours the Google Photos Library
+    API's actual capabilities (see class docstring).
+    """
 
     id: str
     is_read_only_scan: bool
+    has_trash: bool
 
     def __init__(
         self,
@@ -192,16 +208,19 @@ class GooglePhotosSource:
         client_config: dict[str, Any] | None = None,
         *,
         is_read_only_scan: bool = True,
+        has_trash: bool = False,
         service_factory: Callable[[Any], Any] | None = None,
     ) -> None:
         self.id = account_id
         self._credentials = credentials
         self._client_config: dict[str, Any] = dict(client_config or {})
-        # v0.6: Google Photos is permanently read-only until v0.6.1 wires the
-        # scope escalation flow.  The attribute is still honoured for
-        # symmetry with the other sources — a caller that flips it off gets
-        # a SourceError from ``move_to_trash`` describing the deferral.
+        # ``is_read_only_scan`` is the mover-level scan-time tripwire —
+        # still honoured for symmetry with every other source.  v0.6.1
+        # additionally gates the trash path on ``has_trash`` (the token
+        # file's per-account escalation flag).  Both must clear before
+        # any Photos API mutation call is attempted.
         self.is_read_only_scan = is_read_only_scan
+        self.has_trash = has_trash
         self._service_factory: Callable[[Any], Any] = (
             service_factory if service_factory is not None else _build_photos_service
         )
@@ -401,28 +420,77 @@ class GooglePhotosSource:
         yield from chunks
 
     def move_to_trash(self, record: FileRecord) -> TrashedLocation:
-        """Refuse the call — Google Photos trash is deferred to v0.6.1.
+        """Trash a Google Photos media item — three-layer gating.
 
-        v0.6-patch: the redundant ``is_read_only_scan`` tripwire was dropped.
-        The outer construction path pins the flag to ``True`` at every apply
-        site (see ``cli._build_sources_for_apply``), so the branch could
-        never fire in production.  Unconditional ``SourceError`` mirrors the
-        iCloud Photos shape; v0.6.1 will reintroduce a flag-gated write path
-        when scope escalation actually flips.
+        Layer 1 — scan-time tripwire: ``is_read_only_scan=True`` (the
+        default at scan time) refuses with ``SourceError`` so a bug in
+        the scan pipeline cannot mutate the library.
+
+        Layer 2 — per-account trash gate: ``has_trash=False`` (the v0.6
+        default and every account that has not run ``dc auth
+        grant-gphotos-trash``) refuses with an actionable ``SourceError``
+        naming the escalation command.
+
+        Layer 3 — Google API capability: even for a trash-enabled
+        account, the Google Photos Library API v1 does NOT expose a
+        library-wide trash endpoint.  ``mediaItems.batchDelete`` does
+        not exist; ``albums.batchRemoveMediaItems`` only detaches an
+        item from an app-owned album.  We therefore raise a distinct
+        ``SourceError`` naming the API constraint and pointing the
+        operator at https://photos.google.com/trash for the manual
+        step.  When Google later exposes a library-trash endpoint, the
+        actual API call drops in here between layer 2 and this raise.
         """
         _ = record
+        if self.is_read_only_scan:
+            raise SourceError(
+                "GooglePhotosSource is read-only at scan time; "
+                "construct with is_read_only_scan=False before trashing."
+            )
+        if not self.has_trash:
+            raise SourceError(
+                f"This Google Photos account ({self.id!r}) is read-only.  "
+                f"Run `dc auth grant-gphotos-trash {self.id}` to escalate "
+                "the OAuth scope from photoslibrary.readonly to the full "
+                "photoslibrary scope (requires user re-consent)."
+            )
+        # Layer 3 — Google API does not expose library-wide trash.  Even
+        # the full ``photoslibrary`` scope grants only album-scoped
+        # mutations (batchAddMediaItems / batchRemoveMediaItems) and
+        # album/media-item creation.  Direct removal of a mediaItem from
+        # the library is a documented Google API limitation, not a
+        # DuplicateCleaner constraint.  Surface an actionable message so
+        # the user knows exactly where to click.
         raise SourceError(
-            "Google Photos trash deferred to v0.6.1; scope escalation "
-            "required.  Use the Google Photos app or web UI at "
-            "https://photos.google.com to move photos to the trash for now."
+            "Google Photos Library API v1 does not expose a "
+            "library-wide trash endpoint for arbitrary media items — "
+            "this is a documented Google API limitation.  To move a "
+            "Google Photos item to the trash, use "
+            "https://photos.google.com and select the item(s) → "
+            "Delete.  This tool cannot automate the step until Google "
+            "reintroduces a library-scoped delete on the Photos API."
         )
 
     def restore_from_trash(self, loc: TrashedLocation) -> None:
-        """Refuse — v0.6.1 will wire restore alongside the trash escalation."""
+        """Restore is likewise gated on the API capability.
+
+        Same three-layer shape as :meth:`move_to_trash`: v0.6.1's
+        escalation does not unlock a library-scoped restore because the
+        underlying API endpoint is not exposed.  Points the operator at
+        the Google Photos trash UI.
+        """
         _ = loc
+        if not self.has_trash:
+            raise SourceError(
+                f"This Google Photos account ({self.id!r}) is read-only.  "
+                f"Run `dc auth grant-gphotos-trash {self.id}` to escalate "
+                "scope, or restore manually from "
+                "https://photos.google.com/trash."
+            )
         raise SourceError(
-            "Google Photos restore deferred to v0.6.1; scope escalation "
-            "required.  Restore manually from the Google Photos trash UI."
+            "Google Photos Library API v1 does not expose a "
+            "library-wide restore endpoint.  Restore manually from "
+            "https://photos.google.com/trash."
         )
 
     def get_metadata(self, record: FileRecord) -> SourceMetadata:

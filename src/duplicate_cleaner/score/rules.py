@@ -201,12 +201,23 @@ def score_group(
     weights: dict[str, float],
     git_clean_cache: dict[Path, bool] | None = None,
     clone_id_lookup: Callable[[Path], int | None] | None = None,
+    trash_enabled_source_ids: frozenset[str] | set[str] | None = None,
 ) -> list[ScoredMember]:
     """Score every member; mark the highest-scoring non-informational as keeper.
 
     ``clone_id_lookup`` overrides :func:`sys.apfs.get_clone_id`; tests
     inject their own to simulate APFS clone families without needing a
     real APFS volume.
+
+    ``trash_enabled_source_ids`` — v0.6.1 escalation.  Google Photos
+    accounts marked trash-enabled (the user has run ``dc auth
+    grant-gphotos-trash <id>`` and the token file carries
+    ``has_trash=True``) are NOT marked informational; they flow through
+    the normal cross-source scoring so a trashable-but-currently-cloud
+    photo can be proposed as a discard.  iCloud is permanently
+    read-only and is never in this set.  When ``None`` (v0.6 behaviour)
+    every ``gphotos:*`` and ``icloud:*`` member is informational, same
+    as the v0.6-patch invariant.
     """
     members: list[ScoredMember] = [
         ScoredMember(
@@ -253,16 +264,23 @@ def score_group(
         if m.is_shared:
             m.is_informational = True
 
-    # v0.6-patch — Google Photos + iCloud Photos are read-only sources
-    # (gphotos permanently until v0.6.1 escalates scope; icloud permanently
-    # because osxphotos is a reader library, not a writer).  Marking their
-    # members informational-only here prevents the ``cloud_when_local_exists``
-    # penalty from scoring the read-only member lower than a local peer and
-    # proposing the read-only entry as a discard — which would trip
-    # ``apply/mover.py`` pre-flight and refuse the WHOLE run.  Symmetric to
-    # the ``is_shared`` marking above.
+    # v0.6-patch / v0.6.1 — Google Photos + iCloud Photos read-only
+    # marking.  iCloud is PERMANENTLY read-only (osxphotos is a reader
+    # library).  gphotos is read-only DEFAULT — but v0.6.1 adds
+    # per-account escalation via ``dc auth grant-gphotos-trash``.  A
+    # trash-enabled gphotos account skips the informational mark so it
+    # can be proposed as a discard candidate; the mover pre-flight then
+    # honours the source's actual ``has_trash`` flag (defense in depth
+    # against a hand-edited report.json that lies about escalation).
+    #
+    # ``trash_enabled_source_ids=None`` preserves v0.6-patch behaviour:
+    # every gphotos:* and icloud:* member is informational.
+    _trash_enabled: frozenset[str] = frozenset(trash_enabled_source_ids or ())
     for m in members:
-        if m.source_id.startswith(("gphotos:", "icloud:")):
+        if m.source_id.startswith("icloud:"):
+            m.is_informational = True
+            continue
+        if m.source_id.startswith("gphotos:") and m.source_id not in _trash_enabled:
             m.is_informational = True
 
     # Hard-link detection: two-pass so every member of an inode family is
@@ -451,8 +469,13 @@ def score_groups(
     weights: dict[str, float],
     *,
     clone_id_lookup: Callable[[Path], int | None] | None = None,
+    trash_enabled_source_ids: frozenset[str] | set[str] | None = None,
 ) -> list[ScoredGroup]:
-    """Score every group; compute reclaim bytes."""
+    """Score every group; compute reclaim bytes.
+
+    ``trash_enabled_source_ids`` is threaded through to
+    :func:`score_group`; see that function's docstring for semantics.
+    """
     scored: list[ScoredGroup] = []
     git_clean_cache: dict[Path, bool] = {}
     for g in groups:
@@ -462,6 +485,7 @@ def score_groups(
             weights,
             git_clean_cache=git_clean_cache,
             clone_id_lookup=clone_id_lookup,
+            trash_enabled_source_ids=trash_enabled_source_ids,
         )
         reclaim = sum(
             m.size
