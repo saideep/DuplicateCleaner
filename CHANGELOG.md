@@ -2,6 +2,90 @@
 
 All notable changes to this project will be documented in this file. Format: Keep a Changelog. Versioning: SemVer.
 
+## [1.0.0] — 2026-09-15
+
+Feature-complete stable release. Every capability planned in the original roadmap is shipped and tested, with the two exceptions noted in the Deferred section below.
+
+### Shipped in 1.0.0 (cumulative — everything below has been on `main` since the milestone shown)
+
+Local dedup:
+- Exact-duplicate detection with size-bucket → partial BLAKE3 → full BLAKE3 pipeline; SQLite cache keyed on `(path, size, mtime)` (v0.1).
+- Rule-based "right home" scorer with signed weight per signal (path hints, active-home membership, mtime, git-cleanliness, external-vs-internal drive, cross-source local-wins). Every score broken down per signal in the report (v0.1).
+- User-declared `active_homes` config — no silent guessing about which `~/Documents` is the real one (v0.1).
+- HTML + machine-readable JSON reports (v0.1).
+- Archive recursion into `.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz` (v0.1.1). Whole-archive-only discard proposals; encrypted / corrupt / too-large-to-recurse archives veto the outer archive.
+- macOS bundle handling: `.app`, `.pages`, `.numbers`, `.keynote`, `.rtfd`, `.sparsebundle`, `.xcodeproj`, `.playground`, `.framework`, `.bundle` walked atomically (v0.1.1).
+- APFS clone detection via `getattrlist` with `ATTR_CMNEXT_CLONEID` (v0.1.1); clones informational-only.
+- Hardlink detection via `(st_dev, st_ino)` — informational-only (v0.1).
+- Project-tree aggregation (v0.4). Two copies of the same git repo / npm / Cargo / Go module / Maven / Gradle project collapse to one tree-diff entry. Similarity threshold `--min-project-similarity` (Jaccard, default 0.90). Dirty git repos refuse discard.
+- Singleton "Unique files" section in every report (v0.1.1).
+- `dc scan --discover` enumeration-only mode (v0.1.1).
+
+Near-duplicate detection:
+- Perceptual image near-dup via `imagehash.phash` at 256-bit resolution (v0.7). Union-find clustering — three-way near-dups produce one group, not N*(N-1)/2 pairs.
+- Chromaprint audio near-dup via `pyacoustid.fingerprint_file` (v0.8). Local-only fingerprint — no AcoustID.org lookup. Bit-level Hamming compare over decoded uint32 arrays.
+- Video near-dup via ffmpeg keyframe extraction + downscale + pHash (v0.8). 5 keyframes per video, 256-bit pHash each, averaged Hamming.
+- `ffmpeg` and `fpcalc` binaries invoked via hardcoded absolute paths (H9 PATH-hijack safety rail).
+- All three passes filter to `source_id == "local"` at intake — cloud paths never `.resolve()`d.
+- 90-day TTL cache sweeps per family at scan start.
+
+Cloud sources:
+- Google Drive (v0.2) and OneDrive Personal (v0.2) via BYO OAuth. Multi-account with user-chosen labels.
+- Cross-algo hash reconciliation (v0.2.1). Local BLAKE3, Drive MD5, OneDrive SHA-256 form cross-source duplicate groups end-to-end.
+- Cross-source scoring: local always wins the keeper role (`cloud_when_local_exists = -3`).
+- Google Photos read-only via BYO OAuth `photoslibrary.readonly` (v0.6). Per-account trash-scope escalation infrastructure via `dc auth grant-gphotos-trash <account>` (v0.6.1).
+- iCloud Photos read-only via `osxphotos` reading the local Photos.photoslibrary bundle (v0.6). Permanently read-only — deletion goes via Photos.app.
+- Shared cloud files informational-only. OAuth scopes trash-only — the tool literally cannot hard-delete a cloud file.
+- Pre-trash etag drift check; cross-source manifests; undo dispatches per source.
+
+Organize:
+- Three-phase `dc organize discover → review → apply → undo` (v0.3-a/b/c).
+- Nine-domain taxonomy: HR / Personal / Finances / Photos / Videos / Work / Projects / Media / Unsorted.
+- Signal extractors: ID3, EXIF, PDF meta + first-page text, video creation-date, filename regex.
+- Cohesion preservation: music albums, book series, git projects, and photo/video event clusters move atomically.
+- EXIF-first event clustering with mtime fallback.
+- Rename policy user-locked to `preserve` by default.
+
+Migrate:
+- Cloud-to-cloud consolidation via `dc migrate plan → copy → verify → cleanup → undo` (v0.5-a/b/c).
+- Post-upload hash verify — same-algo pairs compared at copy time; cross-algo pairs get a canonical BLAKE3 tee'd at copy time and re-checked by `dc migrate verify --full`.
+- Cleanup structurally refuses without prior verify (per-entry `verified=True` + `verified_ts` gate).
+- Resume-from-manifest for interrupted transfers. Refuses a manifest that belongs to a different plan.
+- Bandwidth throttle via `--max-bandwidth-mbps N`.
+- Destination per-file caps enforced at plan time.
+
+Safety envelope (all shipped, all tested):
+- Dry-run default on every apply-shaped command. `--commit` is the sole write gate.
+- Atomic manifest before first move. Tempfile + fsync + os.replace + parent-dir fsync. Per-entry flush after every successful move.
+- Full undo via manifest across local + cloud entries.
+- Every path from external JSON re-validated: `.resolve()`d and checked against `EXCLUDED_ROOTS` + `is_within(roots)`.
+- `send2trash`-only deletion; `shutil.move` confined to `apply/undo.py` + `organize/undo.py` (grep-tested).
+- 17 audit passes across the lifecycle. Zero DATA-LOSS surviving to `main`.
+
+System behavior:
+- Process runs at `os.nice(10)` and best-effort `taskpolicy -c background`.
+- CPU throttle when `throttle_on_cpu_pct` exceeded (default 85%).
+- Pre-scan free-disk check on the cache volume (default 5 GB).
+- Live progress bar shows CPU / RAM / free disk / files processed.
+
+Documentation:
+- [`docs/first-run.md`](docs/first-run.md) — end-to-end walk-through.
+- [`docs/cloud-oauth-setup.md`](docs/cloud-oauth-setup.md) — BYO OAuth registration.
+- [`docs/organize.md`](docs/organize.md) — organizer workflow.
+- [`docs/migrate.md`](docs/migrate.md) — migration workflow.
+- [`docs/safety.md`](docs/safety.md) — safety model + invariants.
+- [`docs/cli.md`](docs/cli.md) — full CLI reference.
+- [`docs/config.md`](docs/config.md) — every config key.
+- [`docs/AUDIT_LOG.md`](docs/AUDIT_LOG.md) — invariants, rejected alternatives, and every audit round.
+- [`docs/AUDIT_SCAFFOLD.md`](docs/AUDIT_SCAFFOLD.md) — high-standards review contract.
+
+Test suite: 561 passing. Ruff clean, mypy `--strict` clean (modulo documented 3rd-party stub warnings).
+
+### Deferred
+
+- Interactive HTML review UI with click-to-override keeper selection (was v0.3-f). Rich TUI ships in 1.0; browser UI is a v1.1 nice-to-have. Users edit the plan JSON in `$EDITOR` today.
+- Google Photos library-wide trash. The Photos Library API v1 does not expose a library-wide trash endpoint for personal accounts (the full `photoslibrary` scope grants write access only to app-created content). Escalation infrastructure is in place via `dc auth grant-gphotos-trash`; the API call drops in when Google adds the endpoint.
+
 ## [Unreleased]
 
 ### v0.7/v0.8-patch — closes pass-17 audit findings (2026-09-11)
