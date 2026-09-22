@@ -19,7 +19,7 @@ dependencies = [
     "google-api-python-client>=2.144.0,<3",
     "google-auth>=2.35.0,<3",
     "google-auth-oauthlib>=1.2,<2",
-    "tenacity>=9.0,<10",
+    "tenacity>=8.2,<10",
     "httpx>=0.27.0,<0.28",
     "msal>=1.31.0,<2",
     # v0.3 sub-milestone 5.3-a — organizer discovery.
