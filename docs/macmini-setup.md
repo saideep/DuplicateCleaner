@@ -53,7 +53,7 @@ cd ~/DuplicateCleaner
 uv sync
 ```
 
-`uv sync` reads `pyproject.toml` and `uv.lock`, creates `.venv/` inside the project, and installs the exact pinned dependency versions. The lockfile guarantees you get the same versions on every machine.
+`uv sync` reads `pyproject.toml`, creates `.venv/` inside the project, and installs dependencies resolved from the version ranges declared there. Ranges are pinned tightly enough that resolutions are stable in practice, but there is no committed lockfile — if you need bit-for-bit reproducibility across machines, generate one locally with `uv lock`.
 
 Verify the CLI is available:
 
@@ -212,5 +212,5 @@ macOS ships its own Python, which is not what you want. Always invoke DuplicateC
 
 - Python: 3.12.x (see `requires-python = ">=3.12,<3.13"` in `pyproject.toml`).
 - macOS: 15 Sequoia or later.
-- Python package versions: pinned via `pyproject.toml` and locked in `uv.lock`. Do not edit either file by hand.
+- Python package versions: pinned via version ranges in `pyproject.toml`. No lockfile is committed; `uv sync` re-resolves within those ranges on each machine. Run `uv lock` locally if you want a lockfile.
 - Homebrew formulae: latest stable at install time. Chromaprint and ffmpeg are only invoked by v0.8's audio + video near-dup comparators; their exact versions do not matter as long as `fpcalc` and `ffmpeg` binaries are found at their standard Homebrew paths (`/opt/homebrew/bin/` on Apple Silicon, `/usr/local/bin/` on Intel).
