@@ -133,7 +133,7 @@ def _walk_zip(
     """Enumerate ``zpath``; recurse into nested archives up to ``max_depth``."""
     try:
         zf = zipfile.ZipFile(str(zpath), "r")
-    except (zipfile.BadZipFile, OSError) as exc:
+    except (zipfile.BadZipFile, OSError, EOFError) as exc:
         result.skips.append(
             ArchiveSkip(path=prefix, reason="corrupt", error=str(exc))
         )
@@ -165,7 +165,7 @@ def _walk_zip(
                         result,
                         max_nested_bytes,
                     )
-            except (zipfile.BadZipFile, RuntimeError, OSError) as exc:
+            except (zipfile.BadZipFile, RuntimeError, OSError, EOFError) as exc:
                 result.skips.append(
                     ArchiveSkip(
                         path=member_virtual,
@@ -186,7 +186,7 @@ def _walk_tar(
     """Enumerate ``tpath``; recurse into nested archives up to ``max_depth``."""
     try:
         tf = tarfile.open(str(tpath), "r:*")  # noqa: SIM115  # closed via `with tf:` below
-    except (tarfile.TarError, OSError) as exc:
+    except (tarfile.TarError, OSError, EOFError) as exc:
         result.skips.append(
             ArchiveSkip(path=prefix, reason="corrupt", error=str(exc))
         )
@@ -199,7 +199,7 @@ def _walk_tar(
             member_virtual = f"{prefix}{ARCHIVE_SEP}{member.name}"
             try:
                 reader = tf.extractfile(member)
-            except (tarfile.TarError, OSError) as exc:
+            except (tarfile.TarError, OSError, EOFError) as exc:
                 result.skips.append(
                     ArchiveSkip(
                         path=member_virtual,
@@ -220,7 +220,7 @@ def _walk_tar(
                     result,
                     max_nested_bytes,
                 )
-            except (tarfile.TarError, OSError) as exc:
+            except (tarfile.TarError, OSError, EOFError) as exc:
                 result.skips.append(
                     ArchiveSkip(
                         path=member_virtual,
@@ -356,7 +356,7 @@ def _walk_zip_fileobj(
 ) -> None:
     try:
         zf = zipfile.ZipFile(stream, "r")
-    except (zipfile.BadZipFile, OSError) as exc:
+    except (zipfile.BadZipFile, OSError, EOFError) as exc:
         result.skips.append(
             ArchiveSkip(path=prefix, reason="corrupt", error=str(exc))
         )
@@ -385,7 +385,7 @@ def _walk_zip_fileobj(
                         result,
                         max_nested_bytes,
                     )
-            except (zipfile.BadZipFile, RuntimeError, OSError) as exc:
+            except (zipfile.BadZipFile, RuntimeError, OSError, EOFError) as exc:
                 result.skips.append(
                     ArchiveSkip(
                         path=member_virtual,
@@ -405,7 +405,7 @@ def _walk_tar_fileobj(
 ) -> None:
     try:
         tf = tarfile.open(fileobj=stream, mode="r:*")  # noqa: SIM115
-    except (tarfile.TarError, OSError) as exc:
+    except (tarfile.TarError, OSError, EOFError) as exc:
         result.skips.append(
             ArchiveSkip(path=prefix, reason="corrupt", error=str(exc))
         )
@@ -428,7 +428,7 @@ def _walk_tar_fileobj(
                     result,
                     max_nested_bytes,
                 )
-            except (tarfile.TarError, OSError) as exc:
+            except (tarfile.TarError, OSError, EOFError) as exc:
                 result.skips.append(
                     ArchiveSkip(
                         path=member_virtual, reason="corrupt", error=str(exc)
